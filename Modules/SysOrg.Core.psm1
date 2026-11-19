@@ -208,7 +208,9 @@ function Test-SysOrgExcludedPath {
     foreach($pat in @($Config.ExcludedPaths)){
         if([string]::IsNullOrWhiteSpace($pat)){ continue }
         if($pat.Contains('*') -or $pat.Contains('?')){
-            if($p -like $pat){ return $true }
+            # Match the path itself AND anything inside it: a wildcard rule like
+            # 'C:\Users\*\AppData' must also cover 'C:\Users\alice\AppData\Local\Temp'.
+            if($p -like $pat -or $p -like ($pat + '\*')){ return $true }
         } else {
             $pn = $pat.TrimEnd('\')
             if($p -ieq $pn -or $p.StartsWith($pn + '\',[StringComparison]::OrdinalIgnoreCase)){ return $true }
@@ -265,7 +267,11 @@ function Test-SysOrgDestinationPath {
     Test-SysOrgDestinationPath -Path 'D:\_Organized\Documents\2026\a.pdf' -Config $cfg
 #>
     param([string]$Path,$Config)
-    $letter = (Split-Path $Path -Qualifier).TrimEnd(':')
+    # Paths without a drive qualifier (UNC tails, Unix-style paths in test hosts)
+    # can never be an organized destination.
+    $qual = Split-Path $Path -Qualifier -ErrorAction SilentlyContinue
+    if(-not $qual){ return $false }
+    $letter = $qual.TrimEnd(':')
     $root = Get-SysOrgDestinationRoot -Letter $letter -Config $Config
     $p = $Path.TrimEnd('\')
     if($p -ieq $root -or $p.StartsWith($root + '\',[StringComparison]::OrdinalIgnoreCase)){ return $true }
@@ -330,7 +336,7 @@ function Invoke-SysOrgSafeMove {
         }
         $final = Get-SysOrgUniquePath -Path $Destination
 
-        $sameVolume = ((Split-Path $Source -Qualifier) -ieq (Split-Path $final -Qualifier))
+        $sameVolume = ((Split-Path $Source -Qualifier -ErrorAction SilentlyContinue) -ieq (Split-Path $final -Qualifier -ErrorAction SilentlyContinue))
         $allowCross = Get-SysOrgSetting $Config 'Move.AllowCrossVolume' $true
 
         if($sameVolume){

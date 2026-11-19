@@ -21,7 +21,10 @@ BeforeAll {
         FolderAudit            = @{ Enabled=$true; SkipHiddenSystemDirs=$true; RespectDefenderCFA=$false }
         Categories             = @{}
     }
-    $script:letter = (Split-Path $TestDrive -Qualifier).TrimEnd(':')
+    # Drive qualifier of TestDrive; on non-Windows hosts (local test runs) there
+    # is no qualifier, so fall back to a placeholder letter - it is only used for
+    # cache-file naming and scope messages, never for addressing.
+    $script:letter = if($env:OS -eq 'Windows_NT'){ (Split-Path $TestDrive -Qualifier).TrimEnd(':').ToUpper() } else { 'S' }
 }
 
 Describe 'Get-SysOrgInventory exclusions' {
@@ -39,34 +42,44 @@ Describe 'Get-SysOrgInventory exclusions' {
         @($inv | Where-Object { $_.FullName -like '*ignored*' }).Count | Should -Be 0
     }
     It 'cloud placeholders (Offline, RecallOnDataAccess) are never recorded (P1-5)' {
+        # Cross-version assertions on the raw-int helper (production surface):
+        Test-SysOrgCloudPlaceholderAttributes -Attributes 0x400020 | Should -BeTrue    # Archive | RecallOnDataAccess
+        Test-SysOrgCloudPlaceholderAttributes -Attributes 0x20     | Should -BeFalse   # Archive only
+        Test-SysOrgCloudPlaceholderAttributes -Attributes 0x1000   | Should -BeTrue    # Offline
+        if($env:OS -ne 'Windows_NT'){
+            Set-ItResult -Inconclusive -Because 'Linux file APIs ignore Offline attribute writes; Windows CI covers the real-file inventory path'
+            return
+        }
         $root = Join-Path $TestDrive ('cloud-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $root -Force | Out-Null
         $p1 = Join-Path $root 'offline.txt'
-        $p2 = Join-Path $root 'recall.txt'
         $p3 = Join-Path $root 'normal.txt'
-        Set-Content -LiteralPath $p1 -Value 'a'; Set-Content -LiteralPath $p2 -Value 'b'; Set-Content -LiteralPath $p3 -Value 'c'
+        Set-Content -LiteralPath $p1 -Value 'a'; Set-Content -LiteralPath $p3 -Value 'c'
         $f1 = Get-Item -LiteralPath $p1
         $f1.Attributes = ($f1.Attributes -bor [System.IO.FileAttributes]::Offline)
-        $f2 = Get-Item -LiteralPath $p2
-        $f2.Attributes = [System.IO.FileAttributes](([int]$f2.Attributes) -bor 0x400000)   # RecallOnDataAccess
         (($f1.Attributes -band [System.IO.FileAttributes]::Offline) -ne 0) | Should -BeTrue
-        ((([int]$f2.Attributes) -band 0x400000) -ne 0) | Should -BeTrue
+        # RecallOnDataAccess (0x400000) does not exist in the .NET Framework enum that
+        # Windows PowerShell 5.1 uses, so it cannot be assigned to a real file there.
+        # The raw-int helper above is the cross-version surface production uses.
         $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
         $names = @($inv | ForEach-Object { $_.Name })
         $names.Count | Should -Be 1
         $names[0] | Should -Be 'normal.txt'
     }
     It 'does not descend into directory junctions (P2-5)' {
+        if($env:OS -ne 'Windows_NT'){ Set-ItResult -Inconclusive -Because 'Windows-only: NTFS junctions'; return }
         $root  = Join-Path $TestDrive ('junc-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path (Join-Path $root 'real') -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $root 'real\a.txt') -Value 'a'
-        # mklink /J works on PowerShell 5.1 without elevation
-        $null = cmd /c mklink /J "`"$(Join-Path $root 'link')`" `"$(Join-Path $root 'real')`""
+        # New-Item -ItemType Junction needs no elevation on PowerShell 5.1 and avoids
+        # the fragile cmd/mklink quoting that broke on CI.
+        $null = New-Item -ItemType Junction -Path (Join-Path $root 'link') -Target (Join-Path $root 'real')
         Test-Path -LiteralPath (Join-Path $root 'link') | Should -BeTrue
         $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
         @($inv | Where-Object { $_.Name -eq 'a.txt' }).Count | Should -Be 1   # found once, not through the junction
     }
     It 'long paths are recorded as SkippedLongPath and not categorized normally (P2-5)' {
+        if($env:OS -ne 'Windows_NT'){ Set-ItResult -Inconclusive -Because 'Windows-only: \\?\ long-path namespace'; return }
         $root = Join-Path $TestDrive ('deep-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         $deep = $root
         try {
@@ -121,9 +134,12 @@ Describe 'Inventory cache keying (P1-9)' {
 
 Describe 'Get-SysOrgProjectClusters (P2-6)' {
     It 'clusters files sharing the same distinctive tokens regardless of word order' {
+        # Tokens must be distinctive: >= 4 chars, not a stopword (the module filters
+        # 'final', 'report', numbers and short tokens like 'q3'), so order is the
+        # only thing that differs between the names.
         $root = Join-Path $TestDrive ('clust-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $root -Force | Out-Null
-        $files = @('Report Q3 2025 Final.txt','Final Q3 Report 2025.docx','final report 2025 q3.pdf')
+        $files = @('Orion Design Brief.txt','Brief Design Orion.docx','Design Brief Orion.pdf')
         foreach($n in $files){ Set-Content -LiteralPath (Join-Path $root $n) -Value 'x' }
         $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
         $c = Get-SysOrgProjectClusters -Inventory $inv -Config $scanCfg
@@ -134,7 +150,7 @@ Describe 'Get-SysOrgProjectClusters (P2-6)' {
     It 'falls back to the "cluster" slug for non-ASCII stems' {
         $root = Join-Path $TestDrive ('slug-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $root -Force | Out-Null
-        $stem = [string]::Concat([char]0x6587, [char]0x6863)   # CJK stem -> empty ASCII slug
+        $stem = [string]::Concat([char]0x6587, [char]0x6863, [char]0x6848)   # 3-char CJK stem: passes the >= 3 stem gate, produces an empty ASCII slug
         foreach($ext in @('.docx','.pdf','.txt')){ Set-Content -LiteralPath (Join-Path $root ($stem + $ext)) -Value 'x' }
         $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
         $c = Get-SysOrgProjectClusters -Inventory $inv -Config $scanCfg

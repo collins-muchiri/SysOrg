@@ -118,7 +118,9 @@ Describe 'Duplicate groups and sums (P0-2)' {
             [pscustomobject]@{ FullName=(Join-Path $root 'second.txt'); Name='second.txt'; Stem='second'; Extension='.txt'; Length=20
                 LastWriteTime=(Get-Date '2026-01-02'); Directory=$root; Category='Documents' }
         )
-        $dupCfg = @{ Duplicates = @{ Policy='Quarantine'; MinFileSizeKB=1; HeaderHashKB=64 } }
+        # MinFileSizeKB=0: the fixture files are 20 bytes, so any positive
+        # KB threshold would filter them out before duplicate grouping.
+        $dupCfg = @{ Duplicates = @{ Policy='Quarantine'; MinFileSizeKB=0; HeaderHashKB=64 } }
         $groups = @(Find-SysOrgDuplicates -Inventory $inv -Config $dupCfg)
         $groups.Count | Should -Be 1
         $groups[0].WastedBytes | Should -Be 20

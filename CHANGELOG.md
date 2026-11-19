@@ -6,6 +6,43 @@ All notable changes to SysOrg. Versions follow [SemVer](https://semver.org/).
 
 Safety, data-integrity and robustness release (improvement plan P0..P3).
 
+### CI first-run fixes (this tag was re-published after the first CI run failed)
+The initial v1.2.0 CI run failed 16 of 49 tests on Windows PowerShell 5.1. All
+root causes were fixed and the release was rebuilt from the green commit:
+- **Hex-literal trap (all runtimes).** `Test-SysOrgDirAccess` built
+  `GENERIC_READ` from `0x80000000`, which PowerShell parses as a NEGATIVE Int32
+  (two's complement for 8-digit hex with the high bit set); the `[uint32]` cast
+  threw on every call, so every folder-safety probe and inventory scan crashed.
+  The access mask is now the decimal literal `2147483649`.
+- **`-f` inside method-call argument lists (all runtimes).** PowerShell binds
+  the format operator only to its immediate next expression inside a method
+  call, so `$writer.WriteLine('fmt' -f a, b, c)` formatted with ONE argument
+  and threw FormatException on the first journal write of every plan
+  execution. All three journal writes now format into a variable first.
+- **Empty-array return idiom.** `return ,$array` leaks its one-element wrapper
+  under Pester capture (and differs by host), so `Find-SysOrgDuplicates` /
+  `Get-SysOrgInventory` results appeared as `@(@())`. Both functions now
+  stream their records; every caller collects with `@()`.
+- **Join-Path on a non-existent drive.** `New-SysOrgPlan` threw (silently
+  swallowed per-file) when the destination root's drive letter was not present
+  on the machine; destinations are now built by concatenation.
+- **PS 5.1 enum gaps.** `RecallOnDataAccess` (0x400000) does not exist in the
+  .NET Framework `FileAttributes` enum, so casting threw; attribute checks are
+  raw-int based now, with a new exported `Test-SysOrgCloudPlaceholderAttributes`
+  helper (same behavior on 5.1 and 7).
+- **Wildcard exclusion subtrees.** `C:\Users\*\AppData` now also excludes
+  everything BELOW the matched path, not just the exact match.
+- **Junction fixture.** The reparse test uses `New-Item -ItemType Junction`
+  (no elevation needed) instead of fragile `cmd /c mklink` quoting.
+- **Test-fixture correctness.** The duplicate fixture used a `MinFileSizeKB=1`
+  threshold against 20-byte files (no group could ever form); the cluster
+  fixture used the stopword 'final' / short tokens / numbers the module
+  deliberately filters, and a 2-char CJK stem below the >= 3 stem gate.
+- **Portability hardening.** The Win32 writability probe degrades to a .NET
+  check on non-Windows hosts (test runners); qualifier-less paths no longer
+  crash `Test-SysOrgDestinationPath` / protection-reason logic; Windows-only
+  tests are marked inconclusive off-Windows instead of failing.
+
 ### Verified review claims (P0)
 - **P0-1 / P0-2 / P0-3 / P0-5 (review artifacts - verified not reproducible).** A
   static review claimed the published v1.0.0 tree did not parse (stripped casts in

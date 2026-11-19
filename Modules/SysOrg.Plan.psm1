@@ -43,7 +43,10 @@ function New-SysOrgPlan {
                     $h = $dupSet[$src]
                     $hash8 = if($h -and ($h.Length -ge 8)){ $h.Substring(0,8) } else { 'dup' }
                     $qName = '{0}_{1}{2}' -f $f.Stem, $hash8, $f.Extension
-                    $dest  = Join-Path (Join-Path $root $qFolder) (Join-Path $planId $qName)
+                    # NOTE: built by concatenation, not Join-Path - Join-Path throws
+                    # 'Cannot find drive' when the root's drive letter does not exist
+                    # on this machine (which is exactly the case in test runs).
+                    $dest  = ($root + '\' + $qFolder + '\' + $planId + '\' + $qName)
                     $actions.Add([pscustomobject]@{ Action='Quarantine'; Source=$src; Destination=$dest; Reason='Exact duplicate (keeper identified during scan)'; SizeBytes=$f.Length; Hash=$h })
                 }
                 continue
@@ -67,7 +70,10 @@ function New-SysOrgPlan {
             } elseif($dateMode -eq 'YearMonth'){
                 $rel = Join-Path $cat ([datetime]$f.LastWriteTime).ToString('yyyy-MM')
             }
-            $dest = Join-Path (Join-Path $root $rel) $f.Name
+            # Normalize separators and concatenate: Join-Path would throw on a
+            # non-existent drive qualifier (see quarantine destination above).
+            $rel  = ($rel -replace '/', '\')
+            $dest = ($root + '\' + $rel + '\' + $f.Name)
 
             $dt = [datetime]$f.LastWriteTime
             $reasonParts = @("Category=$cat")
@@ -218,7 +224,7 @@ function Invoke-SysOrgPlan {
             # P2-1: hash only when the journal needs it (quarantine or cross-volume);
             # reuse the scan-time hash for quarantines when present
             $needsHash = ($a.Action -eq 'Quarantine') -or
-                         ((Split-Path $a.Source -Qualifier) -ine (Split-Path $a.Destination -Qualifier))
+                         ((Split-Path $a.Source -Qualifier -ErrorAction SilentlyContinue) -ine (Split-Path $a.Destination -Qualifier -ErrorAction SilentlyContinue))
             $hashBefore = $null
             if($needsHash){
                 if($a.PSObject.Properties['Hash'] -and $a.Hash){ $hashBefore = $a.Hash }
@@ -237,11 +243,19 @@ function Invoke-SysOrgPlan {
                         $summary.BytesMoved += [int64]$a.SizeBytes
                         Write-SysOrgLog "Moved: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
                     }
-                    $writer.WriteLine('"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, $a.Action, $a.Source, $result.Destination, $hashBefore)
+                    # P0-fix: inside a method-call argument list the -f operator binds
+                    # only to its immediate next expression - the remaining commas become
+                    # extra method arguments. Format into a variable FIRST, then write.
+                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, $a.Action, $a.Source, $result.Destination, $hashBefore
+                    $writer.WriteLine($journalLine)
                 }
                 'CopiedVerified' {
                     $summary.Copied++
-                    $writer.WriteLine('"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, $a.Action, $a.Source, $result.Destination, $hashBefore)
+                    # P0-fix: inside a method-call argument list the -f operator binds
+                    # only to its immediate next expression - the remaining commas become
+                    # extra method arguments. Format into a variable FIRST, then write.
+                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, $a.Action, $a.Source, $result.Destination, $hashBefore
+                    $writer.WriteLine($journalLine)
                     Write-SysOrgLog "Copied+verified: $($a.Source) -> $($result.Destination) ($($result.Message))" -Level WARN -LogFolder $logFolder
                 }
                 'CollisionDuplicate' {
@@ -252,7 +266,8 @@ function Invoke-SysOrgPlan {
                     $r2 = Invoke-SysOrgSafeMove -Source $a.Source -Destination (Join-Path $qRoot (Split-Path $a.Source -Leaf)) -Config $Config
                     if(($r2.Status -eq 'Moved') -or ($r2.Status -eq 'CopiedVerified')){
                         $summary.Quarantined++
-                        $writer.WriteLine('"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, 'Quarantine', $a.Source, $r2.Destination, $hashBefore)
+                        $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, 'Quarantine', $a.Source, $r2.Destination, $hashBefore
+                        $writer.WriteLine($journalLine)
                         Write-SysOrgLog "Collision duplicate quarantined: $($a.Source) -> $($r2.Destination)" -Level ACTION -LogFolder $logFolder
                     } else {
                         $summary.Failed++
@@ -333,9 +348,11 @@ function New-SysOrgScanReport {
     param([Parameter(Mandatory)][string]$Letter,$Config,[Parameter(Mandatory)][string]$AppRoot)
     $logFolder = Join-Path $AppRoot 'Logs'
     Write-SysOrgLog "Scheduled report scan starting for drive $Letter`:" -LogFolder $logFolder
-    $inv = Get-SysOrgInventory -Letter $Letter -Config $Config -CacheFolder (Join-Path $AppRoot 'Cache') -DefaultScope -NoCache
+    # @() wrapping: the inventory and duplicate functions stream their records
+    # (an empty result emits nothing), so callers must collect with @().
+    $inv = @(Get-SysOrgInventory -Letter $Letter -Config $Config -CacheFolder (Join-Path $AppRoot 'Cache') -DefaultScope -NoCache)
     $catCounts = $inv | Group-Object Category | Sort-Object Count -Descending
-    $dupGroups = Find-SysOrgDuplicates -Inventory $inv -Config $Config
+    $dupGroups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config)
     $clusters  = Get-SysOrgProjectClusters -Inventory $inv -Config $Config
 
     $reportsFolder = Join-Path (Get-SysOrgDestinationRoot -Letter $Letter -Config $Config) (Get-SysOrgSetting $Config 'ReportsFolderName' '_Reports')

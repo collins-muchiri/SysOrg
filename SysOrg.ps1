@@ -92,7 +92,8 @@ function Invoke-SysOrgScanFlow {
     $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail }
     if($NoCacheSwitch){ $invParams.NoCache = $true }
     if(-not $WholeDrive){ $invParams.DefaultScope = $true }
-    $inv = Get-SysOrgInventory @invParams
+    # @() collect: the inventory streams records (empty scan emits nothing)
+    $inv = @(Get-SysOrgInventory @invParams)
     if(@($inv).Count -eq 0){
         Write-Host 'Nothing was scanned; no plan was built. Nothing was modified.' -ForegroundColor Yellow
         return
@@ -114,7 +115,7 @@ function Invoke-SysOrgScanFlow {
     }
     Write-Host ''
     Write-SysOrgLog 'Detecting duplicates (hashes candidate files; can take a while)...' -LogFolder $logFolder
-    $dups = Find-SysOrgDuplicates -Inventory $inv -Config $Config
+    $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config)
     Write-Host ("Duplicate groups found: {0}" -f @($dups).Count)
     $clusters = Get-SysOrgProjectClusters -Inventory $inv -Config $Config
     Write-Host ("Project clusters found: {0}" -f @($clusters.Clusters).Count)
@@ -218,11 +219,11 @@ while($running){
             '3' { $l = Get-SysOrgLetterInput -Prompt 'Drive letter to organize'; Invoke-SysOrgScanFlow -Letter $l }
             '4' {
                   $l = Get-SysOrgLetterInput -Prompt 'Drive letter to report'
-                  $inv = Get-SysOrgInventory -Letter $l -Config $Config -CacheFolder $folders.Cache -DefaultScope
+                  $inv = @(Get-SysOrgInventory -Letter $l -Config $Config -CacheFolder $folders.Cache -DefaultScope)
                   if(@($inv).Count -gt 0){
                       Write-Host ("Files: {0}" -f @($inv).Count)
                       $inv | Group-Object Category | Sort-Object Count -Descending | Format-Table Name,Count -AutoSize | Out-Host
-                      $dups = Find-SysOrgDuplicates -Inventory $inv -Config $Config
+                      $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config)
                       Write-Host ("Duplicate groups: {0} (report only - nothing moved)" -f @($dups).Count)
                   }
                 }

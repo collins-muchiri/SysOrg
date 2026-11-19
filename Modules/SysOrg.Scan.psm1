@@ -34,6 +34,24 @@ function Get-SysOrgCategory {
     return 'Other'
 }
 
+function Test-SysOrgCloudPlaceholderAttributes {
+<#
+.SYNOPSIS
+    True when raw file attributes mark a cloud placeholder (OneDrive files-on-demand).
+.DESCRIPTION
+    Checks Offline (0x1000) and RecallOnDataAccess (0x400000) on the raw integer so
+    it behaves identically on Windows PowerShell 5.1 and PowerShell 7 - the
+    .NET Framework FileAttributes enum has no RecallOnDataAccess member, and
+    casting the value would throw. Hashing or opening such a file would silently
+    hydrate the whole cloud library, so the scanner must skip it.
+.EXAMPLE
+    Test-SysOrgCloudPlaceholderAttributes -Attributes 0x400020   # -> True
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$Attributes)
+    return ((($Attributes -band 0x1000) -ne 0) -or (($Attributes -band 0x400000) -ne 0))
+}
+
 function Get-SysOrgInventory {
 <#
 .SYNOPSIS
@@ -115,7 +133,7 @@ function Get-SysOrgInventory {
 
     if(@($initial).Count -eq 0){
         Write-Warning ("No ScanRoots folders found on drive {0}:. Use -FullDrive to scan the whole drive, or edit ScanRoots in SysOrg.config.psd1." -f $Letter)
-        return ,@()
+        return @()   # streams nothing; callers collect with @() and get an empty array
     }
     Write-Host ("Scan scope ({0}): {1}" -f $scope, ($initial -join '; '))
 
@@ -140,7 +158,7 @@ function Get-SysOrgInventory {
                 $maxAge = Get-SysOrgSetting $Config 'InventoryCacheHours' 24
                 if($ageHours -lt $maxAge){
                     Write-Host ("Using cached inventory ({0}; pass -NoCache to force a rescan)." -f (Get-Item -LiteralPath $cacheFile).LastWriteTime)
-                    return ,@((Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json))
+                    return @((Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json))
                 }
             }
         }
@@ -193,17 +211,19 @@ function Get-SysOrgInventory {
         foreach($fi in $files){
             try{
                 if(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
-                $a = $fi.Attributes
+                # Attribute flags are compared as raw ints: on Windows PowerShell 5.1
+                # casting an int like 0x400020 to [System.IO.FileAttributes] throws
+                # (that value is not defined in the .NET Framework enum).
+                # 0x1 ReadOnly | 0x2 Hidden | 0x4 System | 0x400 ReparsePoint | 0x1000 Offline | 0x400000 RecallOnDataAccess
+                $aInt = [int]$fi.Attributes
                 if(Get-SysOrgSetting $Config 'SkipHiddenSystemFiles' $true){
-                    if((($a -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden) -or
-                       (($a -band [System.IO.FileAttributes]::System)  -eq [System.IO.FileAttributes]::System)){ continue }
+                    if((($aInt -band 0x2) -ne 0) -or (($aInt -band 0x4) -ne 0)){ continue }
                 }
                 # P1-5: cloud placeholders - Offline (0x1000) and RecallOnDataAccess (0x400000).
                 # Hashing or opening these files would silently hydrate the whole cloud library.
-                if((($a -band [System.IO.FileAttributes]::Offline) -eq [System.IO.FileAttributes]::Offline) -or
-                   (([int]$a -band 0x400000) -ne 0)){ continue }
+                if(Test-SysOrgCloudPlaceholderAttributes -Attributes $aInt){ continue }
                 # P2-5: never follow file reparse points
-                if((($a -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)){ continue }
+                if(($aInt -band 0x400) -ne 0){ continue }
                 # P2-5: long paths are recorded, not planned (PS 5.1 cannot address them reliably)
                 if($fi.FullName.Length -ge 260){
                     $records.Add([pscustomobject]@{ FullName=$fi.FullName; Name=$fi.Name; Stem=$fi.BaseName
@@ -237,7 +257,10 @@ function Get-SysOrgInventory {
             $arr | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
         } catch { Write-Warning "Inventory cache could not be written: $($_.Exception.Message)" }
     }
-    return ,$arr
+    # Stream the records: an empty scan emits nothing, and callers collect with @().
+    # The previous 'return ,$arr' idiom leaked its one-element wrapper in Pester
+    # capture contexts, which is exactly what the P0-2 test failure exposed.
+    return $arr
 }
 
 function Get-SysOrgOrganizedDirSet {
@@ -429,7 +452,9 @@ function Find-SysOrgDuplicates {
         }
     }
     Write-Progress -Activity 'Duplicate detection' -Completed
-    return ,$groups.ToArray()
+    # Stream groups (see Get-SysOrgInventory for why 'return ,$array' is wrong):
+    # callers collect with @(); an empty result emits nothing.
+    return $groups.ToArray()
 }
 
 Export-ModuleMember -Function *-SysOrg*

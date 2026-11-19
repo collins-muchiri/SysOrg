@@ -65,10 +65,26 @@ function Test-SysOrgDirAccess {
     $shareRw       = [uint32]7                # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
     $openExisting  = [uint32]3
     $backupSem     = [uint32]0x02000000       # FILE_FLAG_BACKUP_SEMANTICS (required to open directories)
-    $accRead       = [uint32](([int64]0x80000000) -bor 0x0001)   # GENERIC_READ | FILE_LIST_DIRECTORY
-    $accWrite      = [uint32]0x0006                              # FILE_ADD_FILE | FILE_ADD_SUBDIR
+    # NOTE: do NOT write 0x80000000 as a hex literal here - PowerShell parses 8-digit
+    # hex literals with the high bit set as negative Int32 (two's complement), which
+    # makes the [uint32] cast throw on every runtime. Use the decimal value instead.
+    $accRead       = [uint32]2147483649       # GENERIC_READ (0x80000000) | FILE_LIST_DIRECTORY (0x0001)
+    $accWrite      = [uint32]0x0006           # FILE_ADD_FILE | FILE_ADD_SUBDIR
 
     $res = [pscustomobject]@{ Readable=$false; Writable=$false; ReadError=0; WriteError=0 }
+
+    # Windows runs the Win32 probe (the authoritative path). On non-Windows hosts
+    # (test runners) kernel32 does not exist, so degrade gracefully with .NET checks.
+    # No file or folder is ever created, modified or deleted in either path.
+    if($env:OS -ne 'Windows_NT'){
+        try{
+            $res.Readable = [System.IO.Directory]::Exists($Path)
+            if($res.Readable){
+                $res.Writable = -not ((New-Object System.IO.DirectoryInfo($Path)).Attributes -band [System.IO.FileAttributes]::ReadOnly)
+            } else { $res.ReadError = 3 }   # ERROR_PATH_NOT_FOUND
+        } catch { $res.ReadError = 5 }      # ERROR_ACCESS_DENIED
+        return $res
+    }
 
     $h = [SysOrg.DirProbe]::CreateFileW($np, $accRead, $shareRw, [IntPtr]::Zero, $openExisting, $backupSem, [IntPtr]::Zero)
     if(-not $h.Equals([IntPtr](-1))){ $res.Readable = $true; [void][SysOrg.DirProbe]::CloseHandle($h) }
@@ -131,7 +147,8 @@ function Get-SysOrgFolderProtectionReason {
     if($isRoot){ return $null }
 
     $leaf = (Split-Path $p -Leaf).ToLowerInvariant()
-    $letter = (Split-Path $p -Qualifier).TrimEnd(':').ToUpper()
+    $qual = Split-Path $p -Qualifier -ErrorAction SilentlyContinue
+    $letter = if($qual){ $qual.TrimEnd(':').ToUpper() } else { $null }
     if(($letter -eq 'C') -and ($script:SystemFolderNames -contains $leaf)){ return 'System location (never alter)' }
     if($script:SystemFolderNames -contains $leaf){ return 'Protected folder name (never alter)' }
 
