@@ -43,11 +43,13 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
     It '-Force resumes: journaled sources are skipped and the journal is preserved' {
         $planPath = Join-Path $TestDrive 'plan2.json'
         $undoPath = Join-Path $TestDrive ('Undo\undo-plan-test-0002.csv')
-        (Import-Csv -LiteralPath $undoPath).Count | Should -Be 1
+        # @() : Import-Csv returns a SCALAR for a single data row, and PSCustomObject
+        # has no intrinsic .Count on Windows PowerShell 5.1 (PS 7 does).
+        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 1
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive -Force
         $res.Summary.Resumed | Should -Be 1
         $res.Summary.Moved   | Should -Be 0
-        (Import-Csv -LiteralPath $undoPath).Count | Should -Be 1   # journal unchanged, no duplicate header
+        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 1   # journal unchanged, no duplicate header
     }
     It 'resume after a simulated crash: pre-seeded journal skips that source and completes the rest' {
         $srcA = Join-Path $TestDrive 'work3\a.txt'; $srcB = Join-Path $TestDrive 'work3\b.txt'
@@ -75,7 +77,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         $res.Summary.Resumed | Should -Be 1
         $res.Summary.Moved   | Should -Be 1
         Test-Path -LiteralPath $srcB | Should -BeFalse
-        (Import-Csv -LiteralPath $undoPath).Count | Should -Be 2
+        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 2
         $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $planCfg
         $u.Restored | Should -Be 2
         Test-Path -LiteralPath $srcA | Should -BeTrue
