@@ -29,6 +29,7 @@ function Import-SysOrgConfig {
         PreserveSingleCategoryRatio = 0.9
         AlwaysScanFolders      = @('downloads','desktop','documents','temp','tmp','new folder')
         ProjectDetection       = @{ Enabled = $true; MinFiles = 3; MaxProjects = 200 }
+        FolderAudit            = @{ Enabled=$true; MaxTopLevelDepth=2; SkipHiddenSystemDirs=$true; RespectDefenderCFA=$true; IncludeRestrictedInPlans=$false }
         Duplicates             = @{ Policy='Quarantine'; QuarantineFolderName='_Duplicates'; MinFileSizeKB=256; HeaderHashKB=64 }
         Move                   = @{ AllowCrossVolume = $true }
         RemoveEmptySourceDirs  = $false

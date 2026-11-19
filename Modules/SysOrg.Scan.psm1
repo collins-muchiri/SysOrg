@@ -39,10 +39,13 @@ function Get-SysOrgInventory {
         [Parameter(Mandatory)][string]$Letter,
         $Config,
         [string]$CacheFolder,
-        [switch]$NoCache
+        [switch]$NoCache,
+        [string[]]$CfaFolders,
+        [System.Collections.Generic.List[object]]$AuditTrail
     )
     $root = ('{0}:\' -f $Letter)
     if(-not (Test-Path -LiteralPath $root)){ throw "Drive $root not found." }
+    if(-not $cfaFolders){ $cfaFolders = Get-SysOrgDefenderProtectedFolders -Config $Config }
 
     if($CacheFolder -and -not $NoCache){
         $cacheFile = Join-Path $CacheFolder ("inventory-{0}.json" -f $Letter)
@@ -65,6 +68,24 @@ function Get-SysOrgInventory {
         $dir = [string]$stack.Pop()
         if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
         if((Get-SysOrgSetting $Config 'ExcludeDestinations' $true) -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
+
+        # v1.1 folder safety gates: protected (cannot alter) vs restricted (read-only) vs organizable
+        if((Get-SysOrgSetting $Config 'FolderAudit.Enabled' $true) -and ($dir -ine $root)){
+            $protectReason = Get-SysOrgFolderProtectionReason -Path $dir -Config $Config -CfaFolders $cfaFolders
+            if($protectReason){
+                if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$protectReason }) }
+                continue
+            }
+            $acc = Test-SysOrgDirAccess -Path $dir
+            if(-not $acc.Readable){
+                if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=('Access denied reading folder (error {0})' -f $acc.ReadError) }) }
+                continue
+            }
+            if((-not $acc.Writable) -and (-not (Get-SysOrgSetting $Config 'FolderAudit.IncludeRestrictedInPlans' $false))){
+                if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Restricted'; Reason='No write permission - folder left in place' }) }
+                continue
+            }
+        }
 
         $subDirs = @(); $files = @()
         try{

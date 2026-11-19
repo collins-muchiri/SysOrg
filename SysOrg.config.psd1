@@ -1,5 +1,5 @@
 @{
-    Version = '1.0.0'
+    Version = '1.1.0'
 
     # Destination root per drive letter. '*' = fallback for unlisted drives.
     # Token '__AUTO__' resolves to "<DriveLetter>:\_Organized".
@@ -43,6 +43,19 @@
     AlwaysScanFolders           = @('downloads','desktop','documents','temp','tmp','new folder')
 
     ProjectDetection = @{ Enabled = $true; MinFiles = 3; MaxProjects = 200 }
+
+    # v1.1 folder safety audit: every folder is classified as
+    #   Protected   = cannot be altered (system locations, config exclusions, hidden/system,
+    #                 reparse points, Defender Controlled Folder Access, access-denied)
+    #   Restricted  = readable but not writable for the current user (left in place)
+    #   Organizable = readable and writable (eligible for organization)
+    FolderAudit = @{
+        Enabled                  = $true    # gate scans on folder-level checks
+        MaxTopLevelDepth         = 2        # depth of the console safety map (menu option 2 / -AuditDrive)
+        SkipHiddenSystemDirs     = $true    # hidden/system folders are treated as cannot-alter
+        RespectDefenderCFA       = $true    # honor Windows Defender Controlled Folder Access lists
+        IncludeRestrictedInPlans = $false   # true = also propose moves out of read-only folders
+    }
 
     Duplicates = @{
         Policy               = 'Quarantine'   # Quarantine | ReportOnly

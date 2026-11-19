@@ -5,6 +5,7 @@ Windows PowerShell 5.1+. Nothing is installed and nothing runs in the background
 
 ## Features
 
+- **Folder safety audit (v1.1)** — classifies every folder as **Protected** (cannot alter), **Restricted** (read-only for you, left in place), or **Organizable**, using a non-destructive directory-handle probe, Defender Controlled Folder Access lists, and your exclusions
 - **Drive detection** — internal SSD/HDD vs external, with confidence level and the evidence used
 - **Preview-first workflow** — scan → classify → correlate → plan (JSON) → review → explicit confirm → execute
 - **Type-first organization** — `Documents/2025/`, `Images/`, `Videos/` … with year (or year-month) subfolders
@@ -16,7 +17,7 @@ Windows PowerShell 5.1+. Nothing is installed and nothing runs in the background
 
 ## Quick start
 
-1. Download `SysOrg-1.0.0.zip` from the [Releases page](../../releases/latest).
+1. Download `SysOrg-1.1.0.zip` from the [Releases page](../../releases/latest).
 2. Right-click the ZIP → Properties → **Unblock** → extract.
 3. In the extracted folder run in PowerShell:
 
@@ -26,14 +27,32 @@ Windows PowerShell 5.1+. Nothing is installed and nothing runs in the background
 
 4. Launch the **SysOrg** desktop shortcut, then pick option `[1]` to detect drives.
 
+## Folder safety audit (new in v1.1.0)
+
+Menu option `[2]` (or `powershell -File .\SysOrg.ps1 -AuditDrive C`) shows the safety map for a drive:
+
+- **CANNOT BE ALTERED (Protected)** — Windows, Program Files, ProgramData, any `AppData`,
+  Recycle Bin, hidden/system folders, junctions/symlinks/OneDrive roots, Defender Controlled
+  Folder Access protected folders, your `ExcludedPaths`, and folders the current user cannot
+  even read. SysOrg never descends into or modifies any of these.
+- **READ-ONLY (Restricted)** — readable but not writable for the current user; contents stay
+  in place and are excluded from plans by default (`FolderAudit.IncludeRestrictedInPlans`).
+- **CAN BE ORGANIZED (Organizable)** — readable and writable; eligible for planning.
+
+The writability probe opens directory handles with create-rights only — it never creates,
+modifies, or deletes anything. The full map is saved to
+`<Root>\_Reports\SysOrg-FolderAudit-*.txt`, and every scan prints how many folders were
+skipped as protected or read-only.
+
 ## Usage (menu-driven console)
 
 - `[1]` Detect drives (type + confidence)
-- `[2]` Scan a drive → build plan → preview → optional execute
-- `[3]` Report-only scan (no changes)
-- `[4]` Execute a saved plan
-- `[5]` Undo a plan
-- `[6]` Open working folder (plans, undo journals, logs)
+- `[2]` Audit folders: which can / cannot be altered (safety map)
+- `[3]` Scan a drive → build plan → preview → optional execute
+- `[4]` Report-only scan (no changes)
+- `[5]` Execute a saved plan
+- `[6]` Undo a plan
+- `[7]` Open working folder (plans, undo journals, logs)
 
 ### CLI examples
 
