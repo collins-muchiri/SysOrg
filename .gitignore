@@ -1,0 +1,7 @@
+# SysOrg runtime data (never commit)
+Logs/
+Plans/
+Undo/
+Cache/
+*.log
+*.zip
