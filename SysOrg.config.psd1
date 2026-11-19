@@ -1,5 +1,5 @@
 @{
-    Version = '1.1.0'
+    Version = '1.2.0'
 
     # Destination root per drive letter. '*' = fallback for unlisted drives.
     # Token '__AUTO__' resolves to "<DriveLetter>:\_Organized".
@@ -9,6 +9,10 @@
     }
 
     # Paths never scanned or modified. Prefix match unless it contains wildcards.
+    # Root-less single names (e.g. 'Recovery') match ANY path segment on ANY drive.
+    # NOTE: every fixed drive also automatically gets Windows, Program Files,
+    # Program Files (x86), ProgramData, $Recycle.Bin, System Volume Information
+    # and Recovery appended at startup - they cannot be opted away by accident.
     ExcludedPaths = @(
         'C:\Windows'
         'C:\Program Files'
@@ -21,7 +25,7 @@
         'OneDriveTemp'
         '*\node_modules'
         '*\.git'
-        '*\.sysorg-ignore'      # drop a folder/file named .sysorg-ignore anywhere to exclude that tree
+        '*\.sysorg-ignore'      # the marker file itself; the traversal check skips its whole tree
     )
 
     ExcludedFilePatterns = @(
@@ -31,6 +35,13 @@
 
     SkipHiddenSystemFiles = $true     # files with Hidden and/or System attributes are skipped
     ExcludeDestinations   = $true     # destination roots are never re-scanned as sources
+
+    # Default scan scope (v1.2): scans start in these existing folders instead of the
+    # whole drive. Per-drive overrides possible, e.g. ScanRoots = @{ 'D' = @('Downloads') }.
+    # Whole-drive scans require the -FullDrive switch (CLI) on top of this config.
+    ScanRoots = @{
+        '*' = @('Desktop','Documents','Downloads','Pictures','Videos','Music')
+    }
 
     DateFolders = 'Year'              # Year | YearMonth | None  (subfolder inside each category)
     Categories  = @{}                 # optional overrides, e.g. Categories = @{ '.xyz' = 'Other' }
@@ -44,7 +55,7 @@
 
     ProjectDetection = @{ Enabled = $true; MinFiles = 3; MaxProjects = 200 }
 
-    # v1.1 folder safety audit: every folder is classified as
+    # Folder safety audit: every folder is classified as
     #   Protected   = cannot be altered (system locations, config exclusions, hidden/system,
     #                 reparse points, Defender Controlled Folder Access, access-denied)
     #   Restricted  = readable but not writable for the current user (left in place)
@@ -65,10 +76,11 @@
     }
 
     Move = @{
-        AllowCrossVolume = $true            # false = copy-only between drives (source kept)
+        # $true  = cross-volume moves are copy -> SHA256 verify -> remove source
+        # $false = verified copy-only between drives: every source is kept
+        AllowCrossVolume = $true
     }
 
-    RemoveEmptySourceDirs = $false          # SysOrg never deletes folders by default
     MaxPlanActions        = 5000
     InventoryCacheHours   = 24
     ReportsFolderName     = '_Reports'

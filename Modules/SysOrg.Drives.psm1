@@ -2,6 +2,12 @@
 # SysOrg.Drives.psm1 - internal/external + SSD/HDD detection with confidence and evidence.
 
 function ConvertFrom-SysOrgEnum {
+<#
+.SYNOPSIS
+    Maps a numeric CIM enum value to a friendly name using the supplied table.
+.EXAMPLE
+    ConvertFrom-SysOrgEnum -Value 7 -Map $busMap   # -> 'USB'
+#>
     param($Value,$Map)
     if($null -eq $Value){ return 'Unknown' }
     $s = "$Value"
@@ -10,25 +16,36 @@ function ConvertFrom-SysOrgEnum {
 }
 
 function Get-SysOrgDrive {
-    <#
-      Confidence model (each result includes the evidence used):
-        Removable volume            -> External, High
-        BusType USB / SD / MMC      -> External, High
-        BusType NVMe                -> Internal, High (NVMe is always internal solid-state)
-        MediaType SSD (SATA/SCSI)   -> Internal, Medium-High (firmware-reported)
-        MediaType HDD               -> Internal, Medium
-        Win32 InterfaceType USB     -> External, Medium (legacy fallback)
-        Only 'Fixed' volume known   -> Internal, Low (metadata missing)
-    #>
+<#
+.SYNOPSIS
+    Detects drives with location (internal/external), media type and confidence.
+.DESCRIPTION
+    Confidence model (each result includes the evidence used):
+      Removable volume            -> External, High
+      BusType USB / SD / MMC      -> External, High
+      BusType NVMe                -> Internal, High (NVMe is always internal solid-state)
+      MediaType SSD (SATA/SCSI)   -> Internal, Medium-High (firmware-reported)
+      MediaType HDD               -> Internal, Medium
+      Win32 InterfaceType USB     -> External, Medium (legacy fallback)
+      Only 'Fixed' volume known   -> Internal, Low (metadata missing)
+    Caveat: eSATA and Thunderbolt externals report as Internal (the PC sees them as
+    SATA/PCIe); the confidence model downgrades certainty and the DetectionBasis
+    string is the source of truth. SCM (MediaType 5) is mapped and reported as-is.
+.PARAMETER Letters
+    Optional filter, e.g. @('C','D').
+.EXAMPLE
+    Get-SysOrgDrive | Format-Table Drive,MediaType,BusType,Location,Confidence,DetectionBasis -AutoSize
+#>
     param([string[]]$Letters)
 
-    $results = @()
-    try { $volumes = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') }) } catch { $volumes = @() }
-    try { $parts   = @(Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter }) } catch { $parts = @() }
-    try { $wmiDisks = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue) } catch { $wmiDisks = @() }
-    try { $physDisks = @(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName 'MSFT_PhysicalDisk' -ErrorAction SilentlyContinue) } catch { $physDisks = @() }
+    $results = New-Object System.Collections.Generic.List[object]
+    try { $volumes = @(Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') }) } catch { Write-Verbose "Get-Volume unavailable: $($_.Exception.Message)"; $volumes = @() }
+    try { $parts   = @(Get-Partition -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter }) } catch { Write-Verbose "Get-Partition unavailable: $($_.Exception.Message)"; $parts = @() }
+    try { $wmiDisks = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue) } catch { Write-Verbose "Win32_DiskDrive unavailable: $($_.Exception.Message)"; $wmiDisks = @() }
+    try { $physDisks = @(Get-CimInstance -Namespace 'root/Microsoft/Windows/Storage' -ClassName 'MSFT_PhysicalDisk' -ErrorAction SilentlyContinue) } catch { Write-Verbose "MSFT_PhysicalDisk unavailable: $($_.Exception.Message)"; $physDisks = @() }
 
-    $mediaMap = @{ '0'='Unspecified'; '3'='HDD'; '4'='SSD' }
+    # P2-7: '5' = SCM (Storage Class Memory) added
+    $mediaMap = @{ '0'='Unspecified'; '3'='HDD'; '4'='SSD'; '5'='SCM' }
     $busMap   = @{ '1'='SCSI'; '2'='ATAPI'; '3'='ATA'; '4'='IEEE1394'; '5'='SSA'; '6'='Fabric'
                    '7'='USB'; '8'='RAID'; '9'='iSCSI'; '10'='SAS'; '11'='SATA'; '12'='SD'
                    '13'='MMC'; '14'='Virtual'; '15'='FileBacked'; '16'='Spaces'; '17'='NVMe' }
@@ -86,7 +103,7 @@ function Get-SysOrgDrive {
             $location='Internal'; $confidence='Low'; $basis='Fixed volume, no storage metadata'
         }
 
-        $results += [pscustomobject]@{
+        $results.Add([pscustomobject]@{
             Drive          = "$letter`:"
             Label          = $vol.FileSystemLabel
             FileSystem     = $vol.FileSystem
@@ -97,9 +114,9 @@ function Get-SysOrgDrive {
             Location       = $location
             Confidence     = $confidence
             DetectionBasis = $basis
-        }
+        })
     }
-    return ($results | Sort-Object Drive)
+    return ($results.ToArray() | Sort-Object Drive)
 }
 
 Export-ModuleMember -Function *-SysOrg*

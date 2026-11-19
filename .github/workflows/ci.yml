@@ -1,0 +1,41 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  validate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse all PowerShell files
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Include *.ps1,*.psm1,*.psd1 | ForEach-Object {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$null,[ref]$errs) | Out-Null
+            if($errs){
+              $failed = $true
+              Write-Host "PARSE FAIL: $($_.FullName)"
+              $errs | ForEach-Object { Write-Host "  $($_.Message)" }
+            }
+          }
+          if($failed){ exit 1 }
+
+      - name: PSScriptAnalyzer (errors fail the build)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error -Settings .\PSScriptAnalyzerSettings.psd1
+          if($r){ $r | Format-Table -AutoSize; exit 1 }
+
+      - name: Pester tests on Windows PowerShell 5.1 (the supported runtime)
+        shell: powershell
+        run: |
+          Install-PackageProvider NuGet -Force -Scope CurrentUser | Out-Null
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -MinimumVersion 5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = '.\Tests'
+          $cfg.Run.Exit = $true
+          $cfg.TestResult.Enabled = $true
+          Invoke-Pester -Configuration $cfg

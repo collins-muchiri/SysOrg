@@ -1,7 +1,16 @@
 #Requires -Version 5.1
 param([switch]$KeepData)
-$appRoot  = Split-Path -Parent $MyInvocation.MyCommand.Path
+$appRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# P2-8: honor ScheduledTaskName from the config file instead of hardcoding
 $taskName = 'SysOrg Weekly Scan'
+$cfgFile = Join-Path $appRoot 'SysOrg.config.psd1'
+if(Test-Path -LiteralPath $cfgFile){
+    try {
+        $cfg = Import-PowerShellDataFile -LiteralPath $cfgFile
+        if($cfg.ScheduledTaskName){ $taskName = $cfg.ScheduledTaskName }
+    } catch { Write-Warning "Could not read task name from config; using default." }
+}
 
 try {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop

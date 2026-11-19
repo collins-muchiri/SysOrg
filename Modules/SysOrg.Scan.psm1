@@ -20,6 +20,12 @@ foreach($cat in $script:CategoryMap.Keys){
 }
 
 function Get-SysOrgCategory {
+<#
+.SYNOPSIS
+    Maps a file extension to a category name; user Categories overrides win.
+.EXAMPLE
+    Get-SysOrgCategory -Extension '.pdf' -Config $cfg   # -> 'Documents'
+#>
     param([string]$Extension,$Config)
     $ext = $Extension.ToLowerInvariant()
     $overrides = Get-SysOrgSetting $Config 'Categories' $null
@@ -29,43 +35,130 @@ function Get-SysOrgCategory {
 }
 
 function Get-SysOrgInventory {
-    <#
-      Recursive file inventory. Skips excluded paths/files, hidden+system files,
-      and reparse points (junctions/symlinks) to avoid loops and OneDrive churn.
-      Caches to JSON for 24 h to make rescans fast.
-    #>
+<#
+.SYNOPSIS
+    Recursive file inventory with exclusions, folder safety gates, cloud-placeholder
+    skip, long-path recording and a config-keyed JSON cache.
+.DESCRIPTION
+    Default start point is the drive root. With -DefaultScope, the ScanRoots config
+    narrows the scan to existing profile folders (e.g. Desktop, Documents, Downloads,
+    Pictures, Videos, Music) on the scanned drive - a drive with none of them yields
+    zero records instead of scanning everything. -Roots forces explicit start folders
+    (used by tests and power users). Cloud placeholders (OneDrive files-on-demand:
+    Offline / RecallOnDataAccess) are never opened, so scanning cannot hydrate them.
+    Files at or above 260 characters of path are recorded with Category
+    'SkippedLongPath' (Windows PowerShell 5.1 cannot reliably address them; PowerShell
+    7 with LongPathsEnabled lifts this).
+.PARAMETER Letter
+    Drive letter whose root is scanned (also keys the cache file).
+.PARAMETER DefaultScope
+    Resolve the ScanRoots config entry for this drive instead of the whole drive.
+.PARAMETER Roots
+    Explicit absolute start folders; overrides the drive root and -DefaultScope.
+.PARAMETER NoCache
+    Ignore and refresh the JSON inventory cache.
+.PARAMETER CacheFolder
+    Folder for the cache file; omitted = no caching.
+.PARAMETER CfaFolders
+    Defender Controlled Folder Access folders (auto-detected when omitted).
+.PARAMETER AuditTrail
+    Optional list receiving Protected/Restricted folder classification entries.
+.EXAMPLE
+    Get-SysOrgInventory -Letter C -Config $cfg -CacheFolder C:\SysOrg\Cache -DefaultScope
+#>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Letter,
         $Config,
         [string]$CacheFolder,
         [switch]$NoCache,
+        [switch]$DefaultScope,
+        [string[]]$Roots,
         [string[]]$CfaFolders,
         [System.Collections.Generic.List[object]]$AuditTrail
     )
     $root = ('{0}:\' -f $Letter)
-    if(-not (Test-Path -LiteralPath $root)){ throw "Drive $root not found." }
+    if(-not ($Roots -and @($Roots).Count -gt 0)){
+        if(-not (Test-Path -LiteralPath $root)){ throw "Drive $root not found." }
+    }
     if(-not $cfaFolders){ $cfaFolders = Get-SysOrgDefenderProtectedFolders -Config $Config }
 
-    if($CacheFolder -and -not $NoCache){
-        $cacheFile = Join-Path $CacheFolder ("inventory-{0}.json" -f $Letter)
-        if(Test-Path -LiteralPath $cacheFile){
-            $ageHours = ((Get-Date) - (Get-Item -LiteralPath $cacheFile).LastWriteTime).TotalHours
-            $maxAge = Get-SysOrgSetting $Config 'InventoryCacheHours' 24
-            if($ageHours -lt $maxAge){
-                Write-Host ("Using cached inventory ({0}; use -NoCache to force rescan)." -f (Get-Item -LiteralPath $cacheFile).LastWriteTime)
-                return ,@((Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json))
+    # --- P1-6: resolve scan roots ---
+    $initial = @()
+    $scope = 'full'
+    if($Roots -and @($Roots).Count -gt 0){
+        $scope = 'custom'
+        $initial = @($Roots | Where-Object { Test-Path -LiteralPath $_ })
+    }
+    elseif($DefaultScope){
+        $subs = $null
+        $rootsCfg = $Config.ScanRoots
+        if($rootsCfg -is [hashtable]){
+            if($rootsCfg.ContainsKey($Letter)){ $subs = $rootsCfg[$Letter] }
+            elseif($rootsCfg.ContainsKey('*')){ $subs = $rootsCfg['*'] }
+        }
+        if($subs){
+            $resolved = New-Object System.Collections.Generic.HashSet[string]
+            foreach($sub in @($subs)){
+                if([string]::IsNullOrWhiteSpace($sub)){ continue }
+                $driveRel = ('{0}:\{1}' -f $Letter, ($sub.TrimStart('\')))
+                if(Test-Path -LiteralPath $driveRel){ [void]$resolved.Add($driveRel) }
+                $prof = Join-Path $env:USERPROFILE $sub
+                if((Split-Path $prof -Qualifier) -ieq ('{0}:' -f $Letter)){
+                    if(Test-Path -LiteralPath $prof){ [void]$resolved.Add($prof) }
+                }
+            }
+            if($resolved.Count -gt 0){ $initial = @($resolved); $scope = 'scoped' }
+        }
+    }
+    else { $initial = @($root) }
+
+    if(@($initial).Count -eq 0){
+        Write-Warning ("No ScanRoots folders found on drive {0}:. Use -FullDrive to scan the whole drive, or edit ScanRoots in SysOrg.config.psd1." -f $Letter)
+        return ,@()
+    }
+    Write-Host ("Scan scope ({0}): {1}" -f $scope, ($initial -join '; '))
+
+    # --- P1-9: cache key includes scope tag + SHA256 prefix of the config file ---
+    $cfgTag = ''
+    try{
+        $appRootForCfg = Get-SysOrgSetting $Config 'AppRoot' ''
+        if($appRootForCfg){
+            $cfgPath = Join-Path $appRootForCfg 'SysOrg.config.psd1'
+            if(Test-Path -LiteralPath $cfgPath){
+                $cfgTag = '-' + (Get-FileHash -LiteralPath $cfgPath -Algorithm SHA256).Hash.Substring(0,8)
+            }
+        }
+    } catch { Write-Verbose "Config-hash cache tag unavailable: $($_.Exception.Message)" }
+
+    $cacheFile = $null
+    if($CacheFolder){
+        $cacheFile = Join-Path $CacheFolder ('inventory-{0}-{1}{2}.json' -f $Letter, $scope, $cfgTag)
+        if(-not $NoCache){
+            if(Test-Path -LiteralPath $cacheFile){
+                $ageHours = ((Get-Date) - (Get-Item -LiteralPath $cacheFile).LastWriteTime).TotalHours
+                $maxAge = Get-SysOrgSetting $Config 'InventoryCacheHours' 24
+                if($ageHours -lt $maxAge){
+                    Write-Host ("Using cached inventory ({0}; pass -NoCache to force a rescan)." -f (Get-Item -LiteralPath $cacheFile).LastWriteTime)
+                    return ,@((Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json))
+                }
             }
         }
     }
 
     $records = New-Object System.Collections.Generic.List[object]
     $stack = New-Object System.Collections.Stack
-    [void]$stack.Push($root)
+    foreach($startDir in $initial){ [void]$stack.Push([string]$startDir) }
     $count = 0
 
     while($stack.Count -gt 0){
         $dir = [string]$stack.Pop()
+
+        # P1-8: a .sysorg-ignore marker excludes the WHOLE tree, not just the marker itself
+        if(Test-Path -LiteralPath (Join-Path $dir '.sysorg-ignore')){
+            Write-Verbose "Marker .sysorg-ignore found; skipping tree: $dir"
+            continue
+        }
         if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
         if((Get-SysOrgSetting $Config 'ExcludeDestinations' $true) -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
 
@@ -91,19 +184,33 @@ function Get-SysOrgInventory {
         try{
             $di = New-Object System.IO.DirectoryInfo($dir)
             if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ continue }
-            try { $subDirs = $di.GetDirectories() } catch { }
-            try { $files   = $di.GetFiles() } catch { }
-        } catch { continue }
+            try { $subDirs = $di.GetDirectories() } catch { Write-Verbose "Directory enumeration failed: $dir - $($_.Exception.Message)" }
+            try { $files   = $di.GetFiles() } catch { Write-Verbose "File enumeration failed: $dir - $($_.Exception.Message)" }
+        } catch { Write-Verbose "Folder skipped: $dir - $($_.Exception.Message)"; continue }
 
         foreach($d in $subDirs){ [void]$stack.Push($d.FullName) }
 
         foreach($fi in $files){
             try{
                 if(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
+                $a = $fi.Attributes
                 if(Get-SysOrgSetting $Config 'SkipHiddenSystemFiles' $true){
-                    $a = $fi.Attributes
                     if((($a -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden) -or
                        (($a -band [System.IO.FileAttributes]::System)  -eq [System.IO.FileAttributes]::System)){ continue }
+                }
+                # P1-5: cloud placeholders - Offline (0x1000) and RecallOnDataAccess (0x400000).
+                # Hashing or opening these files would silently hydrate the whole cloud library.
+                if((($a -band [System.IO.FileAttributes]::Offline) -eq [System.IO.FileAttributes]::Offline) -or
+                   (([int]$a -band 0x400000) -ne 0)){ continue }
+                # P2-5: never follow file reparse points
+                if((($a -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)){ continue }
+                # P2-5: long paths are recorded, not planned (PS 5.1 cannot address them reliably)
+                if($fi.FullName.Length -ge 260){
+                    $records.Add([pscustomobject]@{ FullName=$fi.FullName; Name=$fi.Name; Stem=$fi.BaseName
+                        Extension=$fi.Extension.ToLowerInvariant(); Length=[int64]$fi.Length
+                        LastWriteTime=$fi.LastWriteTime; Directory=$fi.DirectoryName; Category='SkippedLongPath' })
+                    $count++
+                    continue
                 }
                 $ext = $fi.Extension.ToLowerInvariant()
                 $records.Add([pscustomobject]@{
@@ -118,24 +225,29 @@ function Get-SysOrgInventory {
                 })
                 $count++
                 if($count % 200 -eq 0){ Write-Progress -Activity "Scanning $root" -Status "$count files (in: $dir)" }
-            } catch { }
+            } catch { Write-Verbose "Skipped file $($fi.FullName): $($_.Exception.Message)" }
         }
     }
     Write-Progress -Activity "Scanning $root" -Completed
     $arr = $records.ToArray()
 
-    if($CacheFolder){
+    if($cacheFile){
         try{
             if(-not (Test-Path -LiteralPath $CacheFolder)){ New-Item -ItemType Directory -Path $CacheFolder -Force | Out-Null }
-            $arr | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $CacheFolder ("inventory-{0}.json" -f $Letter)) -Encoding UTF8
+            $arr | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
         } catch { Write-Warning "Inventory cache could not be written: $($_.Exception.Message)" }
     }
     return ,$arr
 }
 
 function Get-SysOrgOrganizedDirSet {
-    <# Folders that already look organized: >= MinFiles, >= ratio single category,
-       and not a folder users routinely dump files into. Their subtrees are preserved. #>
+<#
+.SYNOPSIS
+    Folders that already look organized: >= MinFiles files with >= ratio in one
+    category, excluding routine dump folders. Their subtrees are preserved.
+.EXAMPLE
+    $set = Get-SysOrgOrganizedDirSet -Inventory $inv -Config $cfg
+#>
     param($Inventory,$Config)
     $set = @{}
     if(-not (Get-SysOrgSetting $Config 'PreserveExistingFolders' $true)){ return ,$set }
@@ -163,6 +275,12 @@ function Get-SysOrgOrganizedDirSet {
 }
 
 function Test-SysOrgInOrganizedDir {
+<#
+.SYNOPSIS
+    True when a file's directory is inside an already-organized (preserved) folder.
+.EXAMPLE
+    Test-SysOrgInOrganizedDir -Directory $f.Directory -OrganizedSet $set
+#>
     param([string]$Directory,$OrganizedSet)
     $cur = $Directory.TrimEnd('\')
     while($cur -and ($cur.Length -gt 3)){
@@ -173,14 +291,24 @@ function Test-SysOrgInOrganizedDir {
 }
 
 function Get-SysOrgProjectClusters {
-    <# Conservative relationship detection:
-       1) same filename stem across >= 2 file types (e.g. Report.docx + Report.pdf)
-       2) shared distinctive name tokens (stopwords/numbers filtered)
-       Returns pscustomobject { Lookup (FullName->Key hashtable), Clusters (array) }. #>
+<#
+.SYNOPSIS
+    Conservative relationship detection returning { Lookup, Clusters }.
+.DESCRIPTION
+    1) same filename stem across >= 2 file types (e.g. Report.docx + Report.pdf)
+    2) shared distinctive name tokens (stopwords/numbers filtered).
+    P2-6: the token signature is order-independent (tokens are sorted and
+    de-duplicated before the first three are taken), so 'Report Q3 2025 Final'
+    and 'Final Q3 Report 2025' cluster together. Cluster keys fall back to
+    'cluster' when a stem produces an empty ASCII slug (non-ASCII names).
+.EXAMPLE
+    $c = Get-SysOrgProjectClusters -Inventory $inv -Config $cfg; $c.Lookup['C:\x\Report.pdf']
+#>
     param($Inventory,$Config)
-    $lookup = @{}; $clusters = @()
+    $lookup = @{}
+    $clusters = New-Object System.Collections.Generic.List[object]
     if(-not (Get-SysOrgSetting $Config 'ProjectDetection.Enabled' $true)){
-        return [pscustomobject]@{ Lookup=$lookup; Clusters=$clusters }
+        return [pscustomobject]@{ Lookup=$lookup; Clusters=$clusters.ToArray() }
     }
     $minFiles    = Get-SysOrgSetting $Config 'ProjectDetection.MinFiles' 3
     $maxProjects = Get-SysOrgSetting $Config 'ProjectDetection.MaxProjects' 200
@@ -203,19 +331,21 @@ function Get-SysOrgProjectClusters {
         if(($files.Count -ge $minFiles) -and ($exts.Count -ge 2)){
             $projectIndex++
             if($projectIndex -gt $maxProjects){ break }
-            $key = 'Project-{0:00}-{1}' -f $projectIndex, ($kv.Key -replace '[^a-z0-9]+','-')
+            $slug = ($kv.Key -replace '[^a-z0-9]+','-').Trim('-')
+            if([string]::IsNullOrWhiteSpace($slug)){ $slug = 'cluster' }
+            $key = 'Project-{0:00}-{1}' -f $projectIndex, $slug
             foreach($f in $files){ $lookup[$f.FullName] = $key; [void]$assigned.Add($f.FullName) }
-            $clusters += [pscustomobject]@{ Key=$key; FileCount=$files.Count; Basis='Same filename stem across file types'; Sample=$files[0].Name }
+            $clusters.Add([pscustomobject]@{ Key=$key; FileCount=$files.Count; Basis='Same filename stem across file types'; Sample=$files[0].Name })
         }
     }
 
-    # 2) shared distinctive tokens
+    # 2) shared distinctive tokens (P2-6: order-independent signature)
     $byTokens = @{}
     foreach($f in $Inventory){
         if($assigned.Contains($f.FullName)){ continue }
         $tokens = @(($f.Stem.ToLowerInvariant() -split '[^a-z0-9]+') | Where-Object { $_.Length -ge 4 -and ($stop -notcontains $_) -and ($_ -notmatch '^\d+$') })
         if($tokens.Count -lt 2){ continue }
-        $sig = (@($tokens | Select-Object -First 3) | Sort-Object) -join '+'
+        $sig = (@($tokens | Sort-Object -Unique | Select-Object -First 3)) -join '+'
         if(-not $byTokens.ContainsKey($sig)){ $byTokens[$sig] = New-Object System.Collections.Generic.List[object] }
         [void]$byTokens[$sig].Add($f)
     }
@@ -224,30 +354,42 @@ function Get-SysOrgProjectClusters {
         if($files.Count -ge $minFiles){
             $projectIndex++
             if($projectIndex -gt $maxProjects){ break }
-            $key = 'Project-{0:00}-{1}' -f $projectIndex, ($kv.Key -replace '[^a-z0-9+]+','-')
+            $slug = ($kv.Key -replace '[^a-z0-9]+','-').Trim('-')
+            if([string]::IsNullOrWhiteSpace($slug)){ $slug = 'cluster' }
+            $key = 'Project-{0:00}-{1}' -f $projectIndex, $slug
             foreach($f in $files){ $lookup[$f.FullName] = $key; [void]$assigned.Add($f.FullName) }
-            $clusters += [pscustomobject]@{ Key=$key; FileCount=$files.Count; Basis='Shared distinctive name tokens'; Sample=$files[0].Name }
+            $clusters.Add([pscustomobject]@{ Key=$key; FileCount=$files.Count; Basis='Shared distinctive name tokens'; Sample=$files[0].Name })
         }
     }
-    return [pscustomobject]@{ Lookup=$lookup; Clusters=$clusters }
+    return [pscustomobject]@{ Lookup=$lookup; Clusters=$clusters.ToArray() }
 }
 
 function Find-SysOrgDuplicates {
-    <# Exact duplicates only: group by size -> 64 KB header hash -> full SHA256.
-       Keeper = outside temp-like folders, shortest path, oldest write time. #>
+<#
+.SYNOPSIS
+    Exact duplicate detection: group by size -> 64 KB header hash -> full SHA256.
+.DESCRIPTION
+    Keeper = outside temp-like folders, shortest path, oldest write time.
+    WastedBytes reports the reclaimable size per group (P0-2 acceptance).
+    Only hashes candidate files; cloud placeholders never reach this stage.
+.EXAMPLE
+    $dups = Find-SysOrgDuplicates -Inventory $inv -Config $cfg
+#>
     param($Inventory,$Config)
-    $groups = @()
+    $groups = New-Object System.Collections.Generic.List[object]
     $minKB    = Get-SysOrgSetting $Config 'Duplicates.MinFileSizeKB' 256
     $headerKB = Get-SysOrgSetting $Config 'Duplicates.HeaderHashKB' 64
     $minBytes = [int64]$minKB * 1KB
     $tempLike = @('\downloads\','\desktop\','\temp\','\tmp\')
 
-    $sizeCandidates = @($Inventory | Where-Object { $_.Length -ge $minBytes } | Group-Object -Property Length | Where-Object { $_.Count -gt 1 })
+    $sizeCandidates = @($Inventory | Where-Object { $_.Category -ne 'SkippedLongPath' -and $_.Length -ge $minBytes } | Group-Object -Property Length | Where-Object { $_.Count -gt 1 })
     $total = $sizeCandidates.Count; $done = 0
 
     foreach($sizeGroup in $sizeCandidates){
         $done++
-        Write-Progress -Activity 'Duplicate detection' -Status "Size group $($sizeGroup.Name) bytes ($done of $total)" -PercentComplete ([int](100*$done/[math]::Max($total,1)))
+        Write-Progress -Activity 'Duplicate detection' `
+            -Status "Size group $($sizeGroup.Name) bytes ($done of $total)" `
+            -PercentComplete $(if($total -gt 0){ [int](100 * $done / $total) } else { 0 })
         $headerMap = @{}
         foreach($f in $sizeGroup.Group){
             $h = Get-SysOrgFileHash -Path $f.FullName -HeaderOnly -HeaderKB $headerKB
@@ -276,18 +418,18 @@ function Find-SysOrgDuplicates {
                     @{e={$_.LastWriteTime}})
                 $keep   = $sorted[0]
                 $others = @($sorted | Select-Object -Skip 1)
-                $wasted = [int64]($others | Measure-Object -Property Length -Sum).Sum
-                $groups += [pscustomobject]@{
+                $wasted = [int64](($others | Measure-Object -Property Length -Sum).Sum)
+                $groups.Add([pscustomobject]@{
                     Hash=$fh; KeepPath=$keep.FullName
                     KeepReason='Outside temp-like folders, shortest path, oldest first'
                     Duplicates=@($others | ForEach-Object { $_.FullName })
                     WastedBytes=$wasted
-                }
+                })
             }
         }
     }
     Write-Progress -Activity 'Duplicate detection' -Completed
-    return ,$groups
+    return ,$groups.ToArray()
 }
 
 Export-ModuleMember -Function *-SysOrg*

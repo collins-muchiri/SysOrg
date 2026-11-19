@@ -18,7 +18,12 @@ $script:SystemFolderNames = @(
 )
 
 function Initialize-SysOrgDirProbe {
-    <# Compiles the Win32 probe helper once per session. #>
+<#
+.SYNOPSIS
+    Compiles the Win32 directory-probe helper once per session.
+.EXAMPLE
+    Initialize-SysOrgDirProbe
+#>
     if(-not ('SysOrg.DirProbe' -as [type])){
         Add-Type -TypeDefinition @'
 namespace SysOrg {
@@ -36,9 +41,17 @@ namespace SysOrg {
 }
 
 function Test-SysOrgDirAccess {
-    <# NON-DESTRUCTIVE access probe. Opens the directory with GENERIC_READ (enumerate) and
-       separately with FILE_ADD_FILE|FILE_ADD_SUBDIR (create rights). No file or folder is
-       ever created - only the requested access right is evaluated against the folder ACL. #>
+<#
+.SYNOPSIS
+    NON-DESTRUCTIVE read/write access probe for a folder.
+.DESCRIPTION
+    Opens the directory with GENERIC_READ (enumerate) and separately with
+    FILE_ADD_FILE|FILE_ADD_SUBDIR (create rights). No file or folder is ever
+    created - only the requested access right is evaluated against the folder ACL.
+    Long paths and UNC paths are addressed via the \\?\ namespace.
+.EXAMPLE
+    Test-SysOrgDirAccess -Path C:\Users   # -> Readable/Writable booleans + error codes
+#>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
     Initialize-SysOrgDirProbe
@@ -69,7 +82,15 @@ function Test-SysOrgDirAccess {
 }
 
 function Get-SysOrgDefenderProtectedFolders {
-    <# Windows Defender 'Controlled Folder Access' protected folders = cannot be altered. #>
+<#
+.SYNOPSIS
+    Returns Windows Defender Controlled Folder Access protected folders (cannot alter).
+.DESCRIPTION
+    Empty unless Controlled Folder Access is enabled (mode >= 1) and the
+    FolderAudit.RespectDefenderCFA setting is $true.
+.EXAMPLE
+    $cfa = Get-SysOrgDefenderProtectedFolders -Config $cfg
+#>
     param($Config)
     if(-not (Get-SysOrgSetting $Config 'FolderAudit.RespectDefenderCFA' $true)){ return @() }
     try{
@@ -83,11 +104,20 @@ function Get-SysOrgDefenderProtectedFolders {
             if($prop -and $prop.Value){ $list = @($prop.Value | Where-Object { $_ }); break }
         }
         return ,$list
-    } catch { return @() }
+    } catch { Write-Verbose "Defender CFA folders unavailable: $($_.Exception.Message)"; return @() }
 }
 
 function Get-SysOrgFolderProtectionReason {
-    <# Returns the reason a folder must never be altered, or $null when no static rule matches. #>
+<#
+.SYNOPSIS
+    Returns the reason a folder must never be altered, or $null when no static rule matches.
+.DESCRIPTION
+    Checks, in order: SysOrg destination roots, config ExcludedPaths, drive roots,
+    system folder names, Defender Controlled Folder Access lists, reparse points
+    (junctions/symlinks/OneDrive roots) and hidden/system attributes.
+.EXAMPLE
+    Get-SysOrgFolderProtectionReason -Path C:\Windows -Config $cfg -CfaFolders @()
+#>
     param([Parameter(Mandatory)][string]$Path,$Config,[string[]]$CfaFolders)
     $p = $Path.TrimEnd('\')
     $isRoot = ($p -match '^[A-Za-z]:$') -or ($p -match '^[A-Za-z]:\\$')
@@ -125,9 +155,16 @@ function Get-SysOrgFolderProtectionReason {
 }
 
 function Get-SysOrgFolderAudit {
-    <# Walks a drive (to MaxDepth) and classifies every folder:
-       Protected (cannot alter) / Restricted (read-only) / Organizable.
-       Protected folders are never descended into. #>
+<#
+.SYNOPSIS
+    Walks a drive (to MaxDepth) and classifies every folder:
+    Protected (cannot alter) / Restricted (read-only) / Organizable.
+.DESCRIPTION
+    Protected folders are never descended into. The writability probe never
+    creates, modifies or deletes anything.
+.EXAMPLE
+    $audit = Get-SysOrgFolderAudit -Letter C -Config $cfg -MaxDepth 2
+#>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Letter,$Config,[int]$MaxDepth=2)
 
@@ -160,7 +197,7 @@ function Get-SysOrgFolderAudit {
             $folders.Add([pscustomobject]@{ Path=$dir; Depth=$depth; Status='Restricted'; Reason=('Readable, not writable (error {0}) - left in place' -f $acc.WriteError) })
         }
         if($depth -lt $MaxDepth){
-            try { $kids = [System.IO.Directory]::GetDirectories($dir) } catch { $kids = @() }
+            try { $kids = [System.IO.Directory]::GetDirectories($dir) } catch { Write-Verbose "Could not list children of $dir - $($_.Exception.Message)"; $kids = @() }
             foreach($k in $kids){ [void]$stack.Push(@{ Path=$k; Depth=($depth+1) }) }
         }
     }
@@ -174,29 +211,34 @@ function Get-SysOrgFolderAudit {
 }
 
 function Write-SysOrgFolderAuditReport {
-    <# Writes the full safety map to <Root>\_Reports\SysOrg-FolderAudit-<drive>-<timestamp>.txt #>
+<#
+.SYNOPSIS
+    Writes the full safety map to <ReportFolder>\SysOrg-FolderAudit-<drive>-<stamp>.txt.
+.EXAMPLE
+    Write-SysOrgFolderAuditReport -Audit $audit -ReportFolder C:\Organized\_Reports
+#>
     param($Audit,[string]$ReportFolder)
     if(-not (Test-Path -LiteralPath $ReportFolder)){ New-Item -ItemType Directory -Path $ReportFolder -Force | Out-Null }
     $file = Join-Path $ReportFolder ('SysOrg-FolderAudit-{0}-{1}.txt' -f $Audit.DriveLetter, (Get-Date -Format 'yyyyMMdd-HHmm'))
 
-    $lines = @()
-    $lines += "SysOrg folder safety audit - drive $($Audit.DriveLetter): - $(Get-Date)"
-    $lines += "Legend: Protected = never altered | Restricted = readable, not writable (left in place) | Organizable = eligible"
-    $lines += ("Summary: Protected={0}  Restricted={1}  Organizable={2}  (audit depth {3})" -f $Audit.Summary.Protected, $Audit.Summary.Restricted, $Audit.Summary.Organizable, $Audit.MaxDepth)
-    $lines += ''
-    $lines += '--- CANNOT BE ALTERED (Protected) ---'
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("SysOrg folder safety audit - drive $($Audit.DriveLetter): - $(Get-Date)")
+    $lines.Add("Legend: Protected = never altered | Restricted = readable, not writable (left in place) | Organizable = eligible")
+    $lines.Add(("Summary: Protected={0}  Restricted={1}  Organizable={2}  (audit depth {3})" -f $Audit.Summary.Protected, $Audit.Summary.Restricted, $Audit.Summary.Organizable, $Audit.MaxDepth))
+    $lines.Add('')
+    $lines.Add('--- CANNOT BE ALTERED (Protected) ---')
     foreach($f in ($Audit.Folders | Where-Object { $_.Status -eq 'Protected' } | Sort-Object Depth, Path)){
-        $lines += ('  [' + $f.Reason + '] ' + $f.Path)
+        $lines.Add(('  [' + $f.Reason + '] ' + $f.Path))
     }
-    $lines += ''
-    $lines += '--- READ-ONLY FOR CURRENT USER (Restricted, excluded from plans by default) ---'
+    $lines.Add('')
+    $lines.Add('--- READ-ONLY FOR CURRENT USER (Restricted, excluded from plans by default) ---')
     foreach($f in ($Audit.Folders | Where-Object { $_.Status -eq 'Restricted' } | Sort-Object Depth, Path)){
-        $lines += ('  ' + $f.Path)
+        $lines.Add(('  ' + $f.Path))
     }
-    $lines += ''
-    $lines += '--- CAN BE ORGANIZED (Organizable) ---'
+    $lines.Add('')
+    $lines.Add('--- CAN BE ORGANIZED (Organizable) ---')
     foreach($f in ($Audit.Folders | Where-Object { $_.Status -eq 'Organizable' } | Sort-Object Depth, Path)){
-        $lines += ('  ' + $f.Path)
+        $lines.Add(('  ' + $f.Path))
     }
     $lines | Set-Content -LiteralPath $file -Encoding UTF8
     return $file
