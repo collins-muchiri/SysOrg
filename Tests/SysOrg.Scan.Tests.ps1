@@ -69,18 +69,23 @@ Describe 'Get-SysOrgInventory exclusions' {
     It 'long paths are recorded as SkippedLongPath and not categorized normally (P2-5)' {
         $root = Join-Path $TestDrive ('deep-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         $deep = $root
-        while($deep.Length -lt 280){ $deep = Join-Path $deep ('dddddddddd') }
-        New-Item -ItemType Directory -Path $deep -Force | Out-Null
-        # create via the \\?\ namespace: Set-Content would throw PathTooLong on 5.1
-        [System.IO.File]::WriteAllText(('\\?\' + (Join-Path $deep 'waydown.txt')), 'd')
-        Set-Content -LiteralPath (Join-Path $root 'shallow.txt') -Value 's'
-        $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
-        $shallow = @($inv | Where-Object { $_.Name -eq 'shallow.txt' })
-        $shallow.Count | Should -Be 1
-        $shallow[0].Category | Should -Be 'Documents'
-        # whatever the environment can enumerate beyond 260 chars must be recorded, not planned
-        $deepRecords = @($inv | Where-Object { $_.FullName -like "$deep*" })
-        foreach($r in $deepRecords){ $r.Category | Should -Be 'SkippedLongPath' }
+        try {
+            while($deep.Length -lt 280){ $deep = Join-Path $deep ('dddddddddd') }
+            # create via the \\?\ namespace: New-Item/Set-Content would throw PathTooLong on 5.1
+            [void][System.IO.Directory]::CreateDirectory(('\\?\' + $deep))
+            [System.IO.File]::WriteAllText(('\\?\' + (Join-Path $deep 'waydown.txt')), 'd')
+            Set-Content -LiteralPath (Join-Path $root 'shallow.txt') -Value 's'
+            $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
+            $shallow = @($inv | Where-Object { $_.Name -eq 'shallow.txt' })
+            $shallow.Count | Should -Be 1
+            $shallow[0].Category | Should -Be 'Documents'
+            # whatever the environment can enumerate beyond 260 chars must be recorded, not planned
+            $deepRecords = @($inv | Where-Object { $_.FullName -like "$deep*" })
+            foreach($r in $deepRecords){ $r.Category | Should -Be 'SkippedLongPath' }
+        } finally {
+            # PS 5.1 Remove-Item cannot handle >260-char paths; delete via \\?\ so Pester teardown stays clean
+            if($deep -ne $root){ [void][System.IO.Directory]::Delete(('\\?\' + $deep), $true) }
+        }
     }
 }
 
