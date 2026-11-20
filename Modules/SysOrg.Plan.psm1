@@ -1,90 +1,495 @@
 #Requires -Version 5.1
-# SysOrg.Plan.psm1 - plan generation, preview, execution with undo journal, undo, reports.
+# SysOrg.Plan.psm1 - plan generation (mutability engine + type-first families + numbered copies),
+#                    preview (destination tree, mutability summary, OneDrive warnings),
+#                    execution (incremental journal, resume guard, folder moves),
+#                    undo, migration plans (W12) and report-only scans.
+
+function Get-SysOrgDestinationBase {
+<#
+.SYNOPSIS
+    Resolves the destination base folder for a relative routing path (design 6.3).
+.DESCRIPTION
+    OrganizedRoot style: <root>\<RelBase>. KnownFolders style (opt-in): the resolved known
+    folder for the top segment plus the remaining segments (Downloads\<Source>\<Sub> maps to
+    the real Downloads folder). Returns Base plus the DisplayRoot used by the preview tree.
+.EXAMPLE
+    Get-SysOrgDestinationBase -RelBase 'Downloads\GitHub\Archives' -DriveProfile $prof -Config $cfg -KnownFolders $kf
+#>
+    param([Parameter(Mandatory)][string]$RelBase,[Parameter(Mandatory)]$DriveProfile,$Config,$KnownFolders)
+    $root = Get-SysOrgDestinationRoot -Letter "$($DriveProfile.Letter)" -Config $Config
+    $style = "$(Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot')"
+    if($style -ne 'KnownFolders'){
+        return [pscustomobject]@{ Base=($root + '\' + $RelBase); DisplayRoot=$root }
+    }
+    $top = ($RelBase.Split('\'))[0]
+    $kf = $null
+    foreach($k in @($KnownFolders)){
+        if("$($k.Name)" -ieq $top){ $kf = ("$($k.Path)").TrimEnd('\'); break }
+    }
+    if(-not $kf){ return [pscustomobject]@{ Base=($root + '\' + $RelBase); DisplayRoot=$root } }
+    $tail = $null
+    if($RelBase -match '^Downloads\\(.+)$'){ $tail = $Matches[1] }
+    else {
+        $segs = @($RelBase.Split('\'))
+        if($segs.Count -gt 1){ $tail = (@($segs | Select-Object -Skip 1) -join '\') }
+    }
+    if($tail){ return [pscustomobject]@{ Base=($kf + '\' + $tail); DisplayRoot=$kf } }
+    return [pscustomobject]@{ Base=$kf; DisplayRoot=$kf }
+}
 
 function New-SysOrgPlan {
 <#
 .SYNOPSIS
-    Builds a move/quarantine plan from an inventory, clusters and duplicate groups.
+    Builds a preview-first plan from an inventory (design section 7 routing pipeline).
 .DESCRIPTION
-    Destination layout: <root>\<Category>\[Projects\<key>|<date>]\file. Duplicate
-    quarantine actions carry the scan-time SHA256 (P2-1 hash economy). Files with
-    Category 'SkippedLongPath' are never planned (P2-5).
+    Every record passes, in order: recorded-not-planned checks, destination check, protected
+    paths, project-folder coverage, preservation (organized heuristic + localized category
+    names), the MUTABILITY ENGINE (denials are recorded with reasons), SKIP types, then
+    context routing (download provenance -> Downloads branch; else the type root), families
+    within the context leaf, numbered exact copies (NumberCopies default) and date folders.
+    NO PLAN IS BUILT WITHOUT A DRIVE PROFILE.
 .EXAMPLE
-    $plan = New-SysOrgPlan -Letter C -Inventory $inv -ClusterResult $cl -DupGroups $dups -Config $cfg
+    $plan = New-SysOrgPlan -Letter C -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $cfg -KnownFolders $kf -ProjectFolders $proj
 #>
-    param([Parameter(Mandatory)][string]$Letter,$Inventory,$ClusterResult,$DupGroups,$Config)
-    $root             = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
-    $planId           = 'plan-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
-    $maxActions       = Get-SysOrgSetting $Config 'MaxPlanActions' 5000
-    $dateMode         = Get-SysOrgSetting $Config 'DateFolders' 'Year'
-    $quarantinePolicy = Get-SysOrgSetting $Config 'Duplicates.Policy' 'Quarantine'
-    $qFolder          = Get-SysOrgSetting $Config 'Duplicates.QuarantineFolderName' '_Duplicates'
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,
+          [Parameter(Mandatory)]$Inventory,
+          [Parameter(Mandatory)]$DriveProfile,
+          $DupGroups,
+          $Config,
+          $KnownFolders,
+          $ProjectFolders)
+
+    if(-not $Config){ throw 'New-SysOrgPlan requires -Config.' }
+    if(-not $DriveProfile){ throw 'No drive profile was provided. A plan cannot be built without one (run -ProfileDrives first).' }
+    if(-not $KnownFolders -or @($KnownFolders).Count -eq 0){ $KnownFolders = @(Get-SysOrgKnownFolders) }
+    if(-not $ProjectFolders){ $ProjectFolders = @() }
+
+    $planId    = 'plan-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $root      = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
+    $style     = "$(Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot')"
+    $maxActions = [int](Get-SysOrgSetting $Config 'MaxPlanActions' 5000)
+    $dateMode  = Get-SysOrgSetting $Config 'DateFolders' 'Year'
+    $dlDateMode = Get-SysOrgSetting $Config 'Downloads.DateFolders' "$(Get-SysOrgSetting $Config 'DateFolders' 'Year')"
+    $folderMap = Get-SysOrgFolderMap -Config $Config
+
+    $copiesPolicy = "$(Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies')"
+    $qFolder      = "$(Get-SysOrgSetting $Config 'Copies.QuarantineFolderName' '_Duplicates')"
+    $startIndex   = [int](Get-SysOrgSetting $Config 'Copies.StartIndex' 2)
+    $suffixStyle  = "$(Get-SysOrgSetting $Config 'Copies.SuffixStyle' 'Parentheses')"
+    $unknownSrc   = "$(Get-SysOrgSetting $Config 'Downloads.UnknownSourceFolder' '_NoSource')"
+    $groupBy      = "$(Get-SysOrgSetting $Config 'Downloads.GroupBy' 'SourceFirst')"
+    $useZone      = [bool](Get-SysOrgSetting $Config 'Downloads.UseZoneIdentifier' $true)
+    $storeUrls    = [bool](Get-SysOrgSetting $Config 'Privacy.StoreFullUrlsInJournal' $true)
 
     $organizedSet = Get-SysOrgOrganizedDirSet -Inventory $Inventory -Config $Config
+    $categoryNames = Get-SysOrgCategoryNames -KnownFolders $KnownFolders
+    $kfPathSet = @{}
+    foreach($k in @($KnownFolders)){ if($k.Path){ $kfPathSet[("$($k.Path)").TrimEnd('\').ToLowerInvariant()] = $true } }
+    $oneDriveRoot = $env:OneDrive
+    if($oneDriveRoot){ $oneDriveRoot = $oneDriveRoot.TrimEnd('\') }
 
-    $dupSet = @{}
-    foreach($dg in $DupGroups){ foreach($p in $dg.Duplicates){ $dupSet[$p] = $dg.Hash } }
+    # project-folder coverage: files under a detected project move as one unit
+    $projectDirSet = @{}
+    foreach($pf in @($ProjectFolders)){ $projectDirSet[("$($pf.Path)").TrimEnd('\').ToLowerInvariant()] = $true }
+
+    $multipart = Get-SysOrgMultipartSets -Inventory $Inventory -Config $Config
+    $multipartMap = $multipart.Map
+    $leaderSet = @{}
+    foreach($s in @($multipart.Sets)){ $leaderSet["$($s.Leader)"] = $true }
+
+    $byPath = @{}
+    foreach($r in @($Inventory)){ $byPath["$($r.FullName)"] = $r }
+
+    $dupGroupOf = @{}; $dupMemberSet = @{}; $keeperSet = @{}
+    foreach($dg in @($DupGroups)){
+        $keeperSet["$($dg.KeepPath)"] = $true
+        foreach($p in @($dg.Duplicates)){ $pp = "$p"; $dupMemberSet[$pp] = $true; $dupGroupOf[$pp] = $dg }
+    }
 
     $actions = New-Object System.Collections.Generic.List[object]
     $skipped = New-Object System.Collections.Generic.List[object]
+    $provRows = New-Object System.Collections.Generic.List[object]
+    $odSyncOut = New-Object System.Collections.Generic.List[string]
+    $odIntoCloud = New-Object System.Collections.Generic.List[string]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $mutAllowed = 0
+    $mutDenied = @{}
+    $capped = $false
 
-    foreach($f in $Inventory){
-        if($actions.Count -ge $maxActions){ Write-Warning "Plan capped at $maxActions actions; rest skipped this run."; break }
+    # NOTE: this nested helper only MUTATES objects ($skipped list, $mutDenied h[hashtable) -
+    # scalar counters would be rebound in the child scope, a classic PowerShell trap.
+    function Add-SysOrgPlanSkip {
+        param([string]$Source,[string]$Reason)
+        $skipped.Add([pscustomobject]@{ Source=$Source; Reason=$Reason })
+        if($mutDenied.ContainsKey($Reason)){ $mutDenied[$Reason]++ } else { $mutDenied[$Reason] = 1 }
+    }
+    function Test-SysOrgPlanPreservedDir {
+        param([string]$Directory)
+        $cur = $Directory.TrimEnd('\')
+        while($cur -and ($cur.Length -gt 3)){
+            $lc = $cur.ToLowerInvariant()
+            if($organizedSet.ContainsKey($lc)){ return 'Inside a folder that already looks organized (preserved)' }
+            if(-not $kfPathSet.ContainsKey($lc)){
+                $catName = Test-SysOrgCategoryFolderName -Name $cur -CategoryNames $categoryNames
+                if($catName){ return ('Existing ' + $catName + ' folder (preserved, localized name recognized)') }
+            }
+            $cur = Split-Path $cur -Parent
+        }
+        return $null
+    }
+
+    $context = @{}
+    $partitionLookup = @{}
+    $routed = New-Object System.Collections.Generic.List[object]
+
+    foreach($f in @($Inventory)){
+        if($actions.Count -ge $maxActions){ $capped = $true; break }
+        $src = "$($f.FullName)"
         try{
-            $src = $f.FullName
-            if($f.Category -eq 'SkippedLongPath'){
-                $skipped.Add([pscustomobject]@{ Source=$src; Reason='Path >= 260 characters (recorded; PowerShell 5.1 cannot address it)' })
+            if([string]::IsNullOrWhiteSpace($src)){ continue }
+            # 0) recorded but never planned (P2-5)
+            if("$($f.Category)" -eq 'SkippedLongPath'){
+                Add-SysOrgPlanSkip -Source $src -Reason 'Path >= 260 characters (recorded; PowerShell 5.1 cannot address it)'
                 continue
             }
             if(Test-SysOrgDestinationPath -Path $src -Config $Config){ continue }
+            # protected path (mutability engine, row 1 of the policy matrix)
+            $parentDir = Split-Path $src -Parent
+            if(Test-SysOrgExcludedPath -Path $parentDir -Config $Config){
+                Add-SysOrgPlanSkip -Source $src -Reason 'Protected path'
+                continue
+            }
+            # 2) code project folders move as one unit - their files are not planned individually
+            $cur = $parentDir.ToLowerInvariant()
+            $inProject = $false
+            while($cur -and ($cur.Length -gt 3)){
+                if($projectDirSet.ContainsKey($cur)){ $inProject = $true; break }
+                $cur = Split-Path $cur -Parent
+            }
+            if($inProject){
+                Add-SysOrgPlanSkip -Source $src -Reason 'Inside a detected code project folder (moved as one unit)'
+                continue
+            }
+            # preservation: organized heuristic + localized category recognition (W2)
+            $pres = Test-SysOrgPlanPreservedDir -Directory $parentDir
+            if($pres){ Add-SysOrgPlanSkip -Source $src -Reason $pres; continue }
+            # 1) mutability engine (W3)
+            $mut = Test-SysOrgFileMutable -Path $src -Extension "$($f.Extension)" -DriveProfile $DriveProfile -Config $Config
+            if(-not $mut.Allowed){
+                Add-SysOrgPlanSkip -Source $src -Reason "$($mut.Reason)"
+                continue
+            }
+            if("$($f.Category)" -eq 'SKIP'){
+                Add-SysOrgPlanSkip -Source $src -Reason 'Non-organizable type (system PerceivedType)'
+                continue
+            }
+            $mutAllowed++
 
-            if($dupSet.ContainsKey($src)){
-                if($quarantinePolicy -eq 'Quarantine'){
-                    $h = $dupSet[$src]
-                    $hash8 = if($h -and ($h.Length -ge 8)){ $h.Substring(0,8) } else { 'dup' }
-                    $qName = '{0}_{1}{2}' -f $f.Stem, $hash8, $f.Extension
-                    # NOTE: built by concatenation, not Join-Path - Join-Path throws
-                    # 'Cannot find drive' when the root's drive letter does not exist
-                    # on this machine (which is exactly the case in test runs).
-                    $dest  = ($root + '\' + $qFolder + '\' + $planId + '\' + $qName)
-                    $actions.Add([pscustomobject]@{ Action='Quarantine'; Source=$src; Destination=$dest; Reason='Exact duplicate (keeper identified during scan)'; SizeBytes=$f.Length; Hash=$h })
+            # 4) context: download root or Zone.Identifier -> Downloads branch
+            $category = "$($f.Category)"
+            $inDownloads = $false
+            foreach($r in @($DriveProfile.DownloadRoots)){
+                if([string]::IsNullOrWhiteSpace("$r")){ continue }
+                $r2 = ("$r").TrimEnd('\')
+                if($src.StartsWith($r2 + '\',[StringComparison]::OrdinalIgnoreCase)){ $inDownloads = $true; break }
+            }
+            $prov = $null
+            if($useZone -and ($inDownloads -or ($category -in @('Archives','Installers')))){
+                $prov = Get-SysOrgZoneIdentifier -Path $src
+            }
+            $bucket = $null
+            if($prov){ $bucket = Get-SysOrgSourceBucket -HostUrl "$($prov['HostUrl'])" -ReferrerUrl "$($prov['ReferrerUrl'])" -FileName "$($f.Name)" }
+            $downloadContext = $inDownloads -or ($null -ne $prov) -or ($category -eq 'Installers')
+            $sourceName = $null
+            if($downloadContext){
+                if((-not $bucket) -and ($inDownloads -or $prov)){
+                    $bucket = Get-SysOrgSourceBucket -HostUrl '' -ReferrerUrl '' -FileName "$($f.Name)"
                 }
-                continue
+                if($bucket){ $sourceName = "$bucket" } else { $sourceName = $unknownSrc }
+                $rel = ''
+                if($folderMap.ContainsKey($category)){ $rel = "$($folderMap[$category])" } else { $rel = "$($folderMap['Other'])" }
+                $typeLeaf = ($rel.Split('\'))[-1]
+                if($groupBy -eq 'TypeFirst'){ $pk = ('Downloads\{0}\{1}' -f $typeLeaf, $sourceName) }
+                else { $pk = ('Downloads\{0}\{1}' -f $sourceName, $typeLeaf) }
+                if($prov){
+                    $row = @{ Source=$src; SourceBucket=$sourceName; HostUrl=''; ReferrerUrl='' }
+                    if($storeUrls){
+                        $row.HostUrl = "$($prov['HostUrl'])"
+                        $row.ReferrerUrl = "$($prov['ReferrerUrl'])"
+                    }
+                    [void]$provRows.Add([pscustomobject]$row)
+                }
+            } else {
+                if($folderMap.ContainsKey($category)){ $pk = "$($folderMap[$category])" } else { $pk = "$($folderMap['Other'])" }
             }
-
-            if((Get-SysOrgSetting $Config 'PreserveExistingFolders' $true) -and
-               (Test-SysOrgInOrganizedDir -Directory $f.Directory -OrganizedSet $organizedSet)){
-                $skipped.Add([pscustomobject]@{ Source=$src; Reason='Inside a folder that already looks organized (preserved)' })
-                continue
-            }
-
-            $cat = $f.Category
-            $projectKey = $null
-            if($ClusterResult.Lookup.ContainsKey($src)){ $projectKey = $ClusterResult.Lookup[$src] }
-
-            $rel = $cat
-            if($projectKey){
-                $rel = Join-Path (Join-Path $cat 'Projects') $projectKey
-            } elseif($dateMode -eq 'Year'){
-                $rel = Join-Path $cat ([datetime]$f.LastWriteTime).ToString('yyyy')
-            } elseif($dateMode -eq 'YearMonth'){
-                $rel = Join-Path $cat ([datetime]$f.LastWriteTime).ToString('yyyy-MM')
-            }
-            # Normalize separators and concatenate: Join-Path would throw on a
-            # non-existent drive qualifier (see quarantine destination above).
-            $rel  = ($rel -replace '/', '\')
-            $dest = ($root + '\' + $rel + '\' + $f.Name)
-
-            $dt = [datetime]$f.LastWriteTime
-            $reasonParts = @("Category=$cat")
-            if($projectKey){ $reasonParts += "Project=$projectKey" }
-            else { $reasonParts += 'Date=' + $dt.ToString('yyyy-MM') }
-
-            $actions.Add([pscustomobject]@{ Action='Move'; Source=$src; Destination=$dest; Reason=($reasonParts -join '; '); SizeBytes=$f.Length })
+            $context[$src] = @{ Rel=$pk; Category=$category; Source=$sourceName; InDownloads=$inDownloads }
+            $partitionLookup[$src] = $pk
+            [void]$routed.Add($f)
         } catch {
-            $skipped.Add([pscustomobject]@{ Source=$f.FullName; Reason="Analysis error: $($_.Exception.Message)" })
+            Add-SysOrgPlanSkip -Source $src -Reason ("Analysis error: {0}" -f $_.Exception.Message)
         }
     }
+    if($capped){ [void]$warnings.Add(("Plan capped at {0} actions; the remaining files were skipped this run." -f $maxActions)) }
+
+    # 5) families within the context leaf (W5)
+    $fam = Get-SysOrgNameFamilies -Inventory @($routed) -PartitionLookup $partitionLookup -Config $Config
+
+    # process multipart leaders first so members can join the leader's destination folder
+    $ordered = @($routed | Sort-Object -Property @{e={ if($leaderSet.ContainsKey("$($_.FullName)")){ 0 } else { 1 } }})
+
+    $actionFolderBySrc = @{}
+    $setDestFolder = @{}
+    $usedNames = @{}
+    $familiesAudit = @($fam.Families)
+
+    # pass 1: keepers, family members, singles, multipart units
+    foreach($f in $ordered){
+        if($actions.Count -ge $maxActions){ $capped = $true; break }
+        $src = "$($f.FullName)"
+        $cx = $context[$src]
+        if(-not $cx){ continue }
+        try{
+            $isKeeper = $keeperSet.ContainsKey($src)
+            $isDupMember = $dupMemberSet.ContainsKey($src)
+            if($isDupMember -and (-not $isKeeper)){
+                # NumberCopies: numbered in pass 2 when the keeper was routed; otherwise
+                # the copy routes below as a normal single (keeps its own name)
+                if($copiesPolicy -eq 'NumberCopies' -and $context.ContainsKey("$($dupGroupOf[$src].KeepPath)")){ continue }
+                if($copiesPolicy -eq 'Quarantine'){ continue }    # pass 2
+                if($copiesPolicy -eq 'ReportOnly'){ continue }    # pass 2
+            }
+            $famInfo = $null
+            if($fam.Lookup.ContainsKey($src)){ $famInfo = $fam.Lookup[$src] }
+            $relForDest = $cx.Rel
+            if($famInfo -and $famInfo.Partition){ $relForDest = [string]$famInfo.Partition }
+            $db = Get-SysOrgDestinationBase -RelBase $relForDest -DriveProfile $DriveProfile -Config $Config -KnownFolders $KnownFolders
+            $destFolder = $db.Base
+            $destRoot = $db.DisplayRoot
+            $famName = $null
+            $reason = ''
+            if($famInfo){
+                $famName = [string]$famInfo.Name
+                $destFolder = $db.Base + '\' + $famName
+                $reason = ('Family={0}' -f $famName)
+                if($cx.Source){ $reason = ('Source={0}; Family={1}' -f $cx.Source, $famName) }
+            } else {
+                $dMode = $dateMode
+                if($cx.InDownloads){ $dMode = $dlDateMode }
+                if("$dMode" -eq 'Year'){ $relDate = ([datetime]$f.LastWriteTime).ToString('yyyy'); $destFolder = $db.Base + '\' + $relDate }
+                elseif("$dMode" -eq 'YearMonth'){ $relDate = ([datetime]$f.LastWriteTime).ToString('yyyy-MM'); $destFolder = $db.Base + '\' + $relDate }
+                $reason = ('Category={0}' -f $cx.Category)
+                if($cx.Source){ $reason = ('Source={0}; Category={1}' -f $cx.Source, $cx.Category) }
+            }
+            $isLeader = $leaderSet.ContainsKey($src)
+            if($multipartMap.ContainsKey($src)){
+                $sk = $multipartMap[$src]
+                if(-not $isLeader){
+                    if($setDestFolder.ContainsKey($sk)){ $destFolder = $setDestFolder[$sk] }
+                } else {
+                    $setDestFolder[$sk] = $destFolder
+                }
+                $reason = ('Multipart set {0}; {1}' -f $sk, $reason)
+            }
+            $dest = $destFolder + '\' + $f.Name
+            $nameKey = $destFolder.ToLowerInvariant() + '|' + ("$($f.Name)").ToLowerInvariant()
+            $usedNames[$nameKey] = $true
+
+            $syncOut = $false; $intoCloud = $false
+            if($oneDriveRoot){
+                $srcUnder = $src.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase) -or ($src -ieq $oneDriveRoot)
+                $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add($src) }
+                if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+            }
+            $actions.Add([pscustomobject]@{
+                Action='Move'; Kind='File'; Source=$src; Destination=$dest; DestRoot=$destRoot
+                SizeBytes=[int64]$f.Length; Family=$famName; CopyIndex=$null
+                SourceBucket=$cx.Source; Reason=$reason; DifferentContent=$false
+                OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
+            })
+            $actionFolderBySrc[$src] = $destFolder
+        } catch {
+            Add-SysOrgPlanSkip -Source $src -Reason ("Routing error: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # pass 2: exact copies (W6)
+    $copiesAudit = @{ Policy=$copiesPolicy; Numbered=0; Quarantined=0; Reported=0; Groups=@() }
+    $groupsAudit = New-Object System.Collections.Generic.List[object]
+    foreach($dg in @($DupGroups)){
+        $keeperPath = "$($dg.KeepPath)"
+        $keeperFolder = $actionFolderBySrc[$keeperPath]
+        $members = @()
+        foreach($p in @($dg.Duplicates)){
+            $p2 = "$p"
+            if(-not $byPath.ContainsKey($p2)){ continue }
+            if(-not $context.ContainsKey($p2)){ continue }
+            if($multipartMap.ContainsKey($p2)){ continue }   # multipart members: exempt from numbering and quarantine
+            $members += $byPath[$p2]
+        }
+        $groupAudit = @{ Keeper=$keeperPath; Hash="$($dg.Hash)"; Copies=@(); Quarantined=@(); Reported=@() }
+        if($members.Count -gt 0){
+            if($copiesPolicy -eq 'Quarantine'){
+                foreach($m in $members){
+                    if($actions.Count -ge $maxActions){ $capped = $true; break }
+                    $h = "$($dg.Hash)"
+                    $hash8 = if($h -and ($h.Length -ge 8)){ $h.Substring(0,8) } else { 'dup' }
+                    $qName = '{0}_{1}{2}' -f $m.Stem, $hash8, $m.Extension
+                    $qDir = ($root + '\' + $qFolder + '\' + $planId)
+                    $dest = ($qDir + '\' + $qName)
+                    $syncOut = $false; $intoCloud = $false
+                    if($oneDriveRoot){
+                        $srcUnder = "$($m.FullName)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                        $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                        if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
+                        if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+                    }
+                    $actions.Add([pscustomobject]@{
+                        Action='Quarantine'; Kind='File'; Source="$($m.FullName)"; Destination=$dest; DestRoot=$root
+                        SizeBytes=[int64]$m.Length; Family=$null; CopyIndex=$null; SourceBucket=$null
+                        Reason='Exact duplicate (Quarantine policy); keeper identified during scan'
+                        Hash="$($dg.Hash)"; DifferentContent=$false
+                        OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
+                    })
+                    $copiesAudit.Quarantined++
+                    $groupAudit.Quarantined += "$($m.FullName)"
+                }
+            }
+            elseif($copiesPolicy -eq 'NumberCopies'){
+                if($keeperFolder){
+                    $keeperRec = $byPath[$keeperPath]
+                    $stem = "$($keeperRec.Stem)"
+                    $ext = "$($keeperRec.Extension)"
+                    $withKeys = @()
+                    foreach($m in $members){
+                        $withKeys += [pscustomobject]@{ Rec=$m; Key=(Get-SysOrgNaturalKey -Name "$($m.FullName)") }
+                    }
+                    $orderedMembers = @(($withKeys | Sort-Object -Property @{e={$_.Rec.LastWriteTime.Ticks}}, @{e={$_.Key}}) | ForEach-Object { $_.Rec })
+                    $n = $startIndex - 1
+                    $folderKey = $keeperFolder.ToLowerInvariant()
+                    foreach($m in $orderedMembers){
+                        if($actions.Count -ge $maxActions){ $capped = $true; break }
+                        $n++
+                        $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $n -Style $suffixStyle
+                        $i = $n
+                        # 9.5: plan-time assignment checks the destination for existing files
+                        while($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or
+                              (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate))){
+                            $i++
+                            if($i -gt 999){ $candidate = ([guid]::NewGuid().ToString('N').Substring(0,8)) + $ext; break }
+                            $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $i -Style $suffixStyle
+                        }
+                        $usedNames[$folderKey + '|' + $candidate.ToLowerInvariant()] = $true
+                        $dest = $keeperFolder + '\' + $candidate
+                        $keeperFam = $null
+                        if($fam.Lookup.ContainsKey($keeperPath)){ $keeperFam = [string]$fam.Lookup[$keeperPath].Name }
+                        $syncOut = $false; $intoCloud = $false
+                        if($oneDriveRoot){
+                            $srcUnder = "$($m.FullName)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                            $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                            if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
+                            if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+                        }
+                        $actions.Add([pscustomobject]@{
+                            Action='Move'; Kind='File'; Source="$($m.FullName)"; Destination=$dest; DestRoot=$keeperFolder
+                            SizeBytes=[int64]$m.Length; Family=$keeperFam; CopyIndex=$n; SourceBucket=$null
+                            Reason=('Exact copy {0} of {1}; content verified by SHA256' -f $n, ($orderedMembers.Count + 1))
+                            Hash="$($dg.Hash)"; DifferentContent=$false
+                            OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
+                        })
+                        $copiesAudit.Numbered++
+                        $groupAudit.Copies += @{ Source="$($m.FullName)"; Assigned=$candidate; Index=$n }
+                    }
+                }
+            }
+            else {  # ReportOnly
+                foreach($m in $members){
+                    $copiesAudit.Reported++
+                    $groupAudit.Reported += "$($m.FullName)"
+                }
+            }
+        }
+        [void]$groupsAudit.Add([pscustomobject]$groupAudit)
+    }
+    $copiesAudit.Groups = @($groupsAudit.ToArray())
+
+    # code project folders: one MoveFolder unit each (mutability checked at the folder itself)
+    $projCfgDest = "$(Get-SysOrgSetting $Config 'Projects.Destination' 'Documents\Projects\Code')"
+    $docMap = "$($folderMap['Documents'])"
+    foreach($pf in @($ProjectFolders)){
+        if($actions.Count -ge $maxActions){ $capped = $true; break }
+        try{
+            $mut = Test-SysOrgFileMutable -Path "$($pf.Path)" -Extension '' -DriveProfile $DriveProfile -Config $Config -Container
+            if(-not $mut.Allowed){
+                Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder not moved: {0}" -f $mut.Reason)
+                continue
+            }
+            $db = Get-SysOrgDestinationBase -RelBase $docMap -DriveProfile $DriveProfile -Config $Config -KnownFolders $KnownFolders
+            $base = $db.Base
+            if($projCfgDest -ieq 'Documents' -or $projCfgDest.StartsWith('Documents\',[StringComparison]::OrdinalIgnoreCase)){
+                $tail = $projCfgDest.Substring('Documents'.Length).TrimStart('\')
+                if($tail){ $base = $db.Base + '\' + $tail }
+            } else {
+                $base = $root + '\' + $projCfgDest
+            }
+            $dest = $base + '\' + "$($pf.SafeName)"
+            $syncOut = $false; $intoCloud = $false
+            if($oneDriveRoot){
+                $srcUnder = "$($pf.Path)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($pf.Path)") }
+                if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+            }
+            $actions.Add([pscustomobject]@{
+                Action='Move'; Kind='Folder'; Source="$($pf.Path)"; Destination=$dest; DestRoot=$db.DisplayRoot
+                SizeBytes=[int64]0; Family=$null; CopyIndex=$null; SourceBucket=$null
+                Reason='Code project folder (markers detected); moved whole, .git intact'
+                DifferentContent=$false; OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
+            })
+        } catch {
+            Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder error: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    # 9.4: plan-internal name collisions (different content, same destination) are flagged;
+    # execution resolves them via Get-SysOrgUniquePath - originals are never rewritten here.
+    $byDest = @{}
+    foreach($a in $actions){
+        if("$($a.Action)" -ne 'Move'){ continue }
+        $k = "$($a.Destination)".ToLowerInvariant()
+        if(-not $byDest.ContainsKey($k)){ $byDest[$k] = New-Object System.Collections.Generic.List[object] }
+        [void]$byDest[$k].Add($a)
+    }
+    foreach($k in $byDest.Keys){
+        if($byDest[$k].Count -gt 1){
+            foreach($a in $byDest[$k]){ $a.DifferentContent = $true }
+        }
+    }
+
+    $deniedList = @()
+    $deniedTotal = 0
+    foreach($k in ($mutDenied.Keys | Sort-Object)){
+        $deniedList += [pscustomobject]@{ Reason=$k; Count=$mutDenied[$k] }
+        $deniedTotal += $mutDenied[$k]
+    }
+    $deniedList = @($deniedList | Sort-Object Count -Descending)
+
+    $profileSummary = $null
+    try{
+        $kfSimple = @()
+        foreach($k in @($DriveProfile.KnownFolders)){
+            $kfSimple += [pscustomobject]@{ Name="$($k.Name)"; Path="$($k.Path)"
+                IsRedirected=[bool]$k.IsRedirected; UnderOneDrive=[bool]$k.UnderOneDrive }
+        }
+        $profileSummary = [pscustomobject]@{
+            Letter="$($DriveProfile.Letter)"; Role="$($DriveProfile.Role)"
+            ProposedScope="$($DriveProfile.ProposedScope)"
+            Artifacts=@("$($DriveProfile.Artifacts)")
+            DownloadRoots=@("$($DriveProfile.DownloadRoots)")
+            KnownFolders=$kfSimple
+        }
+    } catch { $profileSummary = $null }
 
     return [pscustomobject]@{
         PlanId          = $planId
@@ -92,9 +497,117 @@ function New-SysOrgPlan {
         Computer        = $env:COMPUTERNAME
         Drive           = "$Letter`:"
         DestinationRoot = $root
-        Mode            = "Type-first; date subfolders=$dateMode; duplicates=$quarantinePolicy; projects=" + (Get-SysOrgSetting $Config 'ProjectDetection.Enabled' $true)
+        DestinationStyle= $style
+        Mode            = ('Type-first families; preset={0}; copies={1}; style={2}' -f (Get-SysOrgSetting $Config 'NamingPreset' 'Windows'), $copiesPolicy, $style)
+        DriveProfile    = $profileSummary
         Actions         = $actions.ToArray()
         Skipped         = $skipped.ToArray()
+        Families        = $familiesAudit
+        Copies          = [pscustomobject]$copiesAudit
+        Mutability      = [pscustomobject]@{ Allowed=$mutAllowed; DeniedTotal=$deniedTotal; Denied=$deniedList }
+        OneDrive        = [pscustomobject]@{ SyncOut=@($odSyncOut.ToArray()); IntoCloud=@($odIntoCloud.ToArray()) }
+        Warnings        = @($warnings.ToArray())
+        Provenance      = @($provRows.ToArray())
+        ProvenanceFile  = ''
+        Stats           = [pscustomobject]@{ Scanned=@($Inventory).Count; Routed=$routed.Count }
+    }
+}
+
+function New-SysOrgMigrationPlan {
+<#
+.SYNOPSIS
+    Builds a previewable plan that maps old v1.x / rev 2.0 organized trees to the
+    Windows naming (W12). Nothing is applied implicitly.
+.DESCRIPTION
+    Photo/Images -> Pictures, Video -> Videos, Audio and Video\Audio -> Music,
+    Spreadsheets/Presentations/Fonts/Databases -> Documents, Archives -> Documents\Archives,
+    Code -> Documents\Code, Other -> Documents\Other, Installers -> Downloads\Installers.
+    Children move one level at a time (MoveFolder for subfolders), so the existing year
+    structure survives intact. `_Duplicates` and `_Reports` folders are left untouched.
+.EXAMPLE
+    New-SysOrgMigrationPlan -Letter C -Config $cfg
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,$Config)
+    if(-not $Config){ throw 'New-SysOrgMigrationPlan requires -Config.' }
+    $planId = 'migrate-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $root = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
+    if(-not (Test-Path -LiteralPath $root)){ throw ("Nothing to migrate: destination root '{0}' does not exist." -f $root) }
+    $maxActions = [int](Get-SysOrgSetting $Config 'MaxPlanActions' 5000)
+    $reportsName = "$(Get-SysOrgSetting $Config 'ReportsFolderName' '_Reports')".ToLowerInvariant()
+
+    $map = @{
+        'photo'='Pictures'; 'images'='Pictures'
+        'video'='Videos'; 'videos'='Videos'
+        'audio'='Music'; 'music'='Music'
+        'spreadsheets'='Documents'; 'presentations'='Documents'; 'fonts'='Documents'; 'databases'='Documents'
+        'archives'='Documents\Archives'; 'code'='Documents\Code'; 'other'='Documents\Other'
+        'installers'='Downloads\Installers'
+    }
+
+    $actions = New-Object System.Collections.Generic.List[object]
+    $skipped = New-Object System.Collections.Generic.List[object]
+    $topDirs = @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue)
+    foreach($td in $topDirs){
+        $leaf = $td.Name.ToLowerInvariant()
+        if(($leaf -eq '_duplicates') -or ($leaf -eq $reportsName) -or ($leaf -eq '_sysorg')){
+            [void]$skipped.Add([pscustomobject]@{ Source=$td.FullName; Reason='Left untouched (SysOrg runtime folder)' })
+            continue
+        }
+        if(-not $map.ContainsKey($leaf)){ continue }   # Documents / Downloads / Windows-named roots stay
+        $target = $map[$leaf]
+        $children = @()
+        try { $children = @(Get-ChildItem -LiteralPath $td.FullName -Force -ErrorAction SilentlyContinue) } catch { }
+        foreach($ch in $children){
+            # rev 2.0 Video\Audio -> Music extraction
+            if(($leaf -eq 'video') -and $ch.PSIsContainer -and ($ch.Name.ToLowerInvariant() -eq 'audio')){
+                $subs = @()
+                try { $subs = @(Get-ChildItem -LiteralPath $ch.FullName -Force -ErrorAction SilentlyContinue) } catch { }
+                foreach($sub in $subs){
+                    $dest2 = ($root + '\Music\' + $sub.Name)
+                    $kind2 = 'File'; if($sub.PSIsContainer){ $kind2 = 'Folder' }
+                    $size2 = [int64]0; if(-not $sub.PSIsContainer){ $size2 = [int64]$sub.Length }
+                    [void]$actions.Add([pscustomobject]@{
+                        Action='Move'; Kind=$kind2; Source=$sub.FullName; Destination=$dest2; DestRoot=$root
+                        SizeBytes=$size2; Family=$null; CopyIndex=$null; SourceBucket=$null
+                        Reason='Migrate: Video\Audio -> Music'; DifferentContent=$false
+                        OneDriveSyncOut=$false; OneDriveIntoCloud=$false
+                    })
+                }
+                continue
+            }
+            $dest = ($root + '\' + $target + '\' + $ch.Name)
+            $kind = 'File'; if($ch.PSIsContainer){ $kind = 'Folder' }
+            $size = [int64]0; if(-not $ch.PSIsContainer){ $size = [int64]$ch.Length }
+            [void]$actions.Add([pscustomobject]@{
+                Action='Move'; Kind=$kind; Source=$ch.FullName; Destination=$dest; DestRoot=$root
+                SizeBytes=$size; Family=$null; CopyIndex=$null; SourceBucket=$null
+                Reason=('Migrate: {0} -> {1}' -f $td.Name, $target); DifferentContent=$false
+                OneDriveSyncOut=$false; OneDriveIntoCloud=$false
+            })
+            if($actions.Count -ge $maxActions){ break }
+        }
+        if($actions.Count -ge $maxActions){ break }
+    }
+    return [pscustomobject]@{
+        PlanId          = $planId
+        Created         = (Get-Date).ToString('s')
+        Computer        = $env:COMPUTERNAME
+        Drive           = "$Letter`:"
+        DestinationRoot = $root
+        DestinationStyle= 'OrganizedRoot'
+        Mode            = 'Migration preview (v1.x / rev 2.0 trees -> Windows naming); _Duplicates untouched'
+        DriveProfile    = $null
+        Actions         = $actions.ToArray()
+        Skipped         = $skipped.ToArray()
+        Families        = @()
+        Copies          = [pscustomobject]@{ Policy='n/a'; Numbered=0; Quarantined=0; Reported=0; Groups=@() }
+        Mutability      = [pscustomobject]@{ Allowed=$actions.Count; DeniedTotal=0; Denied=@() }
+        OneDrive        = [pscustomobject]@{ SyncOut=@(); IntoCloud=@() }
+        Warnings        = @()
+        Provenance      = @()
+        ProvenanceFile  = ''
+        Stats           = [pscustomobject]@{ Scanned=0; Routed=$actions.Count }
     }
 }
 
@@ -102,55 +615,229 @@ function Save-SysOrgPlan {
 <#
 .SYNOPSIS
     Serializes a plan to <PlansFolder>\<PlanId>.json and returns the path.
+.DESCRIPTION
+    Full download URLs (Provenance) are written ONLY to the local sidecar
+    <PlanId>-provenance.csv (Privacy.StoreFullUrlsInJournal) - never into the JSON.
 .EXAMPLE
     $p = Save-SysOrgPlan -Plan $plan -PlansFolder C:\SysOrg\Plans
 #>
     param($Plan,[string]$PlansFolder)
     if(-not (Test-Path -LiteralPath $PlansFolder)){ New-Item -ItemType Directory -Path $PlansFolder -Force | Out-Null }
     $path = Join-Path $PlansFolder ('{0}.json' -f $Plan.PlanId)
-    $Plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+    if($Plan.PSObject.Properties['ProvenanceFile']){
+        $Plan.ProvenanceFile = (Join-Path $PlansFolder ('{0}-provenance.csv' -f $Plan.PlanId))
+    }
+    if($Plan.PSObject.Properties['Provenance'] -and @($Plan.Provenance).Count -gt 0){
+        try{
+            $rows = @('Source,SourceBucket,HostUrl,ReferrerUrl')
+            foreach($p in @($Plan.Provenance)){
+                $rows += ('"{0}","{1}","{2}","{3}"' -f $p.Source, $p.SourceBucket, $p.HostUrl, $p.ReferrerUrl)
+            }
+            $rows | Set-Content -LiteralPath $Plan.ProvenanceFile -Encoding UTF8
+        } catch { Write-Warning "Provenance sidecar could not be written: $($_.Exception.Message)" }
+    }
+    ($Plan | Select-Object -Property * -ExcludeProperty Provenance) | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
     return $path
+}
+
+function Get-SysOrgPreviewTree {
+<#
+.SYNOPSIS
+    Aggregates plan destinations into a two-level tree with counts and bytes (12.1).
+.EXAMPLE
+    $tree = Get-SysOrgPreviewTree -Plan $plan
+#>
+    param([Parameter(Mandatory)]$Plan)
+    $roots = @{}
+    foreach($a in @($Plan.Actions | Where-Object { "$($_.Action)" -eq 'Move' })){
+        $dr = "$($Plan.DestinationRoot)"
+        if($a.PSObject.Properties['DestRoot'] -and "$($a.DestRoot)"){ $dr = "$($a.DestRoot)" }
+        $bytes = [int64]0
+        if($a.PSObject.Properties['SizeBytes'] -and $a.SizeBytes){ $bytes = [int64]$a.SizeBytes }
+        $rel = "$($a.Destination)"
+        if($rel.StartsWith($dr + '\',[StringComparison]::OrdinalIgnoreCase)){ $rel = $rel.Substring($dr.Length + 1) }
+        else { $rel = Split-Path $rel -Leaf }
+        $segs = @($rel.Split('\'))
+        if(-not $roots.ContainsKey($dr)){ $roots[$dr] = @{ Count=0; Bytes=[int64]0; Children=@{} } }
+        $node = $roots[$dr]
+        $node.Count++
+        $node.Bytes += $bytes
+        if($segs.Count -gt 0){
+            $l1 = $segs[0]
+            if(-not $node.Children.ContainsKey($l1)){ $node.Children[$l1] = @{ Count=0; Bytes=[int64]0; Sub=@{} } }
+            $c1 = $node.Children[$l1]
+            $c1.Count++
+            $c1.Bytes += $bytes
+            if($segs.Count -gt 1){
+                $l2 = $segs[1]
+                if(-not $c1.Sub.ContainsKey($l2)){ $c1.Sub[$l2] = @{ Count=0; Bytes=[int64]0 } }
+                $c1.Sub[$l2].Count++
+                $c1.Sub[$l2].Bytes += $bytes
+            }
+        }
+    }
+    return $roots
+}
+
+function Show-SysOrgPreviewTree {
+<#
+.SYNOPSIS
+    Renders the two-level destination tree, natural-sorted (W7), with counts and bytes.
+.EXAMPLE
+    Show-SysOrgPreviewTree -Plan $plan -NaturalSort:$true
+#>
+    param([Parameter(Mandatory)]$Plan,[bool]$NaturalSort=$true)
+    $tree = Get-SysOrgPreviewTree -Plan $Plan
+    if($tree.Keys.Count -eq 0){
+        Write-Host '  (no moves)' -ForegroundColor DarkGray
+        return
+    }
+    foreach($rn in (Sort-SysOrgNatural -Values @($tree.Keys))){
+        $node = $tree[$rn]
+        if($tree.Keys.Count -gt 1){
+            Write-Host ("  [{0}]  ({1} items, {2})" -f $rn, $node.Count, (Format-SysOrgFileSize $node.Bytes)) -ForegroundColor White
+        }
+        $names = @($node.Children.Keys)
+        if($NaturalSort){ $names = Sort-SysOrgNatural -Values $names } else { $names = @($names | Sort-Object) }
+        foreach($n in $names){
+            $c = $node.Children[$n]
+            Write-Host ("  {0}  ({1} items, {2})" -f $n, $c.Count, (Format-SysOrgFileSize $c.Bytes)) -ForegroundColor Gray
+            $subs = @($c.Sub.Keys)
+            if($NaturalSort){ $subs = Sort-SysOrgNatural -Values $subs } else { $subs = @($subs | Sort-Object) }
+            $shown = 0
+            foreach($s in $subs){
+                if($shown -ge 8){ Write-Host ('      ... and {0} more' -f ($subs.Count - $shown)) -ForegroundColor DarkGray; break }
+                $sc = $c.Sub[$s]
+                Write-Host ("    {0}  ({1}, {2})" -f $s, $sc.Count, (Format-SysOrgFileSize $sc.Bytes)) -ForegroundColor DarkGray
+                $shown++
+            }
+        }
+    }
 }
 
 function Show-SysOrgPlan {
 <#
 .SYNOPSIS
-    Prints a full plan preview: totals, reasons, duplicate quarantines, sample moves,
-    affected top-level folders (P1-6 blast radius) and the long-path skip count (P2-5).
+    Prints the full plan preview (design section 12) and returns a summary for the
+    confirmation prompt.
+.DESCRIPTION
+    Sections: plan header + drive profile, mutability summary (12.2), destination tree
+    (12.1, natural-sorted), families and copies table (12.4), OneDrive sync-out warning
+    (12.3), name-collision flags, affected top-level folders and sample moves.
 .EXAMPLE
-    Show-SysOrgPlan -Plan $plan
+    $sum = Show-SysOrgPlan -Plan $plan -Config $cfg
+    if($sum.OneDriveSyncOut -gt 0){ ... the confirmation prompt names the count ... }
 #>
-    param($Plan,[int]$SampleSize=20)
-    Write-Host ''
-    Write-Host ("PLAN {0}  (drive {1} -> {2})" -f $Plan.PlanId, $Plan.Drive, $Plan.DestinationRoot) -ForegroundColor White
-    Write-Host ("Mode: {0}" -f $Plan.Mode)
-    $moves = @($Plan.Actions | Where-Object { $_.Action -eq 'Move' })
-    $quars = @($Plan.Actions | Where-Object { $_.Action -eq 'Quarantine' })
-    $totalBytes = [int64](($moves | Measure-Object -Property SizeBytes -Sum).Sum)
-    Write-Host ("Moves: {0} ({1})   Quarantines (duplicates): {2}   Skipped: {3}" -f $moves.Count, (Format-SysOrgFileSize $totalBytes), $quars.Count, @($Plan.Skipped).Count)
-    $longPaths = @(@($Plan.Skipped) | Where-Object { $_.Reason -like 'Path >= 260*' })
-    if($longPaths.Count -gt 0){
-        Write-Host ("Paths >= 260 characters recorded but not planned (PowerShell 5.1 limit): {0}" -f $longPaths.Count) -ForegroundColor Yellow
+    [CmdletBinding()]
+    param($Plan,[int]$SampleSize=20,$Config)
+    $actions = @($Plan.Actions)
+    $moves = @($actions | Where-Object { "$($_.Action)" -eq 'Move' })
+    $folderMoves = @($moves | Where-Object { $_.PSObject.Properties['Kind'] -and "$($_.Kind)" -eq 'Folder' })
+    $fileMoves  = @($moves | Where-Object { -not ($_.PSObject.Properties['Kind'] -and "$($_.Kind)" -eq 'Folder') })
+    $quars = @($actions | Where-Object { "$($_.Action)" -eq 'Quarantine' })
+    $bytes = [int64]0
+    if($fileMoves.Count -gt 0){ $bytes = [int64]($fileMoves | Measure-Object -Property SizeBytes -Sum).Sum }
+
+    $showDenied = $true; $natural = $true; $warnOD = $true
+    if($Config){
+        $showDenied = [bool](Get-SysOrgSetting $Config 'Preview.ShowDenied' $true)
+        $natural    = [bool](Get-SysOrgSetting $Config 'Preview.NaturalSort' $true)
+        $warnOD     = [bool](Get-SysOrgSetting $Config 'Preview.WarnOneDriveSyncOut' $true)
     }
+
+    Write-Host ''
+    Write-Host ("PLAN {0}  (drive {1} -> {2}, style {3})" -f $Plan.PlanId, $Plan.Drive, $Plan.DestinationRoot, $Plan.DestinationStyle) -ForegroundColor White
+    if($Plan.PSObject.Properties['Mode'] -and $Plan.Mode){ Write-Host ("Mode: {0}" -f $Plan.Mode) }
+    if($Plan.PSObject.Properties['DriveProfile'] -and $Plan.DriveProfile){
+        Write-Host ("Drive profile: role={0}, scope={1}" -f $Plan.DriveProfile.Role, $Plan.DriveProfile.ProposedScope) -ForegroundColor Gray
+    }
+    Write-Host ("File moves: {0} ({1})   Folder moves: {2}   Quarantines: {3}   Skipped: {4}" -f `
+        $fileMoves.Count, (Format-SysOrgFileSize $bytes), $folderMoves.Count, $quars.Count, @($Plan.Skipped).Count)
+    if($Plan.PSObject.Properties['Warnings'] -and @($Plan.Warnings).Count -gt 0){
+        foreach($w in @($Plan.Warnings)){ Write-Host ("WARNING: {0}" -f $w) -ForegroundColor Yellow }
+    }
+
+    # 12.2 mutability summary
+    if($showDenied -and $Plan.PSObject.Properties['Mutability'] -and $Plan.Mutability){
+        $m = $Plan.Mutability
+        Write-Host ''
+        Write-Host ("Mutability: {0} file(s) allowed; {1} denied (provably never touched):" -f $m.Allowed, $m.DeniedTotal) -ForegroundColor White
+        foreach($d in @($m.Denied)){
+            Write-Host ("  {0}  x{1}" -f $d.Reason, $d.Count) -ForegroundColor Yellow
+        }
+        $deniedReasons = @(@($m.Denied) | ForEach-Object { "$($_.Reason)" })
+        $samples = @(@($Plan.Skipped) | Where-Object { $deniedReasons -contains "$($_.Reason)" } | Select-Object -First 5)
+        foreach($s in $samples){ Write-Host ("    e.g. {0}" -f $s.Source) -ForegroundColor DarkYellow }
+    }
+
+    # 12.1 destination tree
+    Write-Host ''
+    Write-Host 'Destination tree:' -ForegroundColor White
+    Show-SysOrgPreviewTree -Plan $Plan -NaturalSort:$natural
+
+    # 12.4 families and copies table
+    if($Plan.PSObject.Properties['Families'] -and @($Plan.Families).Count -gt 0){
+        Write-Host ''
+        Write-Host 'Families:' -ForegroundColor White
+        foreach($fam in (@($Plan.Families) | Select-Object -First 15)){
+            Write-Host ("  {0}  [{1}]  {2} file(s)  ({3})" -f $fam.Name, $fam.Partition, $fam.Members, $fam.Basis)
+        }
+        if(@($Plan.Families).Count -gt 15){ Write-Host ('  ... and {0} more families' -f (@($Plan.Families).Count - 15)) -ForegroundColor DarkGray }
+    }
+    if($Plan.PSObject.Properties['Copies'] -and $Plan.Copies){
+        $c = $Plan.Copies
+        Write-Host ''
+        Write-Host ("Copies policy: {0}" -f $c.Policy) -ForegroundColor White
+        if("$($c.Policy)" -eq 'NumberCopies' -and ([int]$c.Numbered -gt 0)){
+            Write-Host ("  Numbered copies: {0}" -f $c.Numbered)
+            foreach($g in (@($c.Groups) | Where-Object { @($_.Copies).Count -gt 0 } | Select-Object -First 10)){
+                $names = @(@($g.Copies) | ForEach-Object { '{0} -> {1}' -f (Split-Path $_.Source -Leaf), $_.Assigned })
+                Write-Host ("  keeper: {0}  |  {1}" -f (Split-Path $g.Keeper -Leaf), ($names -join '; ')) -ForegroundColor Gray
+            }
+        }
+        if("$($c.Policy)" -eq 'Quarantine' -and ([int]$c.Quarantined -gt 0)){
+            Write-Host ("  Quarantined duplicates: {0}" -f $c.Quarantined)
+        }
+        if("$($c.Policy)" -eq 'ReportOnly' -and ([int]$c.Reported -gt 0)){
+            Write-Host ("  Copies reported (nothing moves): {0}" -f $c.Reported)
+        }
+    }
+
+    # 12.3 OneDrive warnings
+    $syncOutCount = 0; $intoCount = 0
+    if($Plan.PSObject.Properties['OneDrive'] -and $Plan.OneDrive){
+        $syncOutCount = @($Plan.OneDrive.SyncOut).Count
+        $intoCount = @($Plan.OneDrive.IntoCloud).Count
+        if($warnOD -and ($syncOutCount -gt 0 -or $intoCount -gt 0)){
+            Write-Host ''
+            if($syncOutCount -gt 0){
+                Write-Host ("OneDrive sync-out warning: {0} file(s) will LEAVE OneDrive sync (removed from the cloud):" -f $syncOutCount) -ForegroundColor Yellow
+                @($Plan.OneDrive.SyncOut) | Select-Object -First 8 | ForEach-Object { Write-Host ('  ' + $_) -ForegroundColor DarkYellow }
+                if($syncOutCount -gt 8){ Write-Host ('  ... and {0} more' -f ($syncOutCount - 8)) -ForegroundColor DarkYellow }
+            }
+            if($intoCount -gt 0){
+                Write-Host ("OneDrive note: {0} destination(s) are INSIDE OneDrive - moved files will sync to the cloud." -f $intoCount) -ForegroundColor Yellow
+            }
+        }
+    }
+
+    $dc = @($fileMoves | Where-Object { $_.PSObject.Properties['DifferentContent'] -and $_.DifferentContent })
+    if($dc.Count -gt 0){
+        Write-Host ''
+        Write-Host ("Name collisions with different content: {0} (renamed safely at execution; originals are never overwritten)" -f $dc.Count) -ForegroundColor Yellow
+    }
+
     Write-Host ''
     Write-Host 'Affected top-level folders:' -ForegroundColor White
-    $Plan.Actions | Group-Object {
+    $moves | Group-Object {
         $p = $_.Source.Split('\')
         $n = [Math]::Min(1, $p.Count - 1)
-        if($p.Count -ge 3 -and $p[1] -ieq 'Users'){ $n = 2 }   # show the user folder, not just 'C:\Users'
+        if($p.Count -ge 3 -and $p[1] -ieq 'Users'){ $n = 2 }
         $p[0..$n] -join '\'
     } | Sort-Object Count -Descending | Select-Object -First 15 |
         ForEach-Object { Write-Host ('  {0}  ({1} files)' -f $_.Name, $_.Count) }
+
     Write-Host ''
-    Write-Host 'Actions by reason:' -ForegroundColor White
-    $Plan.Actions | Group-Object { $_.Reason.Split(';')[0] } | Sort-Object Count -Descending |
-        Format-Table @{l='Reason';e={$_.Name}}, Count -AutoSize | Out-Host
-    if($quars.Count -gt 0){
-        Write-Host 'Duplicate quarantines (first 5):' -ForegroundColor White
-        $quars | Select-Object -First 5 | ForEach-Object { Write-Host ('  ' + $_.Source) }
-        if($quars.Count -gt 5){ Write-Host ('  ... and {0} more' -f ($quars.Count-5)) }
-        Write-Host ''
-    }
     Write-Host 'Sample moves:' -ForegroundColor White
     $moves | Select-Object -First $SampleSize | ForEach-Object {
         Write-Host ('  ' + $_.Source) -ForegroundColor DarkGray
@@ -158,6 +845,14 @@ function Show-SysOrgPlan {
     }
     if($moves.Count -gt $SampleSize){ Write-Host ('  ... and {0} more moves' -f ($moves.Count - $SampleSize)) }
     Write-Host ''
+
+    $deniedTotal = 0
+    if($Plan.PSObject.Properties['Mutability'] -and $Plan.Mutability){ $deniedTotal = [int]$Plan.Mutability.DeniedTotal }
+    return [pscustomobject]@{
+        Moves=$fileMoves.Count; FolderMoves=$folderMoves.Count; Quarantines=$quars.Count; Bytes=$bytes
+        DeniedTotal=$deniedTotal; OneDriveSyncOut=$syncOutCount; OneDriveIntoCloud=$intoCount
+        DifferentContent=$dc.Count
+    }
 }
 
 function Invoke-SysOrgPlan {
@@ -168,10 +863,13 @@ function Invoke-SysOrgPlan {
 .DESCRIPTION
     - Re-execution guard (P1-3): a plan with an existing undo journal is refused
       unless -Force is passed, in which case journaled sources are skipped (resume).
+    - Folder actions (Kind='Folder') use the folder primitive (copy -> verify -> remove).
     - Hash economy (P2-1): same-volume Move actions are not hashed; cross-volume
       and quarantine actions are, using the scan-time hash when available.
     - Collision duplicates found at execution time are quarantined, never deleted.
     - 'CopiedVerified' results are counted as Copied, not Moved (P1-10).
+    - Numbered copies whose planned name is now taken are re-numbered safely
+      by Get-SysOrgUniquePath (never overwrites).
 .EXAMPLE
     $res = Invoke-SysOrgPlan -PlanPath .\Plans\plan.json -Config $cfg -AppRoot C:\SysOrg
 .EXAMPLE
@@ -192,10 +890,11 @@ function Invoke-SysOrgPlan {
         if(-not $Force){
             throw "Plan '$($plan.PlanId)' already has an undo journal. Undo it first, or pass -Force to resume (journaled actions are skipped)."
         }
-        Import-Csv -LiteralPath $undoPath | ForEach-Object { $alreadyDone[$_.OriginalSource] = $true }
+        @(Import-Csv -LiteralPath $undoPath) | ForEach-Object { $alreadyDone[$_.OriginalSource] = $true }
     }
 
-    $summary = @{ Moved=0; Copied=0; Quarantined=0; CollisionDuplicate=0; Resumed=0; Failed=0; BytesMoved=[int64]0 }
+    $summary = @{ Moved=0; Copied=0; FolderMoves=0; Numbered=0; Quarantined=0; CollisionDuplicate=0
+                  Resumed=0; Failed=0; BytesMoved=[int64]0 }
 
     # P1-1: journal is appended and flushed after EVERY row, not written once at the end
     $journalExists = Test-Path -LiteralPath $undoPath
@@ -204,7 +903,7 @@ function Invoke-SysOrgPlan {
 
     try {
         if(-not $journalExists){
-            $writer.WriteLine('Timestamp,PlanId,Action,OriginalSource,CurrentLocation,ContentHash')
+            $writer.WriteLine('Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash')
         }
         $allActions = @($plan.Actions)
         $i = 0; $total = $allActions.Count
@@ -221,52 +920,64 @@ function Invoke-SysOrgPlan {
                 continue
             }
 
-            # P2-1: hash only when the journal needs it (quarantine or cross-volume);
-            # reuse the scan-time hash for quarantines when present
-            $needsHash = ($a.Action -eq 'Quarantine') -or
-                         ((Split-Path $a.Source -Qualifier -ErrorAction SilentlyContinue) -ine (Split-Path $a.Destination -Qualifier -ErrorAction SilentlyContinue))
+            $kind = 'File'
+            if($a.PSObject.Properties['Kind'] -and "$($a.Kind)"){ $kind = "$($a.Kind)" }
+
+            # P2-1: hash only when the journal needs it (quarantine or cross-volume files);
+            # reuse the scan-time hash when present. Folder moves are count/byte verified.
+            $needsHash = ($kind -eq 'File') -and
+                         (("$($a.Action)" -eq 'Quarantine') -or
+                          ((Split-Path $a.Source -Qualifier -ErrorAction SilentlyContinue) -ine (Split-Path $a.Destination -Qualifier -ErrorAction SilentlyContinue)))
             $hashBefore = $null
             if($needsHash){
                 if($a.PSObject.Properties['Hash'] -and $a.Hash){ $hashBefore = $a.Hash }
                 else { $hashBefore = Get-SysOrgFileHash -Path $a.Source }
             }
 
-            $result = Invoke-SysOrgSafeMove -Source $a.Source -Destination $a.Destination -Config $Config
+            if($kind -eq 'Folder'){
+                $result = Invoke-SysOrgSafeMoveFolder -Source $a.Source -Destination $a.Destination -Config $Config
+            } else {
+                $result = Invoke-SysOrgSafeMove -Source $a.Source -Destination $a.Destination -Config $Config
+            }
 
             switch($result.Status){
                 'Moved' {
-                    if($a.Action -eq 'Quarantine'){
+                    if("$($a.Action)" -eq 'Quarantine'){
                         $summary.Quarantined++
                         Write-SysOrgLog "Quarantined duplicate: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
                     } else {
-                        $summary.Moved++
-                        $summary.BytesMoved += [int64]$a.SizeBytes
-                        Write-SysOrgLog "Moved: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
+                        if($kind -eq 'Folder'){
+                            $summary.FolderMoves++
+                            Write-SysOrgLog "Moved folder: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
+                        } else {
+                            $summary.Moved++
+                            if($a.PSObject.Properties['CopyIndex'] -and $a.CopyIndex){ $summary.Numbered++ }
+                            $summary.BytesMoved += [int64]$a.SizeBytes
+                            Write-SysOrgLog "Moved: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
+                        }
                     }
-                    # P0-fix: inside a method-call argument list the -f operator binds
-                    # only to its immediate next expression - the remaining commas become
-                    # extra method arguments. Format into a variable FIRST, then write.
-                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, $a.Action, $a.Source, $result.Destination, $hashBefore
+                    # P0-fix: format into a variable FIRST, then write (the -f operator binds
+                    # only to its immediate next expression inside a method-call argument list).
+                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}","{6}"' -f (Get-Date -Format s), $plan.PlanId, $kind, $a.Action, $a.Source, $result.Destination, $hashBefore
                     $writer.WriteLine($journalLine)
                 }
                 'CopiedVerified' {
-                    $summary.Copied++
-                    # P0-fix: inside a method-call argument list the -f operator binds
-                    # only to its immediate next expression - the remaining commas become
-                    # extra method arguments. Format into a variable FIRST, then write.
-                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, $a.Action, $a.Source, $result.Destination, $hashBefore
+                    if($kind -eq 'Folder'){ $summary.FolderMoves++ } else { $summary.Copied++ }
+                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}","{6}"' -f (Get-Date -Format s), $plan.PlanId, $kind, $a.Action, $a.Source, $result.Destination, $hashBefore
                     $writer.WriteLine($journalLine)
                     Write-SysOrgLog "Copied+verified: $($a.Source) -> $($result.Destination) ($($result.Message))" -Level WARN -LogFolder $logFolder
                 }
                 'CollisionDuplicate' {
                     $summary.CollisionDuplicate++
                     $letter = (Split-Path $a.Source -Qualifier).TrimEnd(':')
-                    $qRoot = Join-Path (Get-SysOrgDestinationRoot -Letter $letter -Config $Config) (Get-SysOrgSetting $Config 'Duplicates.QuarantineFolderName' '_Duplicates')
+                    $qFolderName = Get-SysOrgSetting $Config 'Copies.QuarantineFolderName' $null
+                    if(-not $qFolderName){ $qFolderName = Get-SysOrgSetting $Config 'Duplicates.QuarantineFolderName' '_Duplicates' }
+                    $qRoot = Join-Path (Get-SysOrgDestinationRoot -Letter $letter -Config $Config) "$qFolderName"
                     $qRoot = Join-Path $qRoot ('manual-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
                     $r2 = Invoke-SysOrgSafeMove -Source $a.Source -Destination (Join-Path $qRoot (Split-Path $a.Source -Leaf)) -Config $Config
                     if(($r2.Status -eq 'Moved') -or ($r2.Status -eq 'CopiedVerified')){
                         $summary.Quarantined++
-                        $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}"' -f (Get-Date -Format s), $plan.PlanId, 'Quarantine', $a.Source, $r2.Destination, $hashBefore
+                        $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}","{6}"' -f (Get-Date -Format s), $plan.PlanId, 'File', 'Quarantine', $a.Source, $r2.Destination, $hashBefore
                         $writer.WriteLine($journalLine)
                         Write-SysOrgLog "Collision duplicate quarantined: $($a.Source) -> $($r2.Destination)" -Level ACTION -LogFolder $logFolder
                     } else {
@@ -285,7 +996,8 @@ function Invoke-SysOrgPlan {
     }
 
     Write-Progress -Activity 'Executing plan' -Completed
-    Write-SysOrgLog ("Plan {0} finished. Moved={1} Copied={2} Quarantined={3} Resumed={4} Failed={5}" -f $plan.PlanId, $summary.Moved, $summary.Copied, $summary.Quarantined, $summary.Resumed, $summary.Failed) -LogFolder $logFolder
+    Write-SysOrgLog ("Plan {0} finished. Moved={1} Copied={2} Folders={3} Numbered={4} Quarantined={5} Resumed={6} Failed={7}" -f `
+        $plan.PlanId, $summary.Moved, $summary.Copied, $summary.FolderMoves, $summary.Numbered, $summary.Quarantined, $summary.Resumed, $summary.Failed) -LogFolder $logFolder
     return [pscustomobject]@{ PlanId=$plan.PlanId; UndoFile=$undoPath; Summary=$summary }
 }
 
@@ -295,10 +1007,12 @@ function Undo-SysOrgPlan {
     Reverses a plan using its undo journal, in reverse order. Never overwrites.
 .DESCRIPTION
     Content verification (P1-4): rows carrying a ContentHash are re-hashed before
-    restore; a file whose content changed since the move is skipped (SkippedChanged)
-    so the undo never clobbers newer intent. Rows with an empty hash (same-volume
-    moves after the P2-1 hash economy) fall back to path-only undo - a documented
-    tradeoff. Restores into occupied slots get unique ' (2)' suffixed paths.
+    restore; a file whose content changed since the move is skipped (SkippedChanged).
+    Rows with an empty hash (same-volume moves after the P2-1 hash economy) fall back
+    to path-only undo - a documented tradeoff. Folder rows (Kind='Folder') restore with
+    the folder primitive. Numbered copies restore their ORIGINAL names because the
+    journal's OriginalSource column carries the pre-move path. Restores into occupied
+    slots get unique ' (2)' suffixed paths.
 .EXAMPLE
     Undo-SysOrgPlan -PlanId plan-20260101-093000 -AppRoot C:\SysOrg -Config $cfg
 #>
@@ -314,8 +1028,8 @@ function Undo-SysOrgPlan {
         $current  = $row.CurrentLocation
         $original = $row.OriginalSource
         if(-not (Test-Path -LiteralPath $current)){ $skippedMissing++; Write-SysOrgLog "Undo skip (missing): $current" -Level WARN -LogFolder $logFolder; continue }
-        # P1-4: verify content has not changed since the move
-        if($row.ContentHash){
+        # P1-4: verify content has not changed since the move (file rows only)
+        if($row.ContentHash -and (-not (Test-Path -LiteralPath $current -PathType Container))){
             $nowHash = Get-SysOrgFileHash -Path $current
             if($nowHash -and ($nowHash -ne $row.ContentHash)){
                 $skippedChanged++
@@ -327,7 +1041,11 @@ function Undo-SysOrgPlan {
         if(-not (Test-Path -LiteralPath $origDir)){ New-Item -ItemType Directory -Path $origDir -Force | Out-Null }
         if(Test-Path -LiteralPath $original){ $dest = Get-SysOrgUniquePath -Path $original }
         else { $dest = $original }
-        $r = Invoke-SysOrgSafeMove -Source $current -Destination $dest -Config $Config
+        if(Test-Path -LiteralPath $current -PathType Container){
+            $r = Invoke-SysOrgSafeMoveFolder -Source $current -Destination $dest -Config $Config
+        } else {
+            $r = Invoke-SysOrgSafeMove -Source $current -Destination $dest -Config $Config
+        }
         if(($r.Status -eq 'Moved') -or ($r.Status -eq 'CopiedVerified')){
             $restored++; Write-SysOrgLog "Undo: $current -> $($r.Destination)" -Level ACTION -LogFolder $logFolder
         } else {
@@ -353,7 +1071,15 @@ function New-SysOrgScanReport {
     $inv = @(Get-SysOrgInventory -Letter $Letter -Config $Config -CacheFolder (Join-Path $AppRoot 'Cache') -DefaultScope -NoCache)
     $catCounts = $inv | Group-Object Category | Sort-Object Count -Descending
     $dupGroups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config)
-    $clusters  = Get-SysOrgProjectClusters -Inventory $inv -Config $Config
+    $folderMap = Get-SysOrgFolderMap -Config $Config
+    $pk = @{}
+    foreach($f in $inv){
+        $c = "$($f.Category)"
+        $rel = "$($folderMap['Other'])"
+        if($folderMap.ContainsKey($c)){ $rel = "$($folderMap[$c])" }
+        $pk["$($f.FullName)"] = $rel
+    }
+    $fam = Get-SysOrgNameFamilies -Inventory $inv -PartitionLookup $pk -Config $Config
 
     $reportsFolder = Join-Path (Get-SysOrgDestinationRoot -Letter $Letter -Config $Config) (Get-SysOrgSetting $Config 'ReportsFolderName' '_Reports')
     if(-not (Test-Path -LiteralPath $reportsFolder)){ New-Item -ItemType Directory -Path $reportsFolder -Force | Out-Null }
@@ -362,21 +1088,22 @@ function New-SysOrgScanReport {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("SysOrg scan report - drive $Letter`: - $(Get-Date)")
     $lines.Add("Files scanned: $($inv.Count)   (REPORT ONLY - nothing was moved)")
+    if($prof){ $lines.Add("Drive profile: role=$($prof.Role), scope=$($prof.ProposedScope), destination=$($prof.DestinationRoot)") }
     $longPaths = @($inv | Where-Object { $_.Category -eq 'SkippedLongPath' })
     if($longPaths.Count -gt 0){ $lines.Add("Paths >= 260 characters recorded but not planned: $($longPaths.Count)") }
     $lines.Add('')
-    $lines.Add('By category:')
+    $lines.Add('By routing category:')
     foreach($c in $catCounts){ $lines.Add(('  {0,-15} {1}' -f $c.Name, $c.Count)) }
     $lines.Add('')
     $lines.Add("Duplicate groups: $(@($dupGroups).Count)")
     foreach($dg in (@($dupGroups) | Select-Object -First 20)){
-        $lines.Add(('  Keep: ' + $dg.KeepPath))
-        foreach($d in $dg.Duplicates){ $lines.Add(('    dup: ' + $d)) }
+        $lines.Add(('  Keep: ' + $dg.KeepPath + '  (' + $dg.KeepReason + ')'))
+        foreach($d in $dg.Duplicates){ $lines.Add(('    copy: ' + $d)) }
     }
     $lines.Add('')
-    $lines.Add("Detected project clusters: $(@($clusters.Clusters).Count)")
-    foreach($cl in (@($clusters.Clusters) | Select-Object -First 20)){
-        $lines.Add(('  {0}  ({1} files, {2})' -f $cl.Key, $cl.FileCount, $cl.Basis))
+    $lines.Add("Detected families: $(@($fam.Families).Count)")
+    foreach($fl in (@($fam.Families) | Select-Object -First 20)){
+        $lines.Add(('  {0}  [{1}]  {2} file(s)  ({3})' -f $fl.Name, $fl.Partition, $fl.Members, $fl.Basis))
     }
     $lines | Set-Content -LiteralPath $file -Encoding UTF8
     Write-SysOrgLog "Report written: $file" -LogFolder $logFolder

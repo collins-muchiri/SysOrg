@@ -1,27 +1,41 @@
 # Tests/SysOrg.Plan.Tests.ps1
 # Covers: P0-2 (sum correctness), P1-1 (journal), P1-3 (re-execution guard + resume),
 #         P1-4 (hash-mismatch undo skip), P1-10 (honest Copied counting), P2-1 (hash economy),
-#         P2-5 (SkippedLongPath excluded from plans)
+#         P2-5 (SkippedLongPath excluded from plans),
+#         W1 (no plan without a profile), W6 (numbered copies + undo restore)
 
 BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
-    Import-Module (Join-Path $repo 'Modules\SysOrg.Core.psm1') -Force
-    Import-Module (Join-Path $repo 'Modules\SysOrg.Scan.psm1') -Force
-    Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1') -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Core.psm1')        -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.KnownFolders.psm1') -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Scan.psm1')        -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1')        -Force
+    $script:fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
+        KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
     $script:planCfg = @{
         AppRoot        = $TestDrive
         OrganizedRoots = @{ '*' = '__AUTO__' }
-        Duplicates     = @{ QuarantineFolderName = '_Duplicates' }
+        Copies         = @{ Policy='Quarantine'; QuarantineFolderName='_Duplicates'; MinFileSizeKB=0; HeaderHashKB=64 }
+        Families       = @{ Enabled=$false }
+        Downloads      = @{ UseZoneIdentifier=$false }
         Move           = @{ AllowCrossVolume = $true }
         ExcludedPaths  = @()
         ExcludedFilePatterns = @()
         SkipHiddenSystemFiles = $true
         ExcludeDestinations = $true
-        PreserveExistingFolders = $true
-        AlwaysScanFolders = @()
-        ProjectDetection = @{ Enabled = $true; MinFiles = 3; MaxProjects = 200 }
+        PreserveExistingFolders = $false
+        DateFolders = 'Year'
         FolderAudit = @{ Enabled = $false }
-        Categories = @{}
+        TypeMap = @{}
+    }
+}
+
+Describe 'No plan without a profile (W1)' {
+    It 'refuses to build a plan when the drive profile is missing' {
+        $inv = @([pscustomobject]@{ FullName='C:\src\note.txt'; Name='note.txt'; Stem='note'; Extension='.txt'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\src'; Category='Documents' })
+        { New-SysOrgPlan -Letter T -Inventory $inv -Config $planCfg } | Should -Throw '*profile*'
+        { New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $null -Config $planCfg } | Should -Throw '*profile*'
     }
 }
 
@@ -32,7 +46,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         Set-Content -LiteralPath $src -Value 'v1'
         $dest = Join-Path $TestDrive 'org2\Documents\2026\doc.txt'
         $plan = [pscustomobject]@{ PlanId='plan-test-0002'
-            Actions=@([pscustomobject]@{ Action='Move'; Source=$src; Destination=$dest; Reason='Category=Documents'; SizeBytes=2 }) }
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dest; Reason='Category=Documents'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'plan2.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive
@@ -60,8 +74,8 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         $planId = 'plan-test-0003'
         $plan = [pscustomobject]@{ PlanId=$planId
             Actions=@(
-                [pscustomobject]@{ Action='Move'; Source=$srcA; Destination=$dstA; Reason='Category=Documents'; SizeBytes=2 },
-                [pscustomobject]@{ Action='Move'; Source=$srcB; Destination=$dstB; Reason='Category=Documents'; SizeBytes=2 }) }
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='Category=Documents'; SizeBytes=2 },
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcB; Destination=$dstB; Reason='Category=Documents'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'plan3.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
         # simulate a crashed first run: action A already executed and journaled
@@ -70,8 +84,8 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         New-Item -ItemType Directory -Path (Join-Path $TestDrive 'Undo') -Force | Out-Null
         $undoPath = Join-Path $TestDrive ('Undo\undo-' + $planId + '.csv')
         Set-Content -LiteralPath $undoPath -Value @(
-            'Timestamp,PlanId,Action,OriginalSource,CurrentLocation,ContentHash',
-            ('"2026-01-01T00:00:00","{0}","Move","{1}","{2}",""' -f $planId, $srcA, $dstA)
+            'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash',
+            ('"2026-01-01T00:00:00","{0}","File","Move","{1}","{2}",""' -f $planId, $srcA, $dstA)
         ) -Encoding UTF8
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive -Force
         $res.Summary.Resumed | Should -Be 1
@@ -97,8 +111,8 @@ Describe 'Undo content verification (P1-4)' {
         New-Item -ItemType Directory -Path (Join-Path $TestDrive 'Undo') -Force | Out-Null
         $undoPath = Join-Path $TestDrive ('Undo\undo-' + $planId + '.csv')
         Set-Content -LiteralPath $undoPath -Value @(
-            'Timestamp,PlanId,Action,OriginalSource,CurrentLocation,ContentHash',
-            ('"2026-01-01T00:00:00","{0}","Move","{1}","{2}","{3}"' -f $planId, $original, $current, $hash)
+            'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash',
+            ('"2026-01-01T00:00:00","{0}","File","Move","{1}","{2}","{3}"' -f $planId, $original, $current, $hash)
         ) -Encoding UTF8
         $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $planCfg
         $u.SkippedChanged | Should -Be 1
@@ -107,8 +121,8 @@ Describe 'Undo content verification (P1-4)' {
     }
 }
 
-Describe 'Duplicate groups and sums (P0-2)' {
-    It 'reports non-zero WastedBytes for a known duplicate fixture' {
+Describe 'Duplicate groups and sums (P0-2, W6 keeper rule)' {
+    It 'reports non-zero WastedBytes; keeper is the OLDEST write time (rev 2.1 rule)' {
         $root = Join-Path $TestDrive ('dupfix-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $root -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $root 'first.txt')  -Value ('D' * 20)
@@ -120,21 +134,18 @@ Describe 'Duplicate groups and sums (P0-2)' {
             [pscustomobject]@{ FullName=(Join-Path $root 'second.txt'); Name='second.txt'; Stem='second'; Extension='.txt'; Length=20
                 LastWriteTime=(Get-Date '2026-01-02'); Directory=$root; Category='Documents' }
         )
-        # MinFileSizeKB=0: the fixture files are 20 bytes, so any positive
-        # KB threshold would filter them out before duplicate grouping.
-        $dupCfg = @{ Duplicates = @{ Policy='Quarantine'; MinFileSizeKB=0; HeaderHashKB=64 } }
-        $groups = @(Find-SysOrgDuplicates -Inventory $inv -Config $dupCfg)
+        $groups = @(Find-SysOrgDuplicates -Inventory $inv -Config $planCfg)
         $groups.Count | Should -Be 1
         $groups[0].WastedBytes | Should -Be 20
-        $groups[0].KeepPath | Should -Be (Join-Path $root 'first.txt')
+        $groups[0].KeepPath | Should -Be (Join-Path $root 'first.txt')   # oldest = keeper
         $groups[0].Duplicates.Count | Should -Be 1
         $groups[0].Duplicates[0] | Should -Be (Join-Path $root 'second.txt')
     }
     It 'Show-SysOrgPlan computes totals without parse errors (P0-1/P0-2 regression guard)' {
-        $plan = [pscustomobject]@{ PlanId='plan-show-1'; Drive='T:'; DestinationRoot='T:\_Organized'; Mode='test'
-            Actions=@([pscustomobject]@{ Action='Move'; Source='C:\x\a.txt'; Destination='T:\_Organized\Documents\a.txt'; Reason='Category=Documents'; SizeBytes=123 })
+        $plan = [pscustomobject]@{ PlanId='plan-show-1'; Drive='T:'; DestinationRoot='T:\_Organized'; DestinationStyle='OrganizedRoot'; Mode='test'
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\x\a.txt'; Destination='T:\_Organized\Documents\a.txt'; DestRoot='T:\_Organized'; Reason='Category=Documents'; SizeBytes=123 })
             Skipped=@() }
-        { Show-SysOrgPlan -Plan $plan } | Should -Not -Throw
+        { Show-SysOrgPlan -Plan $plan -Config $planCfg } | Should -Not -Throw
     }
 }
 
@@ -145,8 +156,7 @@ Describe 'Plan construction' {
         $long   = [pscustomobject]@{ FullName=('C:\' + ('x' * 280)); Name='x' * 279; Stem='x'; Extension='.txt'
             Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\deep'; Category='SkippedLongPath' }
         $inv = @($normal, $long)
-        $clusters = Get-SysOrgProjectClusters -Inventory $inv -Config $planCfg
-        $plan = New-SysOrgPlan -Letter T -Inventory $inv -ClusterResult $clusters -DupGroups @() -Config $planCfg
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $fakeProf -DupGroups @() -Config $planCfg
         @($plan.Actions).Count | Should -Be 1
         $plan.Actions[0].Source | Should -Be 'C:\src\note.txt'
         @($plan.Skipped | Where-Object { $_.Source -eq $long.FullName }).Count | Should -Be 1
@@ -157,11 +167,76 @@ Describe 'Plan construction' {
         $inv = @($dup)
         $dupGroups = @([pscustomobject]@{ Hash='ABCD1234ABCD1234'; KeepPath='C:\keep\copy.bin'
             Duplicates=@('C:\src\copy.bin'); WastedBytes=1024 })
-        $qCfg = @{ Duplicates = @{ Policy='Quarantine'; QuarantineFolderName='_Duplicates' }; OrganizedRoots=@{ '*'='__AUTO__' } }
-        $clusters = Get-SysOrgProjectClusters -Inventory $inv -Config $qCfg
-        $plan = New-SysOrgPlan -Letter T -Inventory $inv -ClusterResult $clusters -DupGroups $dupGroups -Config $qCfg
+        $qCfg = @{ Copies = @{ Policy='Quarantine'; QuarantineFolderName='_Duplicates'; MinFileSizeKB=0; HeaderHashKB=64 }
+                   OrganizedRoots=@{ '*'='__AUTO__' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                   SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                   Families=@{Enabled=$false}; Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false} }
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $fakeProf -DupGroups $dupGroups -Config $qCfg
         @($plan.Actions).Count | Should -Be 1
         $plan.Actions[0].Action | Should -Be 'Quarantine'
         $plan.Actions[0].Hash | Should -Be 'ABCD1234ABCD1234'
+    }
+    It 'NumberCopies: the keeper keeps its name and copies are numbered in the keeper folder (W6)' {
+        $root = Join-Path $TestDrive ('ncfix-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'Data.bin') -Value ('X' * 1200)
+        Set-Content -LiteralPath (Join-Path $root 'Data (2).bin') -Value ('X' * 1200)
+        Set-Content -LiteralPath (Join-Path $root 'Data (3).bin') -Value ('X' * 1200)
+        $inv = @(
+            [pscustomobject]@{ FullName=(Join-Path $root 'Data.bin'); Name='Data.bin'; Stem='Data'; Extension='.bin'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-01'); Directory=$root; Category='Other' },
+            [pscustomobject]@{ FullName=(Join-Path $root 'Data (2).bin'); Name='Data (2).bin'; Stem='Data (2)'; Extension='.bin'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-02'); Directory=$root; Category='Other' },
+            [pscustomobject]@{ FullName=(Join-Path $root 'Data (3).bin'); Name='Data (3).bin'; Stem='Data (3)'; Extension='.bin'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-03'); Directory=$root; Category='Other' }
+        )
+        $ncCfg = @{ Copies = @{ Policy='NumberCopies'; StartIndex=2; MinFileSizeKB=1; HeaderHashKB=64 }
+                    OrganizedRoots=@{ '*'='__AUTO__' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                    SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                    Families=@{Enabled=$false}; Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}
+                    DateFolders='None'; MaxPlanActions=5000 }
+        $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $ncCfg)
+        $dups.Count | Should -Be 1
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $fakeProf -DupGroups $dups -Config $ncCfg
+        @($plan.Actions).Count | Should -Be 3
+        $plan.Copies.Policy | Should -Be 'NumberCopies'
+        $plan.Copies.Numbered | Should -Be 2
+        $keeper = @($plan.Actions | Where-Object { $_.Destination -like '*Data.bin' })
+        $keeper.Count | Should -Be 1
+        $keeper[0].Source | Should -Be (Join-Path $root 'Data.bin')   # oldest = keeper keeps its name
+        $numbered = @($plan.Actions | Where-Object { $_.CopyIndex })
+        @($numbered | Where-Object { $_.Destination -like '*Data (2).bin' }).Count | Should -Be 1
+        @($numbered | Where-Object { $_.Destination -like '*Data (3).bin' }).Count | Should -Be 1
+        ($numbered | ForEach-Object { Split-Path $_.Destination -Parent } | Select-Object -Unique).Count | Should -Be 1   # same folder as the keeper
+    }
+    It 'mutability denials appear in Skipped with reasons and never in Actions (W3)' {
+        $sysProf = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='System'; ProposedScope='KnownFolders'
+            KnownFolders=@([pscustomobject]@{ Name='Documents'; Path='C:\Users\t\Documents'; IsRedirected=$false; UnderOneDrive=$false })
+            DownloadRoots=@('C:\Users\t\Downloads') }
+        $ok   = [pscustomobject]@{ FullName='C:\Users\t\Documents\note.txt'; Name='note.txt'; Stem='note'; Extension='.txt'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\Users\t\Documents'; Category='Documents' }
+        $dll  = [pscustomobject]@{ FullName='C:\Users\t\Documents\lib.dll'; Name='lib.dll'; Stem='lib'; Extension='.dll'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\Users\t\Documents'; Category='Other' }
+        $out  = [pscustomobject]@{ FullName='C:\Loose\notes.txt'; Name='notes.txt'; Stem='notes'; Extension='.txt'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\Loose'; Category='Documents' }
+        $mCfg = @{ OrganizedRoots=@{ 'C'='C:\Organized' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                   SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                   Copies=@{Policy='NumberCopies';StartIndex=2;MinFileSizeKB=1}; Families=@{Enabled=$false}
+                   Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; DateFolders='Year'
+                   Policy=@{ SystemDrive=@{ Scope='KnownFolders'; WritablePaths=@()
+                        BlockedExtensions=@('.dll','.sys','.drv','.ocx','.cpl','.scr','.lnk','.url'); AllowInstallersInDownloads=$true }
+                        DataDrives=@{ Scope='FullDrive' } } }
+        $plan = New-SysOrgPlan -Letter C -Inventory @($ok,$dll,$out) -DriveProfile $sysProf -DupGroups @() -Config $mCfg -KnownFolders @($sysProf.KnownFolders)
+        @($plan.Actions).Count | Should -Be 1
+        $srcs = @($plan.Actions | ForEach-Object { $_.Source })
+        $srcs -contains $ok.FullName | Should -BeTrue
+        $srcs -contains $dll.FullName | Should -BeFalse
+        $srcs -contains $out.FullName | Should -BeFalse
+        $dllSkip = @($plan.Skipped | Where-Object { $_.Source -eq $dll.FullName })
+        $dllSkip.Count | Should -Be 1
+        $dllSkip[0].Reason | Should -Be 'Blocked extension .dll'
+        $outSkip = @($plan.Skipped | Where-Object { $_.Source -eq $out.FullName })
+        $outSkip[0].Reason | Should -Be 'Outside writable scope on system drive'
+        $plan.Mutability.Allowed | Should -Be 1
     }
 }

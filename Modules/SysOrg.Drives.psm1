@@ -1,5 +1,6 @@
 #Requires -Version 5.1
-# SysOrg.Drives.psm1 - internal/external + SSD/HDD detection with confidence and evidence.
+# SysOrg.Drives.psm1 - internal/external + SSD/HDD detection with confidence and evidence,
+#                      plus the drive hierarchy profiler (design section 4, W1).
 
 function ConvertFrom-SysOrgEnum {
 <#
@@ -117,6 +118,134 @@ function Get-SysOrgDrive {
         })
     }
     return ($results.ToArray() | Sort-Object Drive)
+}
+
+function Get-SysOrgDriveProfile {
+<#
+.SYNOPSIS
+    Profiles the hierarchy of every volume BEFORE any plan is built (W1).
+.DESCRIPTION
+    Produces one profile per volume: role (System / Removable / Data), detection evidence,
+    protected artifacts found at the drive root (Windows, Program Files, WindowsApps,
+    XboxGames, ...), known folders resolved on THIS drive (with redirection and OneDrive
+    flags), download roots, the top-level directory tree, the proposed writable scope and
+    the destination root. NO PLAN IS BUILT WITHOUT A PROFILE.
+.PARAMETER Letters
+    Optional drive-letter filter, e.g. @('C').
+.EXAMPLE
+    Get-SysOrgDriveProfile -Config $cfg | Show-SysOrgDriveProfileReport
+#>
+    [CmdletBinding()]
+    param($Config,[string[]]$Letters,[object[]]$KnownFolders)
+    if(-not $KnownFolders -or @($KnownFolders).Count -eq 0){ $KnownFolders = @(Get-SysOrgKnownFolders) }
+    $systemDrive = 'C'
+    try { if($env:SystemDrive){ $systemDrive = $env:SystemDrive.TrimEnd(':').ToUpperInvariant() } } catch { }
+    $artifacts = @(Get-SysOrgSetting $Config 'Policy.ProtectedArtifacts' @())
+
+    $profiles = @()
+    foreach($d in @(Get-SysOrgDrive -Letters $Letters)){
+        $letter = "$($d.Drive)".TrimEnd(':').ToUpperInvariant()
+        $root = ("{0}:\" -f $letter)
+        $role = 'Data'
+        if($letter -eq $systemDrive){ $role = 'System' }
+        elseif("$($d.Location)" -eq 'External'){ $role = 'Removable' }
+
+        $found = @()
+        foreach($a in $artifacts){
+            if([string]::IsNullOrWhiteSpace("$a")){ continue }
+            $ap = ($root + "$a")
+            if(Test-Path -LiteralPath $ap){ $found += "$a" }
+        }
+
+        $kf = @($KnownFolders | Where-Object { $_.Path -and ("$($_.Path)".StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) })
+
+        # Download roots: resolved Downloads known folders on this drive + <root>\Downloads
+        $dl = @()
+        $seen = @{}
+        foreach($k in $kf){
+            if("$($k.Name)" -ieq 'Downloads'){
+                $kk = "$($k.Path)".ToLowerInvariant()
+                if(-not $seen.ContainsKey($kk)){ $seen[$kk]=$true; $dl += [string]$k.Path }
+            }
+        }
+        $dlRoot = ($root + 'Downloads')
+        if(Test-Path -LiteralPath $dlRoot){
+            $kk = $dlRoot.ToLowerInvariant()
+            if(-not $seen.ContainsKey($kk)){ $seen[$kk]=$true; $dl += $dlRoot }
+        }
+
+        $top = @()
+        try {
+            $top = @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue |
+                     Select-Object -First 60 | ForEach-Object { $_.Name })
+        } catch { $top = @() }
+
+        $scope = if($role -eq 'System'){ 'KnownFolders' } else { 'FullDrive' }
+
+        $profiles += [pscustomobject]@{
+            Letter          = $letter
+            Root            = $root
+            Role            = $role
+            Drive           = $d
+            Artifacts       = $found
+            KnownFolders    = $kf
+            DownloadRoots   = $dl
+            TopLevelDirs    = $top
+            ProposedScope   = $scope
+            DestinationRoot = (Get-SysOrgDestinationRoot -Letter $letter -Config $Config)
+        }
+    }
+    return $profiles
+}
+
+function Show-SysOrgDriveProfileReport {
+<#
+.SYNOPSIS
+    Renders the drive hierarchy profile report (design sections 4 and 12.5).
+.DESCRIPTION
+    Per volume: role and detection evidence, protected artifacts found, known folders
+    (with redirection / OneDrive flags), top-level folders, download roots and the
+    proposed writable scope. The user sees the architecture before confirming anything.
+.EXAMPLE
+    Show-SysOrgDriveProfileReport -Profiles (Get-SysOrgDriveProfile -Config $cfg)
+#>
+    param([Parameter(Mandatory)]$Profiles,[switch]$AsText)
+    if(-not $Profiles -or @($Profiles).Count -eq 0){
+        Write-Host 'No drive profiles available.' -ForegroundColor Yellow
+        return
+    }
+    foreach($p in @($Profiles)){
+        Write-Host ''
+        Write-Host ("Drive {0}\   role={1}   proposed scope={2}" -f $p.Letter, $p.Role, $p.ProposedScope) -ForegroundColor White
+        Write-Host ("  Destination root: {0}" -f $p.DestinationRoot)
+        $d = $p.Drive
+        if($d){
+            Write-Host ("  Detection: {0} / {1} / {2} / {3}  (confidence {4})" -f $d.MediaType, $d.BusType, $d.Location, $d.FileSystem, $d.Confidence)
+            Write-Host ("  Evidence : {0}" -f $d.DetectionBasis)
+        }
+        if(@($p.Artifacts).Count -gt 0){
+            Write-Host ("  Protected artifacts at root: {0}" -f (@($p.Artifacts) -join ', ')) -ForegroundColor Yellow
+        }
+        if(@($p.KnownFolders).Count -gt 0){
+            foreach($k in @($p.KnownFolders)){
+                $flags = @()
+                if($k.IsRedirected){ $flags += 'redirected' }
+                if($k.UnderOneDrive){ $flags += 'OneDrive' }
+                $fs = ''
+                if($flags.Count -gt 0){ $fs = ('  [' + ($flags -join ', ') + ']') }
+                Write-Host ("  Known folder: {0,-10} -> {1}{2}" -f $k.Name, $k.Path, $fs)
+            }
+        } else {
+            Write-Host '  Known folders on this drive: (none)' -ForegroundColor DarkGray
+        }
+        if(@($p.DownloadRoots).Count -gt 0){
+            Write-Host ("  Download roots: {0}" -f (@($p.DownloadRoots) -join ', '))
+        }
+        if(@($p.TopLevelDirs).Count -gt 0){
+            Write-Host ("  Top-level folders: {0}" -f (@($p.TopLevelDirs) -join ', '))
+        }
+    }
+    Write-Host ''
 }
 
 Export-ModuleMember -Function *-SysOrg*

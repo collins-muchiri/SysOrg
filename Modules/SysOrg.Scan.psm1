@@ -1,6 +1,13 @@
 #Requires -Version 5.1
-# SysOrg.Scan.psm1 - inventory, classification, project clusters, duplicate detection.
+# SysOrg.Scan.psm1 - inventory, classification (TypeMap -> built-in map -> PerceivedType),
+#                    download provenance, code project folders, multipart sets,
+#                    type-first name families, duplicate detection.
 
+# ---------------------------------------------------------------------------
+# Classification (W4): routing categories are the Windows set.
+#   Documents, Pictures, Videos, Music, Archives, Code, Installers, Other (, SKIP)
+# Legacy v1.x category names translate through $script:CategoryToRoute.
+# ---------------------------------------------------------------------------
 $script:CategoryMap = @{
     Documents     = @('.pdf','.doc','.docx','.txt','.rtf','.odt','.md','.xps','.djvu','.epub','.chm')
     Spreadsheets  = @('.xls','.xlsx','.csv','.ods','.tsv')
@@ -18,19 +25,67 @@ $script:ExtToCategory = @{}
 foreach($cat in $script:CategoryMap.Keys){
     foreach($e in $script:CategoryMap[$cat]){ $script:ExtToCategory[$e] = $cat }
 }
+$script:CategoryToRoute = @{
+    Documents='Documents'; Spreadsheets='Documents'; Presentations='Documents'; Fonts='Documents'; Databases='Documents'
+    Images='Pictures'; Videos='Videos'; Audio='Music'; Archives='Archives'; Code='Code'; Installers='Installers'
+}
+
+$script:PerceivedCache = @{}
+$script:RouteByPerceivedType = @{
+    'image'='Pictures'; 'video'='Videos'; 'audio'='Music'; 'text'='Documents'
+    'document'='Documents'; 'compressed'='Archives'; 'application'='Installers'
+}
+
+function Get-SysOrgPerceivedSub {
+<#
+.SYNOPSIS
+    Windows PerceivedType registry fallback for extensions missing from the map (W4).
+.DESCRIPTION
+    Explorer groups by Kind using the perceived type registered per extension; unknown types
+    land where Windows would put them. 'system' returns 'SKIP' (the file is never moved).
+    Results are cached per session; the registry read is wrapped so non-Windows test hosts
+    return $null instead of throwing.
+.EXAMPLE
+    Get-SysOrgPerceivedSub -Extension '.heic'   # -> 'Pictures' when PerceivedType=image
+#>
+    param([string]$Extension)
+    $ext = "$Extension".ToLowerInvariant()
+    if(-not $ext){ return $null }
+    if($script:PerceivedCache.ContainsKey($ext)){ return $script:PerceivedCache[$ext] }
+    $sub = $null
+    try{
+        $pt = (Get-ItemProperty -LiteralPath ('Registry::HKEY_CLASSES_ROOT\' + $ext) -Name 'PerceivedType' -ErrorAction Stop).PerceivedType
+        $pt = "$pt".ToLowerInvariant()
+        if($script:RouteByPerceivedType.ContainsKey($pt)){ $sub = $script:RouteByPerceivedType[$pt] }
+        if($pt -eq 'system'){ $sub = 'SKIP' }
+    } catch { }
+    $script:PerceivedCache[$ext] = $sub
+    return $sub
+}
 
 function Get-SysOrgCategory {
 <#
 .SYNOPSIS
-    Maps a file extension to a category name; user Categories overrides win.
+    Maps a file extension to a ROUTING category.
+.DESCRIPTION
+    Resolution order (design 3.3): config TypeMap override, built-in extension map,
+    Windows PerceivedType registry fallback, then 'Other'. Legacy config values
+    (Images, Audio, ...) are translated to the routing set. 'SKIP' means never moved.
 .EXAMPLE
     Get-SysOrgCategory -Extension '.pdf' -Config $cfg   # -> 'Documents'
 #>
     param([string]$Extension,$Config)
     $ext = $Extension.ToLowerInvariant()
-    $overrides = Get-SysOrgSetting $Config 'Categories' $null
-    if($overrides -is [hashtable] -and $overrides.ContainsKey($ext)){ return $overrides[$ext] }
-    if($script:ExtToCategory.ContainsKey($ext)){ return $script:ExtToCategory[$ext] }
+    $overrides = Get-SysOrgSetting $Config 'TypeMap' $null
+    if(-not ($overrides -is [hashtable])){ $overrides = Get-SysOrgSetting $Config 'Categories' $null }
+    if($overrides -is [hashtable] -and $overrides.ContainsKey($ext)){
+        $v = "$($overrides[$ext])"
+        if($script:CategoryToRoute.ContainsKey($v)){ return $script:CategoryToRoute[$v] }
+        return $v
+    }
+    if($script:ExtToCategory.ContainsKey($ext)){ return $script:CategoryToRoute[$script:ExtToCategory[$ext]] }
+    $pt = Get-SysOrgPerceivedSub -Extension $ext
+    if($pt){ return $pt }
     return 'Other'
 }
 
@@ -52,25 +107,80 @@ function Test-SysOrgCloudPlaceholderAttributes {
     return ((($Attributes -band 0x1000) -ne 0) -or (($Attributes -band 0x400000) -ne 0))
 }
 
+function Get-SysOrgScanRoots {
+<#
+.SYNOPSIS
+    Resolves the scan start folders and scope tag for a drive (P1-6, extended by W2).
+.DESCRIPTION
+    -Roots wins; -DefaultScope resolves ScanRoots AND the known folders that live on this
+    drive (registry-resolved, so a redirected Pictures folder on D:\Bilder is scoped on D);
+    otherwise the whole drive. Returns @{ Scope; Initial }.
+.EXAMPLE
+    $r = Get-SysOrgScanRoots -Letter C -Config $cfg -DefaultScope
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,$Config,[switch]$DefaultScope,[string[]]$Roots,[object[]]$KnownFolders)
+    $initial = @()
+    $scope = 'full'
+    if($Roots -and @($Roots).Count -gt 0){
+        $scope = 'custom'
+        $initial = @($Roots | Where-Object { Test-Path -LiteralPath $_ })
+    }
+    elseif($DefaultScope){
+        $subs = $null
+        $rootsCfg = $Config.ScanRoots
+        if($rootsCfg -is [hashtable]){
+            if($rootsCfg.ContainsKey($Letter)){ $subs = $rootsCfg[$Letter] }
+            elseif($rootsCfg.ContainsKey('*')){ $subs = $rootsCfg['*'] }
+        }
+        $resolved = New-Object System.Collections.Generic.HashSet[string]
+        if($subs){
+            foreach($sub in @($subs)){
+                if([string]::IsNullOrWhiteSpace("$sub")){ continue }
+                $driveRel = ('{0}:\{1}' -f $Letter, ("$sub").TrimStart('\'))
+                if(Test-Path -LiteralPath $driveRel){ [void]$resolved.Add($driveRel) }
+                if($env:USERPROFILE){
+                    $prof = Join-Path $env:USERPROFILE "$sub"
+                    $qual = $null
+                    try { $qual = Split-Path $prof -Qualifier -ErrorAction Stop } catch { $qual = $null }
+                    if($qual -and ($qual -ieq ('{0}:' -f $Letter)) -and (Test-Path -LiteralPath $prof)){ [void]$resolved.Add($prof) }
+                }
+            }
+        }
+        try{
+            if(-not $KnownFolders -or @($KnownFolders).Count -eq 0){ $KnownFolders = @(Get-SysOrgKnownFolders) }
+            foreach($k in @($KnownFolders)){
+                $kp = "$($k.Path)"
+                if(-not $kp){ continue }
+                $qual = $null
+                try { $qual = Split-Path $kp -Qualifier -ErrorAction Stop } catch { $qual = $null }
+                if($qual -and ($qual.TrimEnd(':').ToUpperInvariant() -eq $Letter.ToUpperInvariant())){
+                    if(Test-Path -LiteralPath $kp){ [void]$resolved.Add($kp) }
+                }
+            }
+        } catch { Write-Verbose "Known-folder scan scope unavailable: $($_.Exception.Message)" }
+        if($resolved.Count -gt 0){ $initial = @($resolved); $scope = 'scoped' }
+    }
+    else { $initial = @(('{0}:\' -f $Letter)) }
+    return [pscustomobject]@{ Scope=$scope; Initial=$initial }
+}
+
 function Get-SysOrgInventory {
 <#
 .SYNOPSIS
     Recursive file inventory with exclusions, folder safety gates, cloud-placeholder
     skip, long-path recording and a config-keyed JSON cache.
 .DESCRIPTION
-    Default start point is the drive root. With -DefaultScope, the ScanRoots config
-    narrows the scan to existing profile folders (e.g. Desktop, Documents, Downloads,
-    Pictures, Videos, Music) on the scanned drive - a drive with none of them yields
-    zero records instead of scanning everything. -Roots forces explicit start folders
-    (used by tests and power users). Cloud placeholders (OneDrive files-on-demand:
-    Offline / RecallOnDataAccess) are never opened, so scanning cannot hydrate them.
+    Default start point is the drive root. With -DefaultScope, Get-SysOrgScanRoots narrows
+    the scan to existing profile folders and known folders on the scanned drive. -Roots
+    forces explicit start folders (used by tests and power users). Cloud placeholders
+    (OneDrive files-on-demand) are never opened, so scanning cannot hydrate them.
     Files at or above 260 characters of path are recorded with Category
-    'SkippedLongPath' (Windows PowerShell 5.1 cannot reliably address them; PowerShell
-    7 with LongPathsEnabled lifts this).
+    'SkippedLongPath' (Windows PowerShell 5.1 cannot reliably address them).
 .PARAMETER Letter
     Drive letter whose root is scanned (also keys the cache file).
 .PARAMETER DefaultScope
-    Resolve the ScanRoots config entry for this drive instead of the whole drive.
+    Resolve the ScanRoots config entry + known folders for this drive instead of the whole drive.
 .PARAMETER Roots
     Explicit absolute start folders; overrides the drive root and -DefaultScope.
 .PARAMETER NoCache
@@ -93,47 +203,25 @@ function Get-SysOrgInventory {
         [switch]$DefaultScope,
         [string[]]$Roots,
         [string[]]$CfaFolders,
+        [object[]]$KnownFolders,
         [System.Collections.Generic.List[object]]$AuditTrail
     )
     $root = ('{0}:\' -f $Letter)
-    if(-not ($Roots -and @($Roots).Count -gt 0)){
+    if(-not ($Roots -and @($Roots).Count -gt 0) -and (-not $DefaultScope)){
         if(-not (Test-Path -LiteralPath $root)){ throw "Drive $root not found." }
     }
     if(-not $cfaFolders){ $cfaFolders = Get-SysOrgDefenderProtectedFolders -Config $Config }
 
-    # --- P1-6: resolve scan roots ---
-    $initial = @()
-    $scope = 'full'
-    if($Roots -and @($Roots).Count -gt 0){
-        $scope = 'custom'
-        $initial = @($Roots | Where-Object { Test-Path -LiteralPath $_ })
+    # --- P1-6 + W2: resolve scan roots ---
+    $rootsInfo = Get-SysOrgScanRoots -Letter $Letter -Config $Config -DefaultScope:$DefaultScope -Roots $Roots -KnownFolders $KnownFolders
+    $scope = $rootsInfo.Scope
+    $initial = @($rootsInfo.Initial)
+    if($scope -eq 'full'){
+        if($initial.Count -gt 0){ if(-not (Test-Path -LiteralPath $initial[0])){ throw "Drive $root not found." } }
     }
-    elseif($DefaultScope){
-        $subs = $null
-        $rootsCfg = $Config.ScanRoots
-        if($rootsCfg -is [hashtable]){
-            if($rootsCfg.ContainsKey($Letter)){ $subs = $rootsCfg[$Letter] }
-            elseif($rootsCfg.ContainsKey('*')){ $subs = $rootsCfg['*'] }
-        }
-        if($subs){
-            $resolved = New-Object System.Collections.Generic.HashSet[string]
-            foreach($sub in @($subs)){
-                if([string]::IsNullOrWhiteSpace($sub)){ continue }
-                $driveRel = ('{0}:\{1}' -f $Letter, ($sub.TrimStart('\')))
-                if(Test-Path -LiteralPath $driveRel){ [void]$resolved.Add($driveRel) }
-                $prof = Join-Path $env:USERPROFILE $sub
-                if((Split-Path $prof -Qualifier) -ieq ('{0}:' -f $Letter)){
-                    if(Test-Path -LiteralPath $prof){ [void]$resolved.Add($prof) }
-                }
-            }
-            if($resolved.Count -gt 0){ $initial = @($resolved); $scope = 'scoped' }
-        }
-    }
-    else { $initial = @($root) }
-
-    if(@($initial).Count -eq 0){
+    if($initial.Count -eq 0){
         Write-Warning ("No ScanRoots folders found on drive {0}:. Use -FullDrive to scan the whole drive, or edit ScanRoots in SysOrg.config.psd1." -f $Letter)
-        return @()   # streams nothing; callers collect with @() and get an empty array
+        return @()
     }
     Write-Host ("Scan scope ({0}): {1}" -f $scope, ($initial -join '; '))
 
@@ -313,78 +401,369 @@ function Test-SysOrgInOrganizedDir {
     return $false
 }
 
-function Get-SysOrgProjectClusters {
+# ---------------------------------------------------------------------------
+# W5: type-first name families. Records are partitioned by context leaf (main type
+# root, or Downloads\<Source>\<Sub>); clustering happens ONLY within a partition.
+# Cross-type signatures get the SAME family name in each type root - nothing crosses
+# the type boundary (Families.WithinTypeOnly=$true, the point of revision 2.1).
+# ---------------------------------------------------------------------------
+function Get-SysOrgFamilySignature {
 <#
 .SYNOPSIS
-    Conservative relationship detection returning { Lookup, Clusters }.
+    Normalizes a file stem into a family signature (rev 2.0 normalization rules).
 .DESCRIPTION
-    1) same filename stem across >= 2 file types (e.g. Report.docx + Report.pdf)
-    2) shared distinctive name tokens (stopwords/numbers filtered).
-    P2-6: the token signature is order-independent (tokens are sorted and
-    de-duplicated before the first three are taken), so 'Report Q3 2025 Final'
-    and 'Final Q3 Report 2025' cluster together. Cluster keys fall back to
-    'cluster' when a stem produces an empty ASCII slug (non-ASCII names).
+    Strips ' (n)' copy counters, copy markers, optional vN version suffixes and noise
+    tokens; dates are kept or stripped per Families.KeepDates. The token signature is
+    order-independent (P2-6 sort fix).
 .EXAMPLE
-    $c = Get-SysOrgProjectClusters -Inventory $inv -Config $cfg; $c.Lookup['C:\x\Report.pdf']
+    Get-SysOrgFamilySignature -Stem 'Report final v2' -NoiseTokens @('final') -StripVersionSuffix:$true -KeepDates:$true   # -> 'report'
+#>
+    param([Parameter(Mandatory)][string]$Stem,[string[]]$NoiseTokens,[bool]$StripVersionSuffix,[bool]$KeepDates)
+    $s = $Stem.ToLowerInvariant()
+    $s = [regex]::Replace($s, '\(\d+\)', ' ')
+    $s = [regex]::Replace($s, '\s*[-_]\s*cop(y|ies)(\s*\(\d+\))?\s*', ' ')
+    if($StripVersionSuffix){
+        $s = [regex]::Replace($s, '\s*v\d+(\.\d+)*\s*$', ' ')
+    }
+    $tokens = @(($s -split '[^a-z0-9]+') | Where-Object { $_ -and ("$_" -ne '') })
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach($t in $tokens){
+        if($NoiseTokens -contains $t){ continue }
+        if($StripVersionSuffix -and ($t -match '^v\d+(\.\d+)*$')){ continue }
+        [void]$out.Add($t)
+    }
+    if(-not $KeepDates){
+        $hadYear = $false
+        foreach($t in $out){ if($t -match '^(19|20)\d{2}$'){ $hadYear = $true; break } }
+        if($hadYear){
+            $filtered = New-Object System.Collections.Generic.List[string]
+            foreach($t in $out){
+                if($t -match '^(19|20)\d{2}$'){ continue }
+                if($t -match '^\d{1,2}$'){ continue }
+                [void]$filtered.Add($t)
+            }
+            $out = $filtered
+        }
+    }
+    $sig = (@($out.ToArray()) | Sort-Object -Unique) -join '+'
+    return $sig
+}
+
+function Get-SysOrgNameFamilies {
+<#
+.SYNOPSIS
+    Type-first family partition over routed inventory records (W5).
+.DESCRIPTION
+    Partition records by context leaf (via $PartitionLookup), normalize stems, and group:
+      1) same signature with >= Families.MinFiles members in one partition -> family;
+      2) a signature spanning >= 2 type roots qualifies EVERY partition holding it,
+         so holiday.jpg and holiday.mp4 produce Pictures\holiday\ AND Videos\holiday\
+         with the SAME family name - never one mixed folder.
+    Family folder name = most frequent original stem (sanitized, truncated).
+    Families.CrossTypeLink='Dominant' (opt-in) additionally links leftovers that share a
+    family signature; with Families.WithinTypeOnly=$false they may cross the type boundary.
+.EXAMPLE
+    $fam = Get-SysOrgNameFamilies -Inventory $inv -PartitionLookup $pk -Config $cfg
+    $fam.Lookup['C:\x\holiday.jpg'].Name   # -> 'holiday'
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()]$Inventory,$PartitionLookup,$Config)
+    $lookup = @{}
+    $families = New-Object System.Collections.Generic.List[object]
+    $inv = @($Inventory)
+    if(-not (Get-SysOrgSetting $Config 'Families.Enabled' $true)){ return [pscustomobject]@{ Lookup=$lookup; Families=$families.ToArray() } }
+    if($inv.Count -eq 0){ return [pscustomobject]@{ Lookup=$lookup; Families=$families.ToArray() } }
+
+    $noise    = @(Get-SysOrgSetting $Config 'Families.NoiseTokens' @())
+    $stripVer = [bool](Get-SysOrgSetting $Config 'Families.StripVersionSuffix' $true)
+    $keepDates = [bool](Get-SysOrgSetting $Config 'Families.KeepDates' $true)
+    $minFiles = [int](Get-SysOrgSetting $Config 'Families.MinFiles' 2)
+    $withinType = [bool](Get-SysOrgSetting $Config 'Families.WithinTypeOnly' $true)
+    $crossLink = "$(Get-SysOrgSetting $Config 'Families.CrossTypeLink' 'SameName')"
+    $maxLen   = [int](Get-SysOrgSetting $Config 'Families.MaxNameLength' 60)
+
+    # signature -> partition -> records
+    $bySig = @{}
+    foreach($f in $inv){
+        $pk = ''
+        if($PartitionLookup -and $PartitionLookup.ContainsKey($f.FullName)){ $pk = [string]$PartitionLookup[$f.FullName] }
+        if(-not $pk){ $pk = [string]$f.Category }
+        $sig = Get-SysOrgFamilySignature -Stem ([string]$f.Stem) -NoiseTokens $noise -StripVersionSuffix:$stripVer -KeepDates:$keepDates
+        if([string]::IsNullOrEmpty($sig)){ continue }
+        if(-not $bySig.ContainsKey($sig)){ $bySig[$sig] = @{} }
+        if(-not $bySig[$sig].ContainsKey($pk)){ $bySig[$sig][$pk] = New-Object System.Collections.Generic.List[object] }
+        [void]$bySig[$sig][$pk].Add($f)
+    }
+
+    foreach($sig in $bySig.Keys){
+        $partMap = $bySig[$sig]
+        $partKeys = @($partMap.Keys)
+        $roots = New-Object System.Collections.Generic.HashSet[string]
+        foreach($pk in $partKeys){ [void]$roots.Add(("$pk".Split('\')[0]).ToLowerInvariant()) }
+        $crossType = ($roots.Count -ge 2)
+        foreach($pk in $partKeys){
+            $members = @($partMap[$pk])
+            $isFamily = ($members.Count -ge $minFiles)
+            $basis = 'Same normalized name within the type root'
+            if((-not $isFamily) -and $crossType){
+                $isFamily = $true
+                $basis = 'Same name across types (same family name in each type root)'
+            }
+            if(-not $isFamily){ continue }
+            $famName = Get-SysOrgFamilyFolderName -Members $members -MaxNameLength $maxLen
+            foreach($m in $members){ $lookup[$m.FullName] = @{ Name=$famName; Partition=[string]$pk } }
+            [void]$families.Add([pscustomobject]@{
+                Name=$famName; Partition=[string]$pk; Members=$members.Count
+                MemberPaths=@($members | ForEach-Object { "$($_.FullName)" })
+                Signature=$sig; Basis=$basis
+            })
+        }
+    }
+
+    if($crossLink -eq 'Dominant'){
+        foreach($sig in $bySig.Keys){
+            $partMap = $bySig[$sig]
+            $domPk = $null; $domCount = -1
+            $pks = Sort-SysOrgNatural -Values @($partMap.Keys)
+            foreach($pk in $pks){ if($partMap[$pk].Count -gt $domCount){ $domCount = $partMap[$pk].Count; $domPk = $pk } }
+            if($domCount -lt $minFiles){ continue }
+            $domMembers = @($partMap[$domPk])
+            $famName = Get-SysOrgFamilyFolderName -Members $domMembers -MaxNameLength $maxLen
+            foreach($pk in @($partMap.Keys)){
+                if($pk -eq $domPk){ continue }
+                $targetPk = [string]$pk
+                if(-not $withinType){ $targetPk = [string]$domPk }   # opt-in: cross the type boundary
+                foreach($m in @($partMap[$pk])){
+                    if($lookup.ContainsKey($m.FullName)){ continue }
+                    $lookup[$m.FullName] = @{ Name=$famName; Partition=$targetPk }
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{ Lookup=$lookup; Families=$families.ToArray() }
+}
+
+function Get-SysOrgFamilyFolderName {
+<#
+.SYNOPSIS
+    Family folder name: most frequent original stem among members, sanitized.
+.DESCRIPTION
+    Ties break by natural name order (deterministic across runs, W7).
+.EXAMPLE
+    Get-SysOrgFamilyFolderName -Members $records -MaxNameLength 60   # -> 'Report'
+#>
+    param([Parameter(Mandatory)]$Members,[int]$MaxNameLength=60)
+    $stemCounts = @{}
+    foreach($m in @($Members)){
+        $k2 = ([string]$m.Stem).ToLowerInvariant()
+        if(-not $stemCounts.ContainsKey($k2)){ $stemCounts[$k2] = 0 }
+        $stemCounts[$k2]++
+    }
+    $best = $null; $bestCount = -1
+    $ordered = Sort-SysOrgNatural -Values @($stemCounts.Keys)
+    foreach($st in $ordered){
+        if($stemCounts[$st] -gt $bestCount){ $bestCount = $stemCounts[$st]; $best = $st }
+    }
+    if(-not $best){ $best = 'Family' }
+    return (Get-SysOrgSafeFolderName -Name $best -MaxLength $MaxNameLength)
+}
+
+function Get-SysOrgProjectFolders {
+<#
+.SYNOPSIS
+    Detects code project FOLDERS by their marker files (.git, package.json, *.sln, ...).
+.DESCRIPTION
+    Project folders move as ONE MoveFolder unit (rev 2.0 D4): `Documents\Projects\Code\<Name>`,
+    .git intact. Detection walks the scan roots to depth 4, never descends into a found
+    project, and never treats known folders, the app root, the user profile or destination
+    roots as projects. Generic names ('src', 'new folder', ...) get a deterministic suffix
+    so distinct generic folders cannot collide at the destination.
+.EXAMPLE
+    $projects = Get-SysOrgProjectFolders -Roots @('C:\Users\t\Documents') -Config $cfg -DriveProfile $prof
+#>
+    [CmdletBinding()]
+    param([string[]]$Roots,$Config,$DriveProfile,[object[]]$KnownFolders)
+    $result = New-Object System.Collections.Generic.List[object]
+    if(-not (Get-SysOrgSetting $Config 'Projects.Enabled' $true)){ return $result.ToArray() }
+    if(-not $Roots -or @($Roots).Count -eq 0){ return $result.ToArray() }
+
+    $markers = @(Get-SysOrgSetting $Config 'Projects.Markers' @())
+    if($markers.Count -eq 0){
+        $markers = @('.git','.svn','.hg','.jj','.gitignore','package.json','package-lock.json','yarn.lock',
+                     'pnpm-lock.yaml','Cargo.toml','go.mod','go.sum','pyproject.toml','setup.py','composer.json',
+                     'Gemfile','pom.xml','build.gradle','build.gradle.kts','Makefile','CMakeLists.txt',
+                     '*.sln','*.csproj','*.vcxproj','*.fsproj')
+    }
+    $generic = @(@(Get-SysOrgSetting $Config 'Projects.GenericNames' @()) | ForEach-Object { "$_".ToLowerInvariant() })
+    $maxDepth = 4
+    $maxCount = 200
+
+    $guard = New-Object System.Collections.Generic.HashSet[string]
+    $appRoot = Get-SysOrgSetting $Config 'AppRoot' $null
+    if($appRoot){ [void]$guard.Add(("$appRoot").TrimEnd('\').ToLowerInvariant()) }
+    if($env:USERPROFILE){ [void]$guard.Add(($env:USERPROFILE).TrimEnd('\').ToLowerInvariant()) }
+    if($DriveProfile){
+        $dr = Get-SysOrgDestinationRoot -Letter "$($DriveProfile.Letter)" -Config $Config
+        [void]$guard.Add($dr.ToLowerInvariant())
+    }
+    foreach($k in @($KnownFolders)){ if($k.Path){ [void]$guard.Add(("$($k.Path)").TrimEnd('\').ToLowerInvariant()) } }
+
+    $stack = New-Object System.Collections.Stack
+    foreach($r in @($Roots)){ if(Test-Path -LiteralPath $r){ [void]$stack.Push(@{ Path=[string]$r; Depth=0 }) } }
+
+    while($stack.Count -gt 0){
+        $item = $stack.Pop()
+        $dir = [string]$item.Path; $depth = [int]$item.Depth
+        $lc = $dir.TrimEnd('\').ToLowerInvariant()
+        if($guard.Contains($lc)){ continue }
+        if(Test-Path -LiteralPath (Join-Path $dir '.sysorg-ignore')){ continue }
+        if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
+        if((Get-SysOrgSetting $Config 'ExcludeDestinations' $true) -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
+        try{
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ continue }
+            if((Get-SysOrgSetting $Config 'FolderAudit.SkipHiddenSystemDirs' $true) -and
+               ((($di.Attributes -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden) -or
+                (($di.Attributes -band [System.IO.FileAttributes]::System) -eq [System.IO.FileAttributes]::System))){ continue }
+        } catch { continue }
+
+        $entries = @()
+        try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir) | ForEach-Object { Split-Path $_ -Leaf }) } catch { $entries = @() }
+        $isProject = $false
+        if($entries.Count -gt 0){
+            foreach($m in $markers){
+                if([string]::IsNullOrWhiteSpace("$m")){ continue }
+                if("$m".Contains('*') -or "$m".Contains('?')){
+                    foreach($e in $entries){ if($e -like "$m"){ $isProject = $true; break } }
+                } elseif($entries -contains "$m"){ $isProject = $true }
+                if($isProject){ break }
+            }
+        }
+        if($isProject){
+            $name = Split-Path $dir -Leaf
+            $safe = Get-SysOrgSafeFolderName -Name $name -MaxLength 60
+            if($generic -contains $name.ToLowerInvariant()){
+                $sha = [System.Security.Cryptography.SHA256]::Create()
+                try{
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($lc)
+                    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+                    $safe = ('{0} ({1})' -f $safe, $hash.Substring(0,8))
+                } finally { $sha.Dispose() }
+            }
+            [void]$result.Add([pscustomobject]@{ Path=$dir; Name=$name; SafeName=$safe })
+            if($result.Count -ge $maxCount){ break }
+            continue   # do not descend: nested projects belong to the outer project
+        }
+        if($depth -lt $maxDepth){
+            try{
+                foreach($k in @([System.IO.Directory]::GetDirectories($dir))){ [void]$stack.Push(@{ Path=[string]$k; Depth=($depth+1) }) }
+            } catch { Write-Verbose "Project scan could not list '$dir': $($_.Exception.Message)" }
+        }
+    }
+    return $result.ToArray()
+}
+
+function Get-SysOrgMultipartSets {
+<#
+.SYNOPSIS
+    Groups multipart archives into single move units (rev 2.0 D5).
+.DESCRIPTION
+    Recognizes name.zip.001/002..., name.7z.001..., name.part1.rar/name.part2.rar and
+    name.rar + name.r00/r01 sets. Returns @{ Map; Sets } where Map routes every member
+    path to its set key and Sets carries the natural-ordered members with the leader.
+    Multipart members are exempt from copy numbering and quarantine.
+.EXAMPLE
+    $mp = Get-SysOrgMultipartSets -Inventory $inv -Config $cfg
+    $mp.Map['C:\dl\Trip.zip.001']   # -> 'set-trip-zip'
 #>
     param($Inventory,$Config)
-    $lookup = @{}
-    $clusters = New-Object System.Collections.Generic.List[object]
-    if(-not (Get-SysOrgSetting $Config 'ProjectDetection.Enabled' $true)){
-        return [pscustomobject]@{ Lookup=$lookup; Clusters=$clusters.ToArray() }
+    $map = @{}
+    $sets = New-Object System.Collections.Generic.List[object]
+    if(-not (Get-SysOrgSetting $Config 'Archives.KeepMultipartTogether' $true)){
+        return [pscustomobject]@{ Map=$map; Sets=$sets.ToArray() }
     }
-    $minFiles    = Get-SysOrgSetting $Config 'ProjectDetection.MinFiles' 3
-    $maxProjects = Get-SysOrgSetting $Config 'ProjectDetection.MaxProjects' 200
-    $stop = @('copy','copies','final','new','old','backup','bak','untitled','scan','img','image','photo','video','audio','temp','tmp','draft','export','download','downloads','doc','document','file','output','out','test','sample','misc','edit','edited','version','the','and','for')
-
-    $assigned = New-Object System.Collections.Generic.HashSet[string]
-    $projectIndex = 0
-
-    # 1) same stem, multiple extensions
-    $byStem = @{}
-    foreach($f in $Inventory){
-        $stem = $f.Stem.ToLowerInvariant()
-        if($stem.Length -lt 3){ continue }
-        if(-not $byStem.ContainsKey($stem)){ $byStem[$stem] = New-Object System.Collections.Generic.List[object] }
-        [void]$byStem[$stem].Add($f)
-    }
-    foreach($kv in $byStem.GetEnumerator()){
-        $files = @($kv.Value | Where-Object { -not $assigned.Contains($_.FullName) })
-        $exts  = @($files | ForEach-Object { $_.Extension } | Sort-Object -Unique)
-        if(($files.Count -ge $minFiles) -and ($exts.Count -ge 2)){
-            $projectIndex++
-            if($projectIndex -gt $maxProjects){ break }
-            $slug = ($kv.Key -replace '[^a-z0-9]+','-').Trim('-')
-            if([string]::IsNullOrWhiteSpace($slug)){ $slug = 'cluster' }
-            $key = 'Project-{0:00}-{1}' -f $projectIndex, $slug
-            foreach($f in $files){ $lookup[$f.FullName] = $key; [void]$assigned.Add($f.FullName) }
-            $clusters.Add([pscustomobject]@{ Key=$key; FileCount=$files.Count; Basis='Same filename stem across file types'; Sample=$files[0].Name })
+    $byKey = @{}
+    foreach($f in @($Inventory)){
+        $name = "$($f.Name)"
+        $key = $null
+        if($name -imatch '^(?<base>.+)\.part(?<num>\d+)\.(rar|rev)$'){ $key = $Matches.base.ToLowerInvariant() }
+        elseif($name -imatch '^(?<base>.+)\.(?<ext2>zip|7z)\.(?<num>\d{3})$'){ $key = ($Matches.base + '.' + $Matches.ext2).ToLowerInvariant() }
+        elseif($name -imatch '^(?<base>.+)\.r(?<num>\d{2})$'){ $key = $Matches.base.ToLowerInvariant() }
+        elseif($name -imatch '^(?<base>.+)\.rar$'){ $key = $Matches.base.ToLowerInvariant() }
+        if($key){
+            if(-not $byKey.ContainsKey($key)){ $byKey[$key] = New-Object System.Collections.Generic.List[object] }
+            [void]$byKey[$key].Add($f)
         }
     }
+    foreach($k in $byKey.Keys){
+        $members = @($byKey[$k])
+        if($members.Count -lt 2){ continue }
+        $ordered = Sort-SysOrgNatural -Values @($members | ForEach-Object { "$($_.FullName)" })
+        $leaderPath = $ordered[0]
+        $setKey = 'set-' + ($k -replace '[^a-z0-9]+','-')
+        foreach($m in $members){ $map["$($m.FullName)"] = $setKey }
+        [void]$sets.Add([pscustomobject]@{ Key=$setKey; Base=$k; Leader=$leaderPath; Members=$members })
+    }
+    return [pscustomobject]@{ Map=$map; Sets=$sets.ToArray() }
+}
 
-    # 2) shared distinctive tokens (P2-6: order-independent signature)
-    $byTokens = @{}
-    foreach($f in $Inventory){
-        if($assigned.Contains($f.FullName)){ continue }
-        $tokens = @(($f.Stem.ToLowerInvariant() -split '[^a-z0-9]+') | Where-Object { $_.Length -ge 4 -and ($stop -notcontains $_) -and ($_ -notmatch '^\d+$') })
-        if($tokens.Count -lt 2){ continue }
-        $sig = (@($tokens | Sort-Object -Unique | Select-Object -First 3)) -join '+'
-        if(-not $byTokens.ContainsKey($sig)){ $byTokens[$sig] = New-Object System.Collections.Generic.List[object] }
-        [void]$byTokens[$sig].Add($f)
+function Get-SysOrgSourceBucket {
+<#
+.SYNOPSIS
+    Maps download provenance to a source bucket name (Downloads branch).
+.DESCRIPTION
+    Resolution order: Zone.Identifier HostUrl, then ReferrerUrl (exact host map, then the
+    registrable domain), then filename heuristics (WhatsApp, Telegram, Signal, Screenshots).
+    Returns $null when nothing matches - the caller routes to Downloads\_NoSource.
+.EXAMPLE
+    Get-SysOrgSourceBucket -HostUrl 'https://github.com/x/y/releases/download/1/f.zip'   # -> 'GitHub'
+#>
+    [CmdletBinding()]
+    param([string]$HostUrl,[string]$ReferrerUrl,[string]$FileName)
+    $hostMap = @{
+        'github.com'='GitHub'; 'raw.githubusercontent.com'='GitHub'; 'objects.githubusercontent.com'='GitHub'
+        'codeload.github.com'='GitHub'; 'gist.github.com'='GitHub'
+        'whatsapp.com'='WhatsApp'; 'web.whatsapp.com'='WhatsApp'; 'cdn.whatsapp.net'='WhatsApp'
+        'telegram.org'='Telegram'; 't.me'='Telegram'; 'cdn-telegram.org'='Telegram'
+        'signal.org'='Signal'; 'updates.signal.org'='Signal'
+        'discord.com'='Discord'; 'discordapp.com'='Discord'; 'cdn.discordapp.com'='Discord'
+        'dropbox.com'='Dropbox'; 'dl.dropboxusercontent.com'='Dropbox'
+        'drive.google.com'='GoogleDrive'; 'docs.google.com'='GoogleDrive'
+        'onedrive.live.com'='OneDrive'; '1drv.ms'='OneDrive'
+        'live.com'='Microsoft'; 'sharepoint.com'='Microsoft'; 'office.com'='Microsoft'; 'microsoft.com'='Microsoft'
+        'slack.com'='Slack'; 'files.slack.com'='Slack'
+        'reddit.com'='Reddit'; 'i.redd.it'='Reddit'
+        'steamcontent.com'='Steam'; 'steampowered.com'='Steam'
+        'zoom.us'='Zoom'; 'archive.org'='InternetArchive'
     }
-    foreach($kv in $byTokens.GetEnumerator()){
-        $files = @($kv.Value | Where-Object { -not $assigned.Contains($_.FullName) })
-        if($files.Count -ge $minFiles){
-            $projectIndex++
-            if($projectIndex -gt $maxProjects){ break }
-            $slug = ($kv.Key -replace '[^a-z0-9]+','-').Trim('-')
-            if([string]::IsNullOrWhiteSpace($slug)){ $slug = 'cluster' }
-            $key = 'Project-{0:00}-{1}' -f $projectIndex, $slug
-            foreach($f in $files){ $lookup[$f.FullName] = $key; [void]$assigned.Add($f.FullName) }
-            $clusters.Add([pscustomobject]@{ Key=$key; FileCount=$files.Count; Basis='Shared distinctive name tokens'; Sample=$files[0].Name })
-        }
+    $u = $null
+    foreach($c in @($HostUrl,$ReferrerUrl)){ if("$c"){ $u = "$c"; break } }
+    if($u){
+        try{
+            if($u -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://'){ $u = 'https://' + $u }
+            $uri = [uri]$u
+            $h = $uri.Host.ToLowerInvariant()
+            if($hostMap.ContainsKey($h)){ return $hostMap[$h] }
+            foreach($pfx in @('cdn.','dl.','download.','downloads.','www.','data.','assets.','static.','media.')){
+                if($h.StartsWith($pfx)){ $h = $h.Substring($pfx.Length); break }
+            }
+            $parts = $h.Split('.')
+            $name = $null
+            if($parts.Count -ge 2){ $name = $parts[$parts.Count - 2] } else { $name = $parts[0] }
+            if($name -and ("$name" -ne '')){
+                $ti = (Get-Culture).TextInfo
+                return $ti.ToTitleCase("$name")
+            }
+        } catch { Write-Verbose "Source bucket parse failed for '$u': $($_.Exception.Message)" }
     }
-    return [pscustomobject]@{ Lookup=$lookup; Clusters=$clusters.ToArray() }
+    if($FileName){
+        if("$FileName" -imatch '^whatsapp'){ return 'WhatsApp' }
+        if("$FileName" -imatch 'wa\d{4}'){ return 'WhatsApp' }
+        if("$FileName" -imatch '^telegram'){ return 'Telegram' }
+        if("$FileName" -imatch '^signal-'){ return 'Signal' }
+        if("$FileName" -imatch '^screenshot'){ return 'Screenshots' }
+    }
+    return $null
 }
 
 function Find-SysOrgDuplicates {
@@ -392,18 +771,18 @@ function Find-SysOrgDuplicates {
 .SYNOPSIS
     Exact duplicate detection: group by size -> 64 KB header hash -> full SHA256.
 .DESCRIPTION
-    Keeper = outside temp-like folders, shortest path, oldest write time.
-    WastedBytes reports the reclaimable size per group (P0-2 acceptance).
-    Only hashes candidate files; cloud placeholders never reach this stage.
+    Rev 2.1 keeper rule (W6): the keeper is the OLDEST LastWriteTime, then natural name
+    order - the original is the one the user created first. WastedBytes reports the
+    reclaimable size per group. Only hashes candidate files; cloud placeholders never
+    reach this stage.
 .EXAMPLE
     $dups = Find-SysOrgDuplicates -Inventory $inv -Config $cfg
 #>
     param($Inventory,$Config)
     $groups = New-Object System.Collections.Generic.List[object]
-    $minKB    = Get-SysOrgSetting $Config 'Duplicates.MinFileSizeKB' 256
-    $headerKB = Get-SysOrgSetting $Config 'Duplicates.HeaderHashKB' 64
+    $minKB    = Get-SysOrgSetting $Config 'Copies.MinFileSizeKB' 256
+    $headerKB = Get-SysOrgSetting $Config 'Copies.HeaderHashKB' 64
     $minBytes = [int64]$minKB * 1KB
-    $tempLike = @('\downloads\','\desktop\','\temp\','\tmp\')
 
     $sizeCandidates = @($Inventory | Where-Object { $_.Category -ne 'SkippedLongPath' -and $_.Length -ge $minBytes } | Group-Object -Property Length | Where-Object { $_.Count -gt 1 })
     $total = $sizeCandidates.Count; $done = 0
@@ -435,17 +814,20 @@ function Find-SysOrgDuplicates {
             foreach($fh in $fullMap.Keys){
                 $dupes = $fullMap[$fh]
                 if($dupes.Count -lt 2){ continue }
-                $sorted = @($dupes | Sort-Object -Property `
-                    @{e={ $n=$_.FullName.ToLowerInvariant(); $inTemp=$false; foreach($t in $tempLike){ if($n.Contains($t)){ $inTemp=$true; break } }; if($inTemp){1}else{0} }},
-                    @{e={$_.FullName.Length}},
-                    @{e={$_.LastWriteTime}})
-                $keep   = $sorted[0]
-                $others = @($sorted | Select-Object -Skip 1)
-                $wasted = [int64](($others | Measure-Object -Property Length -Sum).Sum)
+                # W6: keeper = oldest LastWriteTime, then natural name order (W7 key)
+                $withKeys = @()
+                foreach($d in $dupes){
+                    $withKeys += [pscustomobject]@{ Rec=$d; Key=(Get-SysOrgNaturalKey -Name "$($d.FullName)") }
+                }
+                $sorted = @($withKeys | Sort-Object -Property @{e={$_.Rec.LastWriteTime.Ticks}}, @{e={$_.Key}})
+                $keep   = $sorted[0].Rec
+                $others = @($sorted | Select-Object -Skip 1 | ForEach-Object { $_.Rec })
+                $wasted = [int64]0
+                if($others.Count -gt 0){ $wasted = [int64]($others | Measure-Object -Property Length -Sum).Sum }
                 $groups.Add([pscustomobject]@{
-                    Hash=$fh; KeepPath=$keep.FullName
-                    KeepReason='Outside temp-like folders, shortest path, oldest first'
-                    Duplicates=@($others | ForEach-Object { $_.FullName })
+                    Hash=$fh; KeepPath=$keep.FullName; KeepName=$keep.Name
+                    KeepReason='Oldest LastWriteTime, then natural name order (the original the user created first)'
+                    Duplicates=@($others | ForEach-Object { "$($_.FullName)" })
                     WastedBytes=$wasted
                 })
             }

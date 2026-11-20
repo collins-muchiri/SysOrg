@@ -2,6 +2,76 @@
 
 All notable changes to SysOrg. Versions follow [SemVer](https://semver.org/).
 
+## [2.1.0] - 2026-11-20 - Windows-native, type-first, numbered copies
+
+Revision 2.1 (milestone M4, work items W1-W12) - see `ORGANIZATION-DESIGN.md`.
+
+### Added
+- **Drive hierarchy profiler (W1):** `Get-SysOrgDriveProfile` + `-ProfileDrives` and menu option 1
+  produce one profile per volume - role (System / Removable / Data), detection evidence, protected
+  artifacts found at the root, resolved known folders (with redirection and OneDrive flags),
+  download roots, top-level tree and the proposed writable scope. **No plan is built without a profile.**
+- **Known-folder resolver (W2):** real known-folder locations are resolved from the registry
+  (`User Shell Folders`, legacy names + GUIDs). A redirected Pictures folder on D is scoped on D;
+  OneDrive-backed folders carry the sync-out warning. Localized category recognition preserves
+  intact structures (a German `Bilder` folder is recognized as Pictures-like and left alone).
+- **Mutability engine (W3):** `Test-SysOrgFileMutable` gates every record before it can appear in a
+  plan. The writable scope on C is the resolved known folders plus configurable
+  `Policy.SystemDrive.WritablePaths` (or `-WritablePath` on the CLI); `FullDrive` is rejected for the
+  system drive at config validation. Blocked extensions (`.dll .sys .drv .ocx .cpl .scr` + `.lnk .url`
+  on C) with the installer-in-download-roots exception. Denials are recorded per file with reasons
+  and summarized in the preview, so "untouched" is provable.
+- **PerceivedType fallback (W4):** unmapped extensions route by the Windows `PerceivedType` registry
+  value (`image` -> Pictures, `video` -> Videos, `system` -> never moved); config `TypeMap` overrides win.
+- **Windows naming preset (W4):** main folders are now `Documents, Pictures, Videos, Music, Downloads`;
+  `Archives`, `Code`, `Other` live under Documents and `Installers` routes to the Downloads branch.
+  `NamingPreset='Compact4'` restores the rev 2.0 naming (Documents, Photo, Video, Downloads).
+- **Type-first name families (W5):** related files share one named family folder WITHIN their type
+  root; related files across types get the SAME family name in each root (`holiday.jpg` ->
+  `Pictures\holiday\`, `holiday.mp4` -> `Videos\holiday\`, linked by the plan audit field `Family`).
+  Nothing crosses the type boundary (`Families.WithinTypeOnly=$true`); `CrossTypeLink='Dominant'`
+  restores rev 2.0 behavior as an opt-in.
+- **Numbered copies (W6):** `Copies.Policy='NumberCopies'` is the new default. Exact copies are
+  kept and numbered beside the original (`Report.docx`, `Report (2).docx`, `Report (3).docx`);
+  the keeper is the OLDEST LastWriteTime, then natural name order. Nothing is quarantined or
+  deleted. `Quarantine` remains opt-in; `ReportOnly` lists copies without moving anything.
+  Undo restores every original name and path.
+- **Natural sort (W7):** preview trees, family ordering and copy numbering use Explorer ordering
+  (`StrCmpLogicalW`, with a portable fallback) - `file (2)` before `file (10)`.
+- **OneDrive sync-out warning + double confirmation (W8):** moves out of a OneDrive root are listed
+  and COUNTED IN THE CONFIRMATION PROMPT; `DestinationStyle='KnownFolders'` requires a second
+  explicit confirmation (`yes`).
+- **Per-drive artifact auto-protection (W9):** `WindowsApps`, `XboxGames`, `Boot`, `MSOCache`,
+  `PerfLogs` are protected at the root of EVERY drive, extending P1-7.
+- **Migration (W12):** `-Migrate` (CLI and menu option 7) builds a previewable, journal-backed plan
+  that maps old v1.x / rev 2.0 trees (Photo/Images -> Pictures, Video -> Videos, Audio and
+  Video\Audio -> Music, ...); `_Duplicates` and `_Reports` folders are left untouched.
+- **Code project folders:** marker-bearing folders (`.git`, `package.json`, `*.sln`, ...) move whole
+  as one MoveFolder unit to `Documents\Projects\Code\<Name>` - `.git` intact.
+- **Multipart archives:** `name.zip.001/002`, `name.part1.rar/.r00` sets move as one unit; members
+  are exempt from numbering and quarantine.
+- **Preview renderer:** two-level destination tree (natural-sorted, counts + bytes per node),
+  mutability summary grouped by denial reason, families/copies table, OneDrive warnings.
+- **Zone.Identifier reattachment** after verified cross-volume copies (rev 2.0 D7) and download
+  provenance: full URLs are stored ONLY in the local `Plans\<PlanId>-provenance.csv` sidecar.
+- **Folder safe-move primitive** with copy -> count/byte verify -> remove semantics and the same
+  never-overwrite guarantees as files.
+
+### Changed
+- **Config v2.1 (W10):** `Duplicates` -> `Copies` and `Categories` -> `TypeMap` are mapped on load
+  with deprecation warnings, so v1.x/2.0 configs keep working (old `Policy='Quarantine'` is
+  preserved). `Test-SysOrgConfig` now validates NamingPreset, DestinationStyle, Copies.Policy,
+  SuffixStyle, Downloads.GroupBy, Families.MinFiles >= 2, Copies.StartIndex >= 2, the mutability
+  Scope values and MainFolders-vs-preset.
+- Scan roots now include the known folders resolved for the scanned drive (P1-6 + W2).
+- The undo journal gained a `Kind` column (File/Folder); folder rows undo with the folder primitive.
+- File-level "project clusters" were REPLACED by name families; the `ProjectDetection` config key
+  maps to `Projects.Enabled`.
+
+### CI note
+The parse gate, PSScriptAnalyzer and the Pester suite (now including `Tests/SysOrg.Rev21.Tests.ps1`
+covering the section-14 fixtures) run on every push.
+
 ## [1.2.0] - 2026-11-19
 
 Safety, data-integrity and robustness release (improvement plan P0..P3).
