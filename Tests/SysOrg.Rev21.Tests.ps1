@@ -47,7 +47,9 @@ BeforeAll {
         Move=@{ AllowCrossVolume=$true }
         MaxPlanActions=5000
         FolderAudit=@{ Enabled=$false }
-        AppRoot=$TestDrive
+        # NOTE: no AppRoot here - setting AppRoot to the TestDrive would put every
+        # fixture file inside the protected app-root exclusion on Windows, so plans
+        # would come back empty. The executor calls pass -AppRoot explicitly.
     }
 
     function New-SysOrgTestRecord {
