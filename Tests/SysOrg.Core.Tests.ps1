@@ -178,10 +178,10 @@ Describe 'Test-SysOrgFileMutable (W3)' {
     It '.exe inside Downloads is allowed (installer exception)' {
         (Test-SysOrgFileMutable -Path 'C:\Users\t\Downloads\setup.exe' -Extension '.exe' -DriveProfile $sysProf -Config $mutCfg).Allowed | Should -BeTrue
     }
-    It '.exe inside Documents is denied (installer exception applies only in download roots)' {
+    It '.exe inside Documents is denied (installers are movable only inside download roots)' {
         $r = Test-SysOrgFileMutable -Path 'C:\Users\t\Documents\tool.exe' -Extension '.exe' -DriveProfile $sysProf -Config $mutCfg
         $r.Allowed | Should -BeFalse
-        $r.Reason  | Should -Be 'Blocked extension .exe'
+        $r.Reason  | Should -Be 'Installer outside download roots'
     }
     It 'a file outside the known folders is denied with the scope reason (W3 fixture)' {
         $r = Test-SysOrgFileMutable -Path 'C:\Loose\notes.txt' -Extension '.txt' -DriveProfile $sysProf -Config $mutCfg

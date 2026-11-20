@@ -53,8 +53,8 @@ function New-SysOrgPlan {
 #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Letter,
-          [Parameter(Mandatory)]$Inventory,
-          [Parameter(Mandatory)]$DriveProfile,
+          $Inventory,
+          $DriveProfile,
           $DupGroups,
           $Config,
           $KnownFolders,
@@ -62,6 +62,7 @@ function New-SysOrgPlan {
 
     if(-not $Config){ throw 'New-SysOrgPlan requires -Config.' }
     if(-not $DriveProfile){ throw 'No drive profile was provided. A plan cannot be built without one (run -ProfileDrives first).' }
+    if(-not $Inventory){ throw 'New-SysOrgPlan requires an inventory (run a scan first).' }
     if(-not $KnownFolders -or @($KnownFolders).Count -eq 0){ $KnownFolders = @(Get-SysOrgKnownFolders) }
     if(-not $ProjectFolders){ $ProjectFolders = @() }
 
@@ -85,21 +86,24 @@ function New-SysOrgPlan {
     $organizedSet = Get-SysOrgOrganizedDirSet -Inventory $Inventory -Config $Config
     $categoryNames = Get-SysOrgCategoryNames -KnownFolders $KnownFolders
     $kfPathSet = @{}
-    foreach($k in @($KnownFolders)){ if($k.Path){ $kfPathSet[("$($k.Path)").TrimEnd('\').ToLowerInvariant()] = $true } }
+    foreach($k in @($KnownFolders)){ if($k.Path){ $kfPathSet[(("$($k.Path)").Replace('/','\').TrimEnd('\')).ToLowerInvariant()] = $true } }
     $oneDriveRoot = $env:OneDrive
     if($oneDriveRoot){ $oneDriveRoot = $oneDriveRoot.TrimEnd('\') }
 
     # project-folder coverage: files under a detected project move as one unit
     $projectDirSet = @{}
-    foreach($pf in @($ProjectFolders)){ $projectDirSet[("$($pf.Path)").TrimEnd('\').ToLowerInvariant()] = $true }
+    foreach($pf in @($ProjectFolders)){ $projectDirSet[(("$($pf.Path)").Replace('/','\').TrimEnd('\')).ToLowerInvariant()] = $true }
 
     $multipart = Get-SysOrgMultipartSets -Inventory $Inventory -Config $Config
     $multipartMap = $multipart.Map
     $leaderSet = @{}
     foreach($s in @($multipart.Sets)){ $leaderSet["$($s.Leader)"] = $true }
 
+    # normalize the inventory once: @() breaks on List[object], arrays are always safe
+    $invArray = $Inventory
+    if($Inventory -is [System.Collections.Generic.List[object]]){ $invArray = $Inventory.ToArray() }
     $byPath = @{}
-    foreach($r in @($Inventory)){ $byPath["$($r.FullName)"] = $r }
+    foreach($r in @($invArray)){ $byPath["$($r.FullName)"] = $r }
 
     $dupGroupOf = @{}; $dupMemberSet = @{}; $keeperSet = @{}
     foreach($dg in @($DupGroups)){
@@ -126,7 +130,9 @@ function New-SysOrgPlan {
     }
     function Test-SysOrgPlanPreservedDir {
         param([string]$Directory)
-        $cur = $Directory.TrimEnd('\')
+        # Normalize separators both ways: pwsh on non-Windows hosts normalizes to '/',
+        # and the walk must terminate even when Split-Path stops shortening the value.
+        $cur = ("$Directory").Replace('/','\').TrimEnd('\')
         while($cur -and ($cur.Length -gt 3)){
             $lc = $cur.ToLowerInvariant()
             if($organizedSet.ContainsKey($lc)){ return 'Inside a folder that already looks organized (preserved)' }
@@ -134,7 +140,9 @@ function New-SysOrgPlan {
                 $catName = Test-SysOrgCategoryFolderName -Name $cur -CategoryNames $categoryNames
                 if($catName){ return ('Existing ' + $catName + ' folder (preserved, localized name recognized)') }
             }
-            $cur = Split-Path $cur -Parent
+            $next = Split-Path $cur -Parent
+            if(-not $next -or ("$next").Length -ge $cur.Length){ break }
+            $cur = "$next"
         }
         return $null
     }
@@ -161,7 +169,7 @@ function New-SysOrgPlan {
                 continue
             }
             # 2) code project folders move as one unit - their files are not planned individually
-            $cur = $parentDir.ToLowerInvariant()
+            $cur = $parentDir.Replace('/','\').ToLowerInvariant()
             $inProject = $false
             while($cur -and ($cur.Length -gt 3)){
                 if($projectDirSet.ContainsKey($cur)){ $inProject = $true; break }
@@ -189,10 +197,11 @@ function New-SysOrgPlan {
             # 4) context: download root or Zone.Identifier -> Downloads branch
             $category = "$($f.Category)"
             $inDownloads = $false
+            $srcNorm = $src.Replace('/','\')
             foreach($r in @($DriveProfile.DownloadRoots)){
                 if([string]::IsNullOrWhiteSpace("$r")){ continue }
-                $r2 = ("$r").TrimEnd('\')
-                if($src.StartsWith($r2 + '\',[StringComparison]::OrdinalIgnoreCase)){ $inDownloads = $true; break }
+                $r2 = (("$r").Replace('/','\')).TrimEnd('\')
+                if($srcNorm.StartsWith($r2 + '\',[StringComparison]::OrdinalIgnoreCase)){ $inDownloads = $true; break }
             }
             $prov = $null
             if($useZone -and ($inDownloads -or ($category -in @('Archives','Installers')))){
@@ -233,10 +242,11 @@ function New-SysOrgPlan {
     if($capped){ [void]$warnings.Add(("Plan capped at {0} actions; the remaining files were skipped this run." -f $maxActions)) }
 
     # 5) families within the context leaf (W5)
-    $fam = Get-SysOrgNameFamilies -Inventory @($routed) -PartitionLookup $partitionLookup -Config $Config
+    # @() cannot collect a generic List[object] (Argument types do not match) - use ToArray
+    $fam = Get-SysOrgNameFamilies -Inventory $routed.ToArray() -PartitionLookup $partitionLookup -Config $Config
 
     # process multipart leaders first so members can join the leader's destination folder
-    $ordered = @($routed | Sort-Object -Property @{e={ if($leaderSet.ContainsKey("$($_.FullName)")){ 0 } else { 1 } }})
+    $ordered = @($routed.ToArray() | Sort-Object -Property @{e={ if($leaderSet.ContainsKey("$($_.FullName)")){ 0 } else { 1 } }})
 
     $actionFolderBySrc = @{}
     $setDestFolder = @{}
@@ -297,8 +307,9 @@ function New-SysOrgPlan {
 
             $syncOut = $false; $intoCloud = $false
             if($oneDriveRoot){
-                $srcUnder = $src.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase) -or ($src -ieq $oneDriveRoot)
-                $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                $odNorm = (($oneDriveRoot.Replace('/','\')).TrimEnd('\'))
+                $srcUnder = (($src.Replace('/','\')).StartsWith($odNorm + '\',[StringComparison]::OrdinalIgnoreCase)) -or ($src -ieq $oneDriveRoot)
+                $dstUnder = (($dest.Replace('/','\')).StartsWith($odNorm + '\',[StringComparison]::OrdinalIgnoreCase))
                 if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add($src) }
                 if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
             }
@@ -340,8 +351,9 @@ function New-SysOrgPlan {
                     $dest = ($qDir + '\' + $qName)
                     $syncOut = $false; $intoCloud = $false
                     if($oneDriveRoot){
-                        $srcUnder = "$($m.FullName)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
-                        $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                        $odNormQ = (($oneDriveRoot.Replace('/','\')).TrimEnd('\'))
+                        $srcUnder = (("$($m.FullName)".Replace('/','\')).StartsWith($odNormQ + '\',[StringComparison]::OrdinalIgnoreCase))
+                        $dstUnder = ($dest.Replace('/','\')).StartsWith($odNormQ + '\',[StringComparison]::OrdinalIgnoreCase)
                         if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
                         if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
                     }
@@ -386,8 +398,9 @@ function New-SysOrgPlan {
                         if($fam.Lookup.ContainsKey($keeperPath)){ $keeperFam = [string]$fam.Lookup[$keeperPath].Name }
                         $syncOut = $false; $intoCloud = $false
                         if($oneDriveRoot){
-                            $srcUnder = "$($m.FullName)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
-                            $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
+                            $odNorm2 = (($oneDriveRoot.Replace('/','\')).TrimEnd('\'))
+                            $srcUnder = (("$($m.FullName)".Replace('/','\')).StartsWith($odNorm2 + '\',[StringComparison]::OrdinalIgnoreCase))
+                            $dstUnder = ($dest.Replace('/','\')).StartsWith($odNorm2 + '\',[StringComparison]::OrdinalIgnoreCase)
                             if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
                             if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
                         }
@@ -509,7 +522,7 @@ function New-SysOrgPlan {
         Warnings        = @($warnings.ToArray())
         Provenance      = @($provRows.ToArray())
         ProvenanceFile  = ''
-        Stats           = [pscustomobject]@{ Scanned=@($Inventory).Count; Routed=$routed.Count }
+        Stats           = [pscustomobject]@{ Scanned=@($invArray).Count; Routed=$routed.Count }
     }
 }
 

@@ -84,8 +84,14 @@ function Get-SysOrgCategory {
         return $v
     }
     if($script:ExtToCategory.ContainsKey($ext)){ return $script:CategoryToRoute[$script:ExtToCategory[$ext]] }
+    # PerceivedType fallback: Get-SysOrgPerceivedSub already maps raw registry values to
+    # routing categories; map again here so raw values (e.g. 'image' from a mock) resolve too.
     $pt = Get-SysOrgPerceivedSub -Extension $ext
-    if($pt){ return $pt }
+    if($pt){
+        if("$pt" -eq 'SKIP'){ return 'SKIP' }
+        if($script:RouteByPerceivedType.ContainsKey("$pt")){ return $script:RouteByPerceivedType["$pt"] }
+        return "$pt"
+    }
     return 'Other'
 }
 
@@ -393,10 +399,12 @@ function Test-SysOrgInOrganizedDir {
     Test-SysOrgInOrganizedDir -Directory $f.Directory -OrganizedSet $set
 #>
     param([string]$Directory,$OrganizedSet)
-    $cur = $Directory.TrimEnd('\')
+    $cur = ("$Directory").Replace('/','\').TrimEnd('\')
     while($cur -and ($cur.Length -gt 3)){
         if($OrganizedSet.ContainsKey($cur.ToLowerInvariant())){ return $true }
-        $cur = Split-Path $cur -Parent
+        $next = Split-Path $cur -Parent
+        if(-not $next -or ("$next").Length -ge $cur.Length){ break }
+        $cur = "$next"
     }
     return $false
 }
@@ -470,7 +478,11 @@ function Get-SysOrgNameFamilies {
     param([AllowEmptyCollection()]$Inventory,$PartitionLookup,$Config)
     $lookup = @{}
     $families = New-Object System.Collections.Generic.List[object]
-    $inv = @($Inventory)
+    # NOTE: @() collecting a generic List[object] throws 'Argument types do not match'
+    # on both Windows PowerShell 5.1 and PowerShell 7 - normalize via ToArray first.
+    $inv = @()
+    if($Inventory -is [System.Collections.Generic.List[object]]){ $inv = $Inventory.ToArray() }
+    elseif($null -ne $Inventory){ $inv = @($Inventory) }
     if(-not (Get-SysOrgSetting $Config 'Families.Enabled' $true)){ return [pscustomobject]@{ Lookup=$lookup; Families=$families.ToArray() } }
     if($inv.Count -eq 0){ return [pscustomobject]@{ Lookup=$lookup; Families=$families.ToArray() } }
 
@@ -502,7 +514,7 @@ function Get-SysOrgNameFamilies {
         foreach($pk in $partKeys){ [void]$roots.Add(("$pk".Split('\')[0]).ToLowerInvariant()) }
         $crossType = ($roots.Count -ge 2)
         foreach($pk in $partKeys){
-            $members = @($partMap[$pk])
+            $members = $partMap[$pk].ToArray()
             $isFamily = ($members.Count -ge $minFiles)
             $basis = 'Same normalized name within the type root'
             if((-not $isFamily) -and $crossType){
@@ -527,13 +539,13 @@ function Get-SysOrgNameFamilies {
             $pks = Sort-SysOrgNatural -Values @($partMap.Keys)
             foreach($pk in $pks){ if($partMap[$pk].Count -gt $domCount){ $domCount = $partMap[$pk].Count; $domPk = $pk } }
             if($domCount -lt $minFiles){ continue }
-            $domMembers = @($partMap[$domPk])
+            $domMembers = $partMap[$domPk].ToArray()
             $famName = Get-SysOrgFamilyFolderName -Members $domMembers -MaxNameLength $maxLen
             foreach($pk in @($partMap.Keys)){
                 if($pk -eq $domPk){ continue }
                 $targetPk = [string]$pk
                 if(-not $withinType){ $targetPk = [string]$domPk }   # opt-in: cross the type boundary
-                foreach($m in @($partMap[$pk])){
+                foreach($m in $partMap[$pk]){
                     if($lookup.ContainsKey($m.FullName)){ continue }
                     $lookup[$m.FullName] = @{ Name=$famName; Partition=$targetPk }
                 }
@@ -554,9 +566,11 @@ function Get-SysOrgFamilyFolderName {
 #>
     param([Parameter(Mandatory)]$Members,[int]$MaxNameLength=60)
     $stemCounts = @{}
+    $stemOriginal = @{}
     foreach($m in @($Members)){
-        $k2 = ([string]$m.Stem).ToLowerInvariant()
-        if(-not $stemCounts.ContainsKey($k2)){ $stemCounts[$k2] = 0 }
+        $orig = [string]$m.Stem
+        $k2 = $orig.ToLowerInvariant()
+        if(-not $stemCounts.ContainsKey($k2)){ $stemCounts[$k2] = 0; $stemOriginal[$k2] = $orig }
         $stemCounts[$k2]++
     }
     $best = $null; $bestCount = -1
@@ -565,6 +579,7 @@ function Get-SysOrgFamilyFolderName {
         if($stemCounts[$st] -gt $bestCount){ $bestCount = $stemCounts[$st]; $best = $st }
     }
     if(-not $best){ $best = 'Family' }
+    else { $best = $stemOriginal[$best] }   # keep the original stem's casing
     return (Get-SysOrgSafeFolderName -Name $best -MaxLength $MaxNameLength)
 }
 
@@ -614,7 +629,7 @@ function Get-SysOrgProjectFolders {
     while($stack.Count -gt 0){
         $item = $stack.Pop()
         $dir = [string]$item.Path; $depth = [int]$item.Depth
-        $lc = $dir.TrimEnd('\').ToLowerInvariant()
+        $lc = ($dir.Replace('/','\')).TrimEnd('\').ToLowerInvariant()
         if($guard.Contains($lc)){ continue }
         if(Test-Path -LiteralPath (Join-Path $dir '.sysorg-ignore')){ continue }
         if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
@@ -696,7 +711,7 @@ function Get-SysOrgMultipartSets {
         }
     }
     foreach($k in $byKey.Keys){
-        $members = @($byKey[$k])
+        $members = $byKey[$k].ToArray()
         if($members.Count -lt 2){ continue }
         $ordered = Sort-SysOrgNatural -Values @($members | ForEach-Object { "$($_.FullName)" })
         $leaderPath = $ordered[0]

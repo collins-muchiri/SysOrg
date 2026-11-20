@@ -59,6 +59,10 @@ BeforeAll {
             LastWriteTime=$fi.LastWriteTime; Directory=$fi.DirectoryName; Category=$Category
         }
     }
+    function New-SysOrgTestPathNorm {
+        param([string]$Path)
+        return (("$Path").Replace('/','\').ToLowerInvariant())
+    }
     function New-SysOrgTestPlans {
         return (Join-Path $TestDrive ('plans-' + [guid]::NewGuid().ToString('N').Substring(0,6)))
     }
@@ -83,7 +87,7 @@ Describe 'W6 fixture: Report + byte-identical copy + Report final v2' {
         $plan = New-SysOrgPlan -Letter $letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $cfg -KnownFolders @()
         @($plan.Actions).Count | Should -Be 3
         $famRoot = Join-Path (Join-Path $orgRoot 'Documents') 'Report'
-        foreach($a in @($plan.Actions)){ (Split-Path $_.Destination -Parent) | Should -Be $famRoot }
+        foreach($a in @($plan.Actions)){ (New-SysOrgTestPathNorm (Split-Path "$($a.Destination)" -Parent)) | Should -Be (New-SysOrgTestPathNorm $famRoot) }
         $keeper = @($plan.Actions | Where-Object { $_.Source -eq $p1 })[0]
         (Split-Path $keeper.Destination -Leaf) | Should -Be 'Report.docx'
         $copy = @($plan.Actions | Where-Object { $_.Source -eq $p2 })[0]
@@ -156,11 +160,11 @@ Describe 'W5 fixture: holiday.jpg + holiday.mp4' {
         $a1 = @($plan.Actions | Where-Object { $_.Source -eq $p1 })[0]
         $a2 = @($plan.Actions | Where-Object { $_.Source -eq $p2 })[0]
         $a1.Family | Should -Be $a2.Family                       # plan audit field links them
-        (Split-Path (Split-Path $a1.Destination -Parent) -Leaf) | Should -Be 'Pictures'
-        (Split-Path (Split-Path $a2.Destination -Parent) -Leaf) | Should -Be 'Videos'
-        (Split-Path $a1.Destination -Parent) | Should -Not -Be (Split-Path $a2.Destination -Parent)
-        $a1.Destination | Should -Be (Join-Path (Join-Path $orgRoot 'Pictures\holiday') 'holiday.jpg')
-        $a2.Destination | Should -Be (Join-Path (Join-Path $orgRoot 'Videos\holiday') 'holiday.mp4')
+        (($a1.Destination -split '[\\/]')[-3]) | Should -Be 'Pictures'
+        (($a2.Destination -split '[\\/]')[-3]) | Should -Be 'Videos'
+        (("$($a1.Destination)" -split '[\\/]')[-3]) | Should -Not -Be (("$($a2.Destination)" -split '[\\/]')[-3])
+        (New-SysOrgTestPathNorm $a1.Destination) | Should -Be (New-SysOrgTestPathNorm (Join-Path (Join-Path $orgRoot 'Pictures\holiday') 'holiday.jpg'))
+        (New-SysOrgTestPathNorm $a2.Destination) | Should -Be (New-SysOrgTestPathNorm (Join-Path (Join-Path $orgRoot 'Videos\holiday') 'holiday.mp4'))
     }
 }
 
@@ -221,7 +225,7 @@ Describe 'Code project folders move whole (rev 2.0 D4 via W5)' {
         $plan = New-SysOrgPlan -Letter $letter -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $cfg -KnownFolders @() -ProjectFolders $projects
         $folderActions = @($plan.Actions | Where-Object { "$($_.Kind)" -eq 'Folder' })
         $folderActions.Count | Should -Be 1
-        $folderActions[0].Destination | Should -Be (Join-Path (Join-Path $orgRoot 'Documents\Projects\Code') 'myapp')
+        (New-SysOrgTestPathNorm $folderActions[0].Destination) | Should -Be (New-SysOrgTestPathNorm (Join-Path (Join-Path $orgRoot 'Documents\Projects\Code') 'myapp'))
         # the repo files are NOT planned individually
         @($plan.Actions | Where-Object { $_.Source -like '*readme.md' -and "$($_.Kind)" -eq 'File' }).Count | Should -Be 0
 
@@ -245,9 +249,9 @@ Describe 'Downloads branch provenance' {
         $plan = New-SysOrgPlan -Letter $letter -Inventory $inv -DriveProfile $dlProf -DupGroups @() -Config $cfg -KnownFolders @()
         @($plan.Actions).Count | Should -Be 1
         $plan.Actions[0].SourceBucket | Should -Be 'WhatsApp'
-        $plan.Actions[0].Destination | Should -BeLike ((Join-Path $orgRoot 'Downloads\WhatsApp\Pictures') + '*')
+        (New-SysOrgTestPathNorm $plan.Actions[0].Destination) | Should -BeLike ((New-SysOrgTestPathNorm (Join-Path $orgRoot 'Downloads\WhatsApp\Pictures')) + '*')
         $year = (Get-Item -LiteralPath $p1).LastWriteTime.ToString('yyyy')
-        $plan.Actions[0].Destination | Should -BeLike (("*\" + $year) + "\*")
+        $plan.Actions[0].Destination | Should -BeLike (("*" + $year) + "*")
     }
     It 'files without provenance land in _NoSource; installers route to _NoSource\Installers' {
         $dl = Join-Path $TestDrive ('dl2-' + [guid]::NewGuid().ToString('N').Substring(0,6))
@@ -263,8 +267,8 @@ Describe 'Downloads branch provenance' {
         @($plan.Actions).Count | Should -Be 2
         $bin = @($plan.Actions | Where-Object { $_.Source -eq $p1 })[0]
         $exe = @($plan.Actions | Where-Object { $_.Source -eq $p2 })[0]
-        $bin.Destination  | Should -BeLike ((Join-Path $orgRoot 'Downloads\_NoSource\Other') + '*')
-        $exe.Destination  | Should -BeLike ((Join-Path $orgRoot 'Downloads\_NoSource\Installers') + '*')
+        (New-SysOrgTestPathNorm $bin.Destination) | Should -BeLike ((New-SysOrgTestPathNorm (Join-Path $orgRoot 'Downloads\_NoSource\Other')) + '*')
+        (New-SysOrgTestPathNorm $exe.Destination) | Should -BeLike ((New-SysOrgTestPathNorm (Join-Path $orgRoot 'Downloads\_NoSource\Installers')) + '*')
     }
 }
 
@@ -285,27 +289,27 @@ Describe 'W12 fixture: migration preview from old trees' {
         $plan = New-SysOrgMigrationPlan -Letter $letter -Config $migCfg
         $act = @($plan.Actions)
         $folders = @($act | Where-Object { "$($_.Kind)" -eq 'Folder' })
-        @($folders | Where-Object { $_.Source -eq (Join-Path $old 'Photo\2024') -and $_.Destination -eq (Join-Path $old 'Pictures\2024') }).Count | Should -Be 1
-        @($folders | Where-Object { $_.Source -eq (Join-Path $old 'Video\Audio\2023') -and $_.Destination -eq (Join-Path $old 'Music\2023') }).Count | Should -Be 1
-        @($act | Where-Object { $_.Source -eq (Join-Path $old 'Photo\loose.jpg') -and $_.Destination -eq (Join-Path $old 'Pictures\loose.jpg') }).Count | Should -Be 1
-        @($act | Where-Object { $_.Source -eq (Join-Path $old 'Video\clip.mp4') -and $_.Destination -eq (Join-Path $old 'Videos\clip.mp4') }).Count | Should -Be 1
-        @($act | Where-Object { $_.Source -like '*_Duplicates*' }).Count | Should -Be 0     # quarantine folder untouched
-        @($act | Where-Object { $_.Source -like '*Downloads\keep.txt*' }).Count | Should -Be 0
-        @($plan.Skipped | Where-Object { $_.Source -eq (Join-Path $old '_Duplicates') }).Count | Should -Be 1
+        @($folders | Where-Object { (New-SysOrgTestPathNorm $_.Source) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Photo\2024')) -and (New-SysOrgTestPathNorm $_.Destination) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Pictures\2024')) }).Count | Should -Be 1
+        @($folders | Where-Object { (New-SysOrgTestPathNorm $_.Source) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Video\Audio\2023')) -and (New-SysOrgTestPathNorm $_.Destination) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Music\2023')) }).Count | Should -Be 1
+        @($act | Where-Object { (New-SysOrgTestPathNorm $_.Source) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Photo\loose.jpg')) -and (New-SysOrgTestPathNorm $_.Destination) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Pictures\loose.jpg')) }).Count | Should -Be 1
+        @($act | Where-Object { (New-SysOrgTestPathNorm $_.Source) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Video\clip.mp4')) -and (New-SysOrgTestPathNorm $_.Destination) -eq (New-SysOrgTestPathNorm (Join-Path $old 'Videos\clip.mp4')) }).Count | Should -Be 1
+        @($act | Where-Object { (New-SysOrgTestPathNorm $_.Source) -like '*_duplicates*' }).Count | Should -Be 0     # quarantine folder untouched
+        @($act | Where-Object { (New-SysOrgTestPathNorm $_.Source) -like '*downloads\keep.txt*' }).Count | Should -Be 0
+        @($plan.Skipped | Where-Object { (New-SysOrgTestPathNorm $_.Source) -eq (New-SysOrgTestPathNorm (Join-Path $old '_Duplicates')) }).Count | Should -Be 1
 
         $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder (New-SysOrgTestPlans)
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $migCfg -AppRoot $TestDrive
         $res.Summary.Moved | Should -Be 2
         $res.Summary.FolderMoves | Should -Be 2
-        Test-Path -LiteralPath (Join-Path $old 'Pictures\2024\a.jpg') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $old 'Music\2023\b.mp3') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $old 'Videos\clip.mp4') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $old 'Pictures\loose.jpg') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $old '_Duplicates\p-1\c.bin') | Should -BeTrue   # untouched
+        Test-Path -LiteralPath (Join-Path $old ('Pictures' + [System.IO.Path]::DirectorySeparatorChar + '2024' + [System.IO.Path]::DirectorySeparatorChar + 'a.jpg')) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $old ('Music' + [System.IO.Path]::DirectorySeparatorChar + '2023' + [System.IO.Path]::DirectorySeparatorChar + 'b.mp3')) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $old ('Videos' + [System.IO.Path]::DirectorySeparatorChar + 'clip.mp4')) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $old ('Pictures' + [System.IO.Path]::DirectorySeparatorChar + 'loose.jpg')) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $old ('_Duplicates' + [System.IO.Path]::DirectorySeparatorChar + 'p-1' + [System.IO.Path]::DirectorySeparatorChar + 'c.bin')) | Should -BeTrue   # untouched
         $u = Undo-SysOrgPlan -PlanId $plan.PlanId -AppRoot $TestDrive -Config $migCfg
         $u.Restored | Should -Be 4
-        Test-Path -LiteralPath (Join-Path $old 'Photo\2024\a.jpg') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $old 'Video\Audio\2023\b.mp3') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $old ('Photo' + [System.IO.Path]::DirectorySeparatorChar + '2024' + [System.IO.Path]::DirectorySeparatorChar + 'a.jpg')) | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $old ('Video' + [System.IO.Path]::DirectorySeparatorChar + 'Audio' + [System.IO.Path]::DirectorySeparatorChar + '2023' + [System.IO.Path]::DirectorySeparatorChar + 'b.mp3')) | Should -BeTrue
     }
 }
 

@@ -231,7 +231,13 @@ function Get-SysOrgSetting {
         else { return $Default }
     }
     if($null -eq $node){ return $Default }
-    return ,$node
+    # NOTE: return the node WITHOUT comma-wrapping. The previous ',$node' wrapped arrays
+    # into a single pipeline object, so @(Get-SysOrgSetting ... 'X.Y' @()) returned a
+    # ONE-ELEMENT array whose element was the whole inner array - blocked-extension,
+    # artifact, marker and noise-token lookups silently never matched. Streaming the
+    # value is correct: callers that need an array collect with @(), which rebuilds
+    # 0/1/N-element arrays properly; scalar callers are unaffected.
+    return $node
 }
 
 function Write-SysOrgLog {
@@ -321,7 +327,10 @@ function Sort-SysOrgNatural {
     if($vals.Count -eq 0){ return @() }
     $list = [System.Collections.Generic.List[string]]::new()
     foreach($v in $vals){ [void]$list.Add([string]$v) }
-    if('SysOrg.NativeSort' -as [type]){
+    # StrCmpLogicalW lives in shlwapi.dll (Windows only): on other hosts the compiled type
+    # exists but the P/Invoke must not be invoked, so guard on the OS and fall back to the
+    # number-aware chunk comparison with identical ordering.
+    if(('SysOrg.NativeSort' -as [type]) -and ($env:OS -eq 'Windows_NT')){
         $list.Sort([Comparison[string]]{ param($a,$b) [SysOrg.NativeSort]::StrCmpLogicalW($a,$b) })
     } else {
         $list.Sort([Comparison[string]]{
@@ -536,15 +545,21 @@ function Test-SysOrgFileMutable {
     if($role -ieq 'System'){ $polKey = 'Policy.SystemDrive' } else { $polKey = 'Policy.DataDrives' }
     $blocked = @(Get-SysOrgSetting $Config ($polKey + '.BlockedExtensions') @())
     if((-not $Container) -and ($blocked -contains $Extension)){
-        $isInstaller = @('.exe','.msi','.msix','.appx','.apk') -contains $Extension
+        return [pscustomobject]@{ Allowed=$false; Reason=("Blocked extension {0}" -f $Extension) }
+    }
+    # 5.1 policy matrix: installers (.exe .msi .msix .appx .apk) are movable ONLY inside
+    # download roots (the installer exception, on every drive role). With
+    # AllowInstallersInDownloads=$false they never move at all.
+    if((-not $Container) -and (@('.exe','.msi','.msix','.appx','.apk') -contains $Extension)){
         $inDownloads = $false
+        $pathNorm = $Path.Replace('/','\')
         foreach($r in @($DriveProfile.DownloadRoots)){
             if([string]::IsNullOrWhiteSpace("$r")){ continue }
-            $r2 = ("$r").TrimEnd('\')
-            if($Path.StartsWith($r2 + '\',[StringComparison]::OrdinalIgnoreCase)){ $inDownloads = $true; break }
+            $r2 = (("$r").Replace('/','\')).TrimEnd('\')
+            if($pathNorm.StartsWith($r2 + '\',[StringComparison]::OrdinalIgnoreCase)){ $inDownloads = $true; break }
         }
-        if(-not ($isInstaller -and $inDownloads -and (Get-SysOrgSetting $Config ($polKey + '.AllowInstallersInDownloads') $true))){
-            return [pscustomobject]@{ Allowed=$false; Reason=("Blocked extension {0}" -f $Extension) }
+        if((-not $inDownloads) -or (-not (Get-SysOrgSetting $Config ($polKey + '.AllowInstallersInDownloads') $true))){
+            return [pscustomobject]@{ Allowed=$false; Reason='Installer outside download roots' }
         }
     }
     $defaultScope = if($role -ieq 'System'){ 'KnownFolders' } else { 'FullDrive' }
