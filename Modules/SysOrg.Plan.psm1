@@ -79,6 +79,14 @@ function New-SysOrgPlan {
     $dateMode  = Get-SysOrgSetting $Config 'DateFolders' 'Year'
     $dlDateMode = Get-SysOrgSetting $Config 'Downloads.DateFolders' "$(Get-SysOrgSetting $Config 'DateFolders' 'Year')"
     $folderMap = Get-SysOrgFolderMap -Config $Config
+    # v3.0: the Findable layout profile (Windows/Compact4 keep the legacy routing below)
+    $layoutProfile = 'Windows'
+    try { $layoutProfile = Get-SysOrgLayoutProfile -Config $Config } catch { $layoutProfile = 'Windows' }
+    $findable = ($layoutProfile -eq 'Findable')
+    $layoutCap = [int](Get-SysOrgSetting $Config 'Layout.MaxFilesPerFolder' 150)
+    $layoutMin = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
+    $layoutPathBudget = [int](Get-SysOrgSetting $Config 'Layout.MaxPathChars' 200)
+    $relBaseOf = @{}
 
     $copiesPolicy = "$(Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies')"
     $qFolder      = "$(Get-SysOrgSetting $Config 'Copies.QuarantineFolderName' '_Duplicates')"
@@ -238,6 +246,16 @@ function New-SysOrgPlan {
             } else {
                 if($folderMap.ContainsKey($category)){ $pk = "$($folderMap[$category])" } else { $pk = "$($folderMap['Other'])" }
             }
+            # v3.0 Findable: the leaf base comes from the Findable routing table
+            # (subtype heuristics now; the Phase 2 Decision pipeline feeds richer signals
+            # into the same contract). Downloads keeps its provenance branch shape.
+            if($findable){
+                $subtype = Get-SysOrgFindableSubtype -Category $category -Name "$($f.Name)" -Source "$sourceName"
+                $typeLeaf = Get-SysOrgFindableTypeLeaf -Category $category
+                $rb = Get-SysOrgFindableRelBase -Category $category -Subtype $subtype -Source "$sourceName" -Name "$($f.Name)" -InDownloads:$downloadContext -TypeLeaf $typeLeaf
+                $pk = "$($rb.RelBase)"
+                $relBaseOf[$src] = $pk
+            }
             $context[$src] = @{ Rel=$pk; Category=$category; Source=$sourceName; InDownloads=$inDownloads }
             $partitionLookup[$src] = $pk
             [void]$routed.Add($f)
@@ -250,6 +268,43 @@ function New-SysOrgPlan {
     # 5) families within the context leaf (W5)
     # @() cannot collect a generic List[object] (Argument types do not match) - use ToArray
     $fam = Get-SysOrgNameFamilies -Inventory $routed.ToArray() -PartitionLookup $partitionLookup -Config $Config
+
+    # v3.0 Findable: adaptive date granularity is computed over the WHOLE routed set
+    # (per leaf), so a leaf only splits when it really exceeds the cap. Family leaves
+    # stay date-free unless they themselves exceed the cap.
+    $destRelOf = @{}
+    if($findable){
+        $routedArr = $routed.ToArray()
+        $recs = New-Object System.Collections.Generic.List[object]
+        foreach($f in $routedArr){
+            $src2 = "$($f.FullName)"
+            $rb = ''
+            if($relBaseOf.ContainsKey($src2)){ $rb = [string]$relBaseOf[$src2] }
+            if(-not $rb){
+                if($folderMap.ContainsKey("$($f.Category)")){ $rb = "$($folderMap[$($f.Category)])" } else { $rb = "$($folderMap['Other'])" }
+            }
+            $isFam = $fam.Lookup.ContainsKey($src2)
+            [void]$recs.Add([pscustomobject]@{ Key=$rb; FileKey=$src2; Date=$f.LastWriteTime; Family=$isFam })
+        }
+        $segs = Add-SysOrgFindableDateSegments -Records $recs.ToArray() -Cap $layoutCap -MinPerFolder $layoutMin
+        foreach($f in $routedArr){
+            $src2 = "$($f.FullName)"
+            $famInfo2 = $null
+            if($fam.Lookup.ContainsKey($src2)){ $famInfo2 = $fam.Lookup[$src2] }
+            if($famInfo2 -and $famInfo2.Partition){
+                $destRelOf[$src2] = [string]$famInfo2.Partition
+            } else {
+                $rb = ''
+                if($relBaseOf.ContainsKey($src2)){ $rb = [string]$relBaseOf[$src2] }
+                if(-not $rb){
+                    if($folderMap.ContainsKey("$($f.Category)")){ $rb = "$($folderMap[$($f.Category)])" } else { $rb = "$($folderMap['Other'])" }
+                }
+                $seg = ''
+                if($segs.ContainsKey($rb.ToLowerInvariant()) -and $segs[$rb.ToLowerInvariant()].ContainsKey($src2)){ $seg = [string]$segs[$rb.ToLowerInvariant()][$src2] }
+                if($seg){ $destRelOf[$src2] = ($rb + '\' + $seg) } else { $destRelOf[$src2] = $rb }
+            }
+        }
+    }
 
     # process multipart leaders first so members can join the leader's destination folder
     $ordered = @($routed.ToArray() | Sort-Object -Property @{e={ if($leaderSet.ContainsKey("$($_.FullName)")){ 0 } else { 1 } }})
@@ -279,6 +334,11 @@ function New-SysOrgPlan {
             if($fam.Lookup.ContainsKey($src)){ $famInfo = $fam.Lookup[$src] }
             $relForDest = $cx.Rel
             if($famInfo -and $famInfo.Partition){ $relForDest = [string]$famInfo.Partition }
+            # v3.0 Findable: the destination leaf (incl. adaptive date segment) was
+            # computed over the whole routed set; families override with their leaf base.
+            if($findable -and $destRelOf.ContainsKey($src)){
+                $relForDest = [string]$destRelOf[$src]
+            }
             $db = Get-SysOrgDestinationBase -RelBase $relForDest -DriveProfile $DriveProfile -Config $Config -KnownFolders $KnownFolders
             $destFolder = $db.Base
             $destRoot = $db.DisplayRoot
@@ -290,12 +350,15 @@ function New-SysOrgPlan {
                 $reason = ('Family={0}' -f $famName)
                 if($cx.Source){ $reason = ('Source={0}; Family={1}' -f $cx.Source, $famName) }
             } else {
-                $dMode = $dateMode
-                if($cx.InDownloads){ $dMode = $dlDateMode }
-                if("$dMode" -eq 'Year'){ $relDate = ([datetime]$f.LastWriteTime).ToString('yyyy'); $destFolder = $db.Base + '\' + $relDate }
-                elseif("$dMode" -eq 'YearMonth'){ $relDate = ([datetime]$f.LastWriteTime).ToString('yyyy-MM'); $destFolder = $db.Base + '\' + $relDate }
+                if(-not $findable){
+                    $dMode = $dateMode
+                    if($cx.InDownloads){ $dMode = $dlDateMode }
+                    if("$dMode" -eq 'Year'){ $relDate = ([datetime]$f.LastWriteTime).ToString('yyyy'); $destFolder = $db.Base + '\' + $relDate }
+                    elseif("$dMode" -eq 'YearMonth'){ $relDate = ([datetime]$f.LastWriteTime).ToString('yyyy-MM'); $destFolder = $db.Base + '\' + $relDate }
+                }
                 $reason = ('Category={0}' -f $cx.Category)
                 if($cx.Source){ $reason = ('Source={0}; Category={1}' -f $cx.Source, $cx.Category) }
+                if($findable){ $reason = ('Findable={0}' -f $relForDest) }
             }
             $isLeader = $leaderSet.ContainsKey($src)
             if($multipartMap.ContainsKey($src)){
@@ -308,6 +371,12 @@ function New-SysOrgPlan {
                 $reason = ('Multipart set {0}; {1}' -f $sk, $reason)
             }
             $dest = $destFolder + '\' + $f.Name
+            # v3.0 Findable: keep every destination inside the character budget with
+            # deterministic hash-suffixed shortening (folder segments first, name last).
+            if($findable){
+                $dest = Compress-SysOrgFindablePath -Path $dest -Budget $layoutPathBudget
+                $destFolder = Split-Path $dest -Parent
+            }
             $nameKey = $destFolder.ToLowerInvariant() + '|' + ("$($f.Name)").ToLowerInvariant()
             $usedNames[$nameKey] = $true
 
@@ -469,6 +538,9 @@ function New-SysOrgPlan {
 
     # code project folders: one MoveFolder unit each (mutability checked at the folder itself)
     $projCfgDest = "$(Get-SysOrgSetting $Config 'Projects.Destination' 'Documents\Projects\Code')"
+    # v3.0 Findable: projects live under Code\Projects (the tree's Code branch) unless the
+    # user customized Projects.Destination away from the legacy default.
+    if($findable -and ($projCfgDest -ieq 'Documents\Projects\Code')){ $projCfgDest = 'Code\Projects' }
     $docMap = "$($folderMap['Documents'])"
     foreach($pf in @($ProjectFolders)){
         if($actions.Count -ge $maxActions){ $capped = $true; break }
@@ -549,6 +621,13 @@ function New-SysOrgPlan {
         }
     } catch { $profileSummary = $null }
 
+    # v3.0: Mode line reflects the active layout (precomputed for PS 5.1 compatibility)
+    if($findable){
+        $modeLine = ('Findable layout; copies={0}; style={1}' -f $copiesPolicy, $style)
+    } else {
+        $modeLine = ('Type-first families; preset={0}; copies={1}; style={2}' -f (Get-SysOrgSetting $Config 'NamingPreset' 'Windows'), $copiesPolicy, $style)
+    }
+
     return [pscustomobject]@{
         PlanId          = $planId
         Created         = (Get-Date).ToString('s')
@@ -556,7 +635,7 @@ function New-SysOrgPlan {
         Drive           = "$Letter`:"
         DestinationRoot = $root
         DestinationStyle= $style
-        Mode            = ('Type-first families; preset={0}; copies={1}; style={2}' -f (Get-SysOrgSetting $Config 'NamingPreset' 'Windows'), $copiesPolicy, $style)
+        Mode            = $modeLine
         DriveProfile    = $profileSummary
         Actions         = $actions.ToArray()
         Skipped         = $skipped.ToArray()

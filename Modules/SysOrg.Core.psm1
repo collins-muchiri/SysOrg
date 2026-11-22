@@ -88,6 +88,12 @@ function Test-SysOrgConfig {
     if(@('Year','YearMonth','None') -notcontains $dateMode){ $errors += "DateFolders must be Year, YearMonth, or None (got '$dateMode')." }
     $naming = Get-SysOrgSetting $Config 'NamingPreset' 'Windows'
     if(@('Windows','Compact4') -notcontains $naming){ $errors += "NamingPreset must be Windows or Compact4 (got '$naming')." }
+    # v3.0: the layout profile. Findable activates the new layout engine; Windows and
+    # Compact4 keep the legacy behaviour exactly.
+    $layoutProfile = Get-SysOrgSetting $Config 'LayoutProfile' 'Windows'
+    if(@('Windows','Compact4','Findable') -notcontains $layoutProfile){ $errors += "LayoutProfile must be Windows, Compact4, or Findable (got '$layoutProfile')." }
+    $reviewMode = Get-SysOrgSetting $Config 'Review.Mode' 'Report'
+    if(@('Report','Move') -notcontains $reviewMode){ $errors += "Review.Mode must be Report or Move (got '$reviewMode')." }
     $style = Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot'
     if(@('OrganizedRoot','KnownFolders') -notcontains $style){ $errors += "DestinationStyle must be OrganizedRoot or KnownFolders (got '$style')." }
     $cpol = Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies'
@@ -178,6 +184,11 @@ function Import-SysOrgConfig {
     param([string]$Path,[string]$AppRoot,[switch]$AllowDegradedMode)
     $defaults = @{
         Version          = '2.1.1'
+        # v3.0 LayoutProfile: 'Findable' is the NEW-install default (injected only when no
+        # config file was loaded - see the load block below). A config file that exists
+        # but does not carry the key keeps its current 'Windows' behaviour, so upgrading
+        # an existing install never changes where files go.
+        LayoutProfile    = 'Findable'
         NamingPreset     = 'Windows'
         DestinationStyle = 'OrganizedRoot'
         OrganizedRoots   = @{ '*' = '__AUTO__' }
@@ -226,6 +237,11 @@ function Import-SysOrgConfig {
         # v3.0 findability score targets (Score.Targets) - see SysOrg.Score.psm1
         Score  = @{ Targets = @{ MaxDepth=4; AvgDepth=3.0; OverCapShare=0.05; NearEmptyShare=0.10
                                  ConfidentShare=0.80; DupByteShare=0.10 } }
+        # v3.0: files the classifier cannot place with at least Classify.MinConfidence
+        # are NEVER dumped into a junk folder. Mode='Report' lists them in the plan's
+        # "needs a decision" section and leaves them in place; Mode='Move' files them
+        # under <root>\_Review\<Year> (still previewed + undoable like any move).
+        Review = @{ Mode='Report'; FolderName='_Review' }
         FolderAudit = @{ Enabled=$true; MaxTopLevelDepth=2; SkipHiddenSystemDirs=$true; RespectDefenderCFA=$true; IncludeRestrictedInPlans=$false }
         Move     = @{ AllowCrossVolume = $true }
         MaxPlanActions         = 5000
@@ -235,9 +251,13 @@ function Import-SysOrgConfig {
         ScheduledDrives        = @('*')
     }
     if($Path -and (Test-Path -LiteralPath $Path)){
+        $configFileLoaded = $false
+        $configHasKey = $false
         try{
             $loaded = Import-PowerShellDataFile -LiteralPath $Path -ErrorAction Stop
             if($loaded -is [hashtable]){
+                $configFileLoaded = $true
+                $configHasKey = $loaded.ContainsKey('LayoutProfile')
                 # W10: deprecation mappings BEFORE the merge, so v1.x/2.0 configs keep working
                 if($loaded.ContainsKey('Duplicates') -and -not $loaded.ContainsKey('Copies')){
                     Write-Warning "Config key 'Duplicates' is deprecated since v2.1.0 - mapped to 'Copies'. Update SysOrg.config.psd1 when convenient."
@@ -290,6 +310,11 @@ function Import-SysOrgConfig {
                 throw ("$msg SysOrg fails closed: fix or remove the config file, or use -AllowDegradedMode for report-only sessions.")
             }
         }
+        # v3.0: an EXISTING config file without LayoutProfile keeps its current layout
+        # (Windows). Only a fresh install (no config file at all) gets the Findable default.
+        # A config that failed to parse also keeps Windows (degraded mode must not change
+        # what would move).
+        if(-not ($configFileLoaded -and $configHasKey)){ $defaults.LayoutProfile = 'Windows' }
     }
     if($defaults.ExcludedPaths -is [string]){ $defaults.ExcludedPaths = @($defaults.ExcludedPaths) }
     # v2.1.1: additive merges - user configuration can ADD to the protection lists but

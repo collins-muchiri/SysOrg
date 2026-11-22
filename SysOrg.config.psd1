@@ -1,7 +1,20 @@
 @{
     Version = '2.1.1'
 
-    # Naming preset for the organized roots:
+    # v3.0 layout profile - the new Findable layout organizes EVERY file type into a
+    # fast-to-browse tree (max depth 4 below the root, max 10 routing roots, adaptive
+    # ISO date granularity: YYYY -> YYYY-MM -> YYYY-MM-DD when a folder exceeds
+    # Layout.MaxFilesPerFolder, merged back up when it would leave mostly near-empty
+    # folders, and a 200-character path budget with deterministic hash-suffixed
+    # shortening). Files that cannot be classified with confidence are left in place
+    # and listed in the plan's "needs a decision" section (Review.Mode below).
+    #   Windows  = the v2.1 behaviour (NamingPreset below governs the folder names)
+    #   Compact4 = the rev 2.0 naming (Documents, Photo, Video, Downloads)
+    #   Findable = the v3.0 layout engine (recommended)
+    LayoutProfile = 'Findable'
+
+    # Naming preset for the organized roots - used by the Windows/Compact4 layout
+    # profiles only (Findable has its own tree):
     #   Windows  = Documents, Pictures, Videos, Music, Downloads   (Windows known-folder names)
     #   Compact4 = Documents, Photo, Video, Downloads              (rev 2.0 naming; Music under Video\Audio)
     NamingPreset = 'Windows'
