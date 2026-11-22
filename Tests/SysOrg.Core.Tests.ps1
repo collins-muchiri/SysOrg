@@ -351,7 +351,7 @@ Describe 'Execute and undo round trip' {
         Set-Content -LiteralPath $src -Value 'pdf'
         $dest = Join-Path $TestDrive 'org\Documents\2026\report.pdf'
         $plan = [pscustomobject]@{
-            PlanId  = 'plan-test-0001'
+            PlanId  = 'plan-20260101-093000'
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dest; Reason='Category=Documents'; SizeBytes=3 })
         }
         $planPath = Join-Path $TestDrive 'plan.json'
@@ -361,7 +361,7 @@ Describe 'Execute and undo round trip' {
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $cfgRound -AppRoot $TestDrive
         $res.Summary.Moved | Should -Be 1
         Test-Path -LiteralPath $src | Should -BeFalse
-        $u = Undo-SysOrgPlan -PlanId 'plan-test-0001' -AppRoot $TestDrive -Config $cfgRound
+        $u = Undo-SysOrgPlan -PlanId 'plan-20260101-093000' -AppRoot $TestDrive -Config $cfgRound
         $u.Restored | Should -Be 1
         Test-Path -LiteralPath $src | Should -BeTrue
     }

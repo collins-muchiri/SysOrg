@@ -95,23 +95,8 @@ function Get-SysOrgCategory {
     return 'Other'
 }
 
-function Test-SysOrgCloudPlaceholderAttributes {
-<#
-.SYNOPSIS
-    True when raw file attributes mark a cloud placeholder (OneDrive files-on-demand).
-.DESCRIPTION
-    Checks Offline (0x1000) and RecallOnDataAccess (0x400000) on the raw integer so
-    it behaves identically on Windows PowerShell 5.1 and PowerShell 7 - the
-    .NET Framework FileAttributes enum has no RecallOnDataAccess member, and
-    casting the value would throw. Hashing or opening such a file would silently
-    hydrate the whole cloud library, so the scanner must skip it.
-.EXAMPLE
-    Test-SysOrgCloudPlaceholderAttributes -Attributes 0x400020   # -> True
-#>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][int]$Attributes)
-    return ((($Attributes -band 0x1000) -ne 0) -or (($Attributes -band 0x400000) -ne 0))
-}
+# NOTE: Test-SysOrgCloudPlaceholderAttributes moved to SysOrg.Core.psm1 in v2.1.1 so the
+# plan executor can re-check placeholders without importing the Scan module.
 
 function Get-SysOrgScanRoots {
 <#

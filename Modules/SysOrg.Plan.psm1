@@ -4,6 +4,10 @@
 #                    execution (incremental journal, resume guard, folder moves),
 #                    undo, migration plans (W12) and report-only scans.
 
+# v2.1.1: plan IDs are validated wherever they index a journal path. Item 10 adds an
+# optional millisecond suffix, so the pattern tolerates '-fff' but nothing else.
+$script:PlanIdPattern = '^(plan|migrate)-\d{8}-\d{6}(-\d{3})?$'
+
 function Get-SysOrgDestinationBase {
 <#
 .SYNOPSIS
@@ -313,10 +317,14 @@ function New-SysOrgPlan {
                 if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add($src) }
                 if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
             }
+            # v2.1.1: capture plan-time metadata so the executor can detect a source that
+            # changed between planning and execution. Stored as a round-trip-safe UTC string.
             $actions.Add([pscustomobject]@{
                 Action='Move'; Kind='File'; Source=$src; Destination=$dest; DestRoot=$destRoot
                 SizeBytes=[int64]$f.Length; Family=$famName; CopyIndex=$null
                 SourceBucket=$cx.Source; Reason=$reason; DifferentContent=$false
+                PlannedLength=[int64]$f.Length
+                PlannedLastWriteTimeUtc=([datetime]$f.LastWriteTime).ToUniversalTime().ToString('o')
                 OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
             })
             $actionFolderBySrc[$src] = $destFolder
@@ -362,6 +370,8 @@ function New-SysOrgPlan {
                         SizeBytes=[int64]$m.Length; Family=$null; CopyIndex=$null; SourceBucket=$null
                         Reason='Exact duplicate (Quarantine policy); keeper identified during scan'
                         Hash="$($dg.Hash)"; DifferentContent=$false
+                        PlannedLength=[int64]$m.Length
+                        PlannedLastWriteTimeUtc=([datetime]$m.LastWriteTime).ToUniversalTime().ToString('o')
                         OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
                     })
                     $copiesAudit.Quarantined++
@@ -644,11 +654,19 @@ function Save-SysOrgPlan {
         try{
             $rows = @('Source,SourceBucket,HostUrl,ReferrerUrl')
             foreach($p in @($Plan.Provenance)){
-                $rows += ('"{0}","{1}","{2}","{3}"' -f $p.Source, $p.SourceBucket, $p.HostUrl, $p.ReferrerUrl)
+                # v2.1.1: proper CSV escaping - untrusted URLs can contain quotes and commas
+                $rows += ((ConvertTo-SysOrgCsvField "$($p.Source)") + ',' + (ConvertTo-SysOrgCsvField "$($p.SourceBucket)") + ',' +
+                          (ConvertTo-SysOrgCsvField "$($p.HostUrl)") + ',' + (ConvertTo-SysOrgCsvField "$($p.ReferrerUrl)"))
             }
             $rows | Set-Content -LiteralPath $Plan.ProvenanceFile -Encoding UTF8
         } catch { Write-Warning "Provenance sidecar could not be written: $($_.Exception.Message)" }
     }
+    # v2.1.1: integrity hash over the canonical action list - the executor verifies it
+    # and refuses to run a plan whose actions were edited after the save.
+    if(-not $Plan.PSObject.Properties['IntegrityHash']){
+        [void]($Plan | Add-Member -NotePropertyName IntegrityHash -NotePropertyValue '')
+    }
+    $Plan.IntegrityHash = Get-SysOrgPlanIntegrityHash -Actions $Plan.Actions
     ($Plan | Select-Object -Property * -ExcludeProperty Provenance) | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
     return $path
 }
@@ -876,6 +894,13 @@ function Invoke-SysOrgPlan {
 .DESCRIPTION
     - Re-execution guard (P1-3): a plan with an existing undo journal is refused
       unless -Force is passed, in which case journaled sources are skipped (resume).
+    - v2.1.1 - EVERY action is re-validated at execution time (the plan file is untrusted
+      input): canonical path forms (no '..', no 8.3 short names, no \\?\ namespace),
+      exclusion and mutability re-checks against a fresh drive profile, destination
+      containment inside the plan root (or resolved known folders), reparse-point and
+      cloud-placeholder refusals, plan-time size/timestamp drift checks, PlanId format
+      validation and a SHA256 integrity hash over the action list. A failed validation is
+      recorded per action as Failed with a reason - the run is never thrown away wholesale.
     - Folder actions (Kind='Folder') use the folder primitive (copy -> verify -> remove).
     - Hash economy (P2-1): same-volume Move actions are not hashed; cross-volume
       and quarantine actions are, using the scan-time hash when available.
@@ -892,6 +917,27 @@ function Invoke-SysOrgPlan {
     try { $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json }
     catch { throw "Plan file could not be read: $($_.Exception.Message)" }
 
+    # v2.1.1: the PlanId is used in the journal path - reject anything that is not the
+    # documented format (blocks journal-name injection like 'plan-..\\evil').
+    if("$($plan.PlanId)" -notmatch $script:PlanIdPattern){
+        throw ("Plan id '{0}' is not valid (expected plan-<yyyyMMdd>-<HHmmss>[-<ms>] or migrate-...); refusing to execute." -f $plan.PlanId)
+    }
+
+    # v2.1.1: plan integrity - Save-SysOrgPlan stores a SHA256 over the canonical action
+    # list. A mismatch means the plan was edited (or corrupted) after the save: refuse
+    # loudly, or continue with -Force and a warning. Old plans without the hash are allowed.
+    if($plan.PSObject.Properties['IntegrityHash'] -and "$($plan.IntegrityHash)"){
+        $expected = "$($plan.IntegrityHash)"
+        $actual = Get-SysOrgPlanIntegrityHash -Actions $plan.Actions
+        if($actual -ne $expected){
+            if(-not $Force){
+                throw ("Plan integrity check FAILED: the actions in '{0}' do not match the hash stored at save time (edited or corrupted plan). Pass -Force to run it anyway." -f $PlanPath)
+            }
+            Write-Warning ("PLAN INTEGRITY MISMATCH: the actions in '{0}' were modified after the plan was saved. Executing anyway because -Force was passed." -f $PlanPath)
+            Write-SysOrgLog ("PLAN INTEGRITY MISMATCH (executed with -Force): {0}" -f $PlanPath) -Level ERROR -LogFolder (Join-Path $AppRoot 'Logs')
+        }
+    }
+
     $logFolder  = Join-Path $AppRoot 'Logs'
     $undoFolder = Join-Path $AppRoot 'Undo'
     if(-not (Test-Path -LiteralPath $undoFolder)){ New-Item -ItemType Directory -Path $undoFolder -Force | Out-Null }
@@ -907,7 +953,59 @@ function Invoke-SysOrgPlan {
     }
 
     $summary = @{ Moved=0; Copied=0; FolderMoves=0; Numbered=0; Quarantined=0; CollisionDuplicate=0
-                  Resumed=0; Failed=0; BytesMoved=[int64]0 }
+                  Resumed=0; Failed=0; Skipped=0; BytesMoved=[int64]0 }
+
+    # ---- v2.1.1 executor-side re-validation -------------------------------------
+    # A fresh drive profile per source drive. On the supported Windows runtime this
+    # re-derives role/scope from the actual hardware; on hosts where no profile can be
+    # built (portable test hosts) the plan-time profile from the JSON is used, which is
+    # covered by the integrity hash, or a minimal default profile is synthesized.
+    $execProfiles = @{}
+    function Get-SysOrgExecutorProfile {
+        param([string]$Letter,$PlanObj)
+        # Key the profile off the plan's OWN drive letter: real plans carry the real letter,
+        # so the fresh profile re-derives the true role/scope on Windows. Falling back to the
+        # physical source-drive qualifier would misclassify test fixtures whose sources live
+        # on the system drive while the plan names a virtual drive.
+        $letter2 = "$($PlanObj.Drive)".TrimEnd(':').ToUpperInvariant()
+        if([string]::IsNullOrWhiteSpace($letter2)){ $letter2 = "$Letter".TrimEnd(':').ToUpperInvariant() }
+        if($execProfiles.ContainsKey($letter2)){ return $execProfiles[$letter2] }
+        $prof = $null
+        try {
+            $fresh = @(Get-SysOrgDriveProfile -Config $Config -Letters $letter2)
+            if($fresh.Count -gt 0){ $prof = $fresh[0] }
+        } catch { Write-Verbose "Fresh drive profile unavailable for $letter2`: $($_.Exception.Message)" }
+        if(-not $prof){
+            if($PlanObj.PSObject.Properties['DriveProfile'] -and $PlanObj.DriveProfile -and
+               ("$($PlanObj.DriveProfile.Letter)" -ieq $letter2)){
+                # NOTE: scalar counters would be rebound in the child scope (classic PowerShell
+                # trap), so the warn-once flag lives in the $execProfiles hashtable.
+                if(-not $execProfiles.ContainsKey('__warnedPlanProfile')){
+                    Write-Warning "No fresh drive profile could be built for $letter2`: using the plan-time profile from the plan file (covered by the plan integrity hash)."
+                    $execProfiles['__warnedPlanProfile'] = $true
+                }
+                $prof = $PlanObj.DriveProfile
+            } else {
+                $sysLetter = 'C'
+                try { if($env:SystemDrive){ $sysLetter = $env:SystemDrive.TrimEnd(':').ToUpperInvariant() } } catch { }
+                $role = if($letter2 -ieq $sysLetter){ 'System' } else { 'Data' }
+                $prof = [pscustomobject]@{ Letter=$letter2; Root=("{0}:\" -f $letter2); Role=$role; ProposedScope='FullDrive'
+                                           KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+            }
+        }
+        $execProfiles[$letter2] = $prof
+        return $prof
+    }
+    # Old plans predate the plan-time size/timestamp snapshot: warn once, skip drift checks.
+    $driftCapable = $false
+    foreach($probe in @($plan.Actions)){
+        if($probe.PSObject.Properties['PlannedLastWriteTimeUtc'] -and "$($probe.PlannedLastWriteTimeUtc)"){ $driftCapable = $true; break }
+    }
+    if((-not $driftCapable) -and @($plan.Actions).Count -gt 0){
+        Write-Warning 'This plan predates v2.1.1 (no plan-time size/timestamp snapshot); the changed-since-plan drift check is not available for it.'
+    }
+    # -----------------------------------------------------------------------------
+
 
     # P1-1: journal is appended and flushed after EVERY row, not written once at the end
     $journalExists = Test-Path -LiteralPath $undoPath
@@ -935,22 +1033,89 @@ function Invoke-SysOrgPlan {
 
             $kind = 'File'
             if($a.PSObject.Properties['Kind'] -and "$($a.Kind)"){ $kind = "$($a.Kind)" }
+            $isContainerAction = ($kind -eq 'Folder')
+
+            # ---- v2.1.1: re-validate this action before anything moves. A failed
+            # validation is recorded as Failed with a reason - never thrown wholesale.
+            $refuse = $null
+            $canonSrc = Get-SysOrgCanonicalPlanPath -Path "$($a.Source)"
+            $canonDst = Get-SysOrgCanonicalPlanPath -Path "$($a.Destination)"
+            if($canonSrc.Error){ $refuse = 'Unsafe source path: ' + $canonSrc.Error }
+            elseif($canonDst.Error){ $refuse = 'Unsafe destination path: ' + $canonDst.Error }
+            if(-not $refuse){
+                if(Test-SysOrgExcludedPath -Path (Split-Path $canonSrc.Path -Parent) -Config $Config){
+                    $refuse = 'Source is in a protected/excluded location'
+                } elseif(Test-Path -LiteralPath $canonSrc.Path){
+                    if(Test-SysOrgReparsePoint -Path $canonSrc.Path){
+                        $refuse = 'Source is a reparse point (junction/symlink)'
+                    } elseif(Test-SysOrgCloudPlaceholderAttributes -Attributes ([int](Get-Item -LiteralPath $canonSrc.Path -Force).Attributes)){
+                        $refuse = 'Source is a cloud placeholder; opening it would hydrate the cloud library'
+                    }
+                }
+            }
+            if(-not $refuse){
+                $srcQual = Split-Path $canonSrc.Path -Qualifier -ErrorAction SilentlyContinue
+                $prof2 = Get-SysOrgExecutorProfile -Letter ("$srcQual".TrimEnd(':')) -PlanObj $plan
+                if($isContainerAction){
+                    $mut = Test-SysOrgFileMutable -Path $canonSrc.Path -Extension '' -DriveProfile $prof2 -Config $Config -Container
+                } else {
+                    $ext2 = [System.IO.Path]::GetExtension($canonSrc.Path).ToLowerInvariant()
+                    $mut = Test-SysOrgFileMutable -Path $canonSrc.Path -Extension $ext2 -DriveProfile $prof2 -Config $Config
+                }
+                if(-not $mut.Allowed){ $refuse = 'Mutability denied at execution time: ' + $mut.Reason }
+            }
+            if(-not $refuse){
+                $destCheck = Test-SysOrgPlanDestinationAllowed -Destination $canonDst.Path -Plan $plan -Config $Config
+                if(-not $destCheck.Allowed){ $refuse = 'Unsafe destination: ' + $destCheck.Reason }
+            }
+            if(-not $refuse -and (-not $isContainerAction) -and $driftCapable -and (Test-Path -LiteralPath $canonSrc.Path)){
+                $fiNow = Get-Item -LiteralPath $canonSrc.Path -Force
+                if($a.PSObject.Properties['PlannedLength'] -and ($null -ne $a.PlannedLength) -and ([int64]$fiNow.Length -ne [int64]$a.PlannedLength)){
+                    $summary.Skipped++
+                    Write-SysOrgLog "Skipped (changed since plan - size differs): $($a.Source)" -Level WARN -LogFolder $logFolder
+                    continue
+                }
+                if($a.PSObject.Properties['PlannedLastWriteTimeUtc'] -and "$($a.PlannedLastWriteTimeUtc)"){
+                    try{
+                        # After the JSON round trip this may arrive as a [datetime]
+                        # (ConvertFrom-Json parses ISO strings) or as the stored string.
+                        $pv = $a.PlannedLastWriteTimeUtc
+                        $plannedUtc = $null
+                        if($pv -is [datetime]){ $plannedUtc = $pv.ToUniversalTime() }
+                        else { $plannedUtc = [datetime]::Parse("$pv", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
+                        $deltaSec = [Math]::Abs(($fiNow.LastWriteTimeUtc - $plannedUtc).TotalSeconds)
+                        if($deltaSec -gt 2){
+                            $summary.Skipped++
+                            Write-SysOrgLog "Skipped (changed since plan - last write time differs): $($a.Source)" -Level WARN -LogFolder $logFolder
+                            continue
+                        }
+                    } catch { Write-Verbose "Drift check parse failed for '$($a.PlannedLastWriteTimeUtc)': $($_.Exception.Message)" }
+                }
+            }
+            if($refuse){
+                $summary.Failed++
+                Write-SysOrgLog ("REFUSED ({0}): {1} -> {2}" -f $refuse, $a.Source, $a.Destination) -Level ERROR -LogFolder $logFolder
+                continue
+            }
+            # validation passed: use the CANONICAL paths for the move, the logs and the journal
+            $aSource = $canonSrc.Path
+            $aDestination = $canonDst.Path
 
             # P2-1: hash only when the journal needs it (quarantine or cross-volume files);
             # reuse the scan-time hash when present. Folder moves are count/byte verified.
             $needsHash = ($kind -eq 'File') -and
                          (("$($a.Action)" -eq 'Quarantine') -or
-                          ((Split-Path $a.Source -Qualifier -ErrorAction SilentlyContinue) -ine (Split-Path $a.Destination -Qualifier -ErrorAction SilentlyContinue)))
+                          ((Split-Path $aSource -Qualifier -ErrorAction SilentlyContinue) -ine (Split-Path $aDestination -Qualifier -ErrorAction SilentlyContinue)))
             $hashBefore = $null
             if($needsHash){
                 if($a.PSObject.Properties['Hash'] -and $a.Hash){ $hashBefore = $a.Hash }
-                else { $hashBefore = Get-SysOrgFileHash -Path $a.Source }
+                else { $hashBefore = Get-SysOrgFileHash -Path $aSource }
             }
 
             if($kind -eq 'Folder'){
-                $result = Invoke-SysOrgSafeMoveFolder -Source $a.Source -Destination $a.Destination -Config $Config
+                $result = Invoke-SysOrgSafeMoveFolder -Source $aSource -Destination $aDestination -Config $Config
             } else {
-                $result = Invoke-SysOrgSafeMove -Source $a.Source -Destination $a.Destination -Config $Config
+                $result = Invoke-SysOrgSafeMove -Source $aSource -Destination $aDestination -Config $Config
             }
 
             switch($result.Status){
@@ -971,26 +1136,36 @@ function Invoke-SysOrgPlan {
                     }
                     # P0-fix: format into a variable FIRST, then write (the -f operator binds
                     # only to its immediate next expression inside a method-call argument list).
-                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}","{6}"' -f (Get-Date -Format s), $plan.PlanId, $kind, $a.Action, $a.Source, $result.Destination, $hashBefore
+                    # v2.1.1: fields are CSV-escaped and the journal stores the CANONICAL source.
+                    $journalLine = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
+                                   (ConvertTo-SysOrgCsvField $kind) + ',' + (ConvertTo-SysOrgCsvField "$($a.Action)") + ',' +
+                                   (ConvertTo-SysOrgCsvField $aSource) + ',' + (ConvertTo-SysOrgCsvField "$($result.Destination)") + ',' +
+                                   (ConvertTo-SysOrgCsvField "$hashBefore")
                     $writer.WriteLine($journalLine)
                 }
                 'CopiedVerified' {
                     if($kind -eq 'Folder'){ $summary.FolderMoves++ } else { $summary.Copied++ }
-                    $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}","{6}"' -f (Get-Date -Format s), $plan.PlanId, $kind, $a.Action, $a.Source, $result.Destination, $hashBefore
+                    $journalLine = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
+                                   (ConvertTo-SysOrgCsvField $kind) + ',' + (ConvertTo-SysOrgCsvField "$($a.Action)") + ',' +
+                                   (ConvertTo-SysOrgCsvField $aSource) + ',' + (ConvertTo-SysOrgCsvField "$($result.Destination)") + ',' +
+                                   (ConvertTo-SysOrgCsvField "$hashBefore")
                     $writer.WriteLine($journalLine)
                     Write-SysOrgLog "Copied+verified: $($a.Source) -> $($result.Destination) ($($result.Message))" -Level WARN -LogFolder $logFolder
                 }
                 'CollisionDuplicate' {
                     $summary.CollisionDuplicate++
-                    $letter = (Split-Path $a.Source -Qualifier).TrimEnd(':')
+                    $letter = (Split-Path $aSource -Qualifier).TrimEnd(':')
                     $qFolderName = Get-SysOrgSetting $Config 'Copies.QuarantineFolderName' $null
                     if(-not $qFolderName){ $qFolderName = Get-SysOrgSetting $Config 'Duplicates.QuarantineFolderName' '_Duplicates' }
                     $qRoot = Join-Path (Get-SysOrgDestinationRoot -Letter $letter -Config $Config) "$qFolderName"
                     $qRoot = Join-Path $qRoot ('manual-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-                    $r2 = Invoke-SysOrgSafeMove -Source $a.Source -Destination (Join-Path $qRoot (Split-Path $a.Source -Leaf)) -Config $Config
+                    $r2 = Invoke-SysOrgSafeMove -Source $aSource -Destination (Join-Path $qRoot (Split-Path $aSource -Leaf)) -Config $Config
                     if(($r2.Status -eq 'Moved') -or ($r2.Status -eq 'CopiedVerified')){
                         $summary.Quarantined++
-                        $journalLine = '"{0}","{1}","{2}","{3}","{4}","{5}","{6}"' -f (Get-Date -Format s), $plan.PlanId, 'File', 'Quarantine', $a.Source, $r2.Destination, $hashBefore
+                        $journalLine = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
+                                       (ConvertTo-SysOrgCsvField 'File') + ',' + (ConvertTo-SysOrgCsvField 'Quarantine') + ',' +
+                                       (ConvertTo-SysOrgCsvField $aSource) + ',' + (ConvertTo-SysOrgCsvField "$($r2.Destination)") + ',' +
+                                       (ConvertTo-SysOrgCsvField "$hashBefore")
                         $writer.WriteLine($journalLine)
                         Write-SysOrgLog "Collision duplicate quarantined: $($a.Source) -> $($r2.Destination)" -Level ACTION -LogFolder $logFolder
                     } else {
@@ -1009,8 +1184,8 @@ function Invoke-SysOrgPlan {
     }
 
     Write-Progress -Activity 'Executing plan' -Completed
-    Write-SysOrgLog ("Plan {0} finished. Moved={1} Copied={2} Folders={3} Numbered={4} Quarantined={5} Resumed={6} Failed={7}" -f `
-        $plan.PlanId, $summary.Moved, $summary.Copied, $summary.FolderMoves, $summary.Numbered, $summary.Quarantined, $summary.Resumed, $summary.Failed) -LogFolder $logFolder
+    Write-SysOrgLog ("Plan {0} finished. Moved={1} Copied={2} Folders={3} Numbered={4} Quarantined={5} Resumed={6} Failed={7} Skipped={8}" -f `
+        $plan.PlanId, $summary.Moved, $summary.Copied, $summary.FolderMoves, $summary.Numbered, $summary.Quarantined, $summary.Resumed, $summary.Failed, $summary.Skipped) -LogFolder $logFolder
     return [pscustomobject]@{ PlanId=$plan.PlanId; UndoFile=$undoPath; Summary=$summary }
 }
 
@@ -1026,10 +1201,17 @@ function Undo-SysOrgPlan {
     the folder primitive. Numbered copies restore their ORIGINAL names because the
     journal's OriginalSource column carries the pre-move path. Restores into occupied
     slots get unique ' (2)' suffixed paths.
+    v2.1.1: the journal is UNTRUSTED INPUT. The PlanId is validated (it indexes the
+    journal path) and every row's CurrentLocation and OriginalSource are canonicalized
+    and re-checked (exclusion, reparse point, cloud placeholder) BEFORE anything moves,
+    so a tampered journal cannot move arbitrary files.
 .EXAMPLE
     Undo-SysOrgPlan -PlanId plan-20260101-093000 -AppRoot C:\SysOrg -Config $cfg
 #>
     param([Parameter(Mandatory)][string]$PlanId,[Parameter(Mandatory)][string]$AppRoot,$Config)
+    if("$PlanId" -notmatch $script:PlanIdPattern){
+        throw ("Plan id '{0}' is not valid (expected plan-<yyyyMMdd>-<HHmmss>[-<ms>] or migrate-...); refusing to touch a journal." -f $PlanId)
+    }
     $undoPath = Join-Path (Join-Path $AppRoot 'Undo') ('undo-{0}.csv' -f $PlanId)
     if(-not (Test-Path -LiteralPath $undoPath)){ throw "No undo journal found for plan '$PlanId'." }
     $logFolder = Join-Path $AppRoot 'Logs'
@@ -1040,6 +1222,40 @@ function Undo-SysOrgPlan {
         $row = $rows[$i]
         $current  = $row.CurrentLocation
         $original = $row.OriginalSource
+        # v2.1.1: tampered-journal protection - both endpoints must be canonical and
+        # must not sit in protected locations. A refused row is counted as Failed.
+        $canonCur = Get-SysOrgCanonicalPlanPath -Path "$current"
+        $canonOrig = Get-SysOrgCanonicalPlanPath -Path "$original"
+        if($canonCur.Error -or $canonOrig.Error){
+            $failed++
+            Write-SysOrgLog ("Undo REFUSED (unsafe journal row: {0} / {1}): {2} -> {3}" -f $canonCur.Error, $canonOrig.Error, $current, $original) -Level ERROR -LogFolder $logFolder
+            continue
+        }
+        $current = $canonCur.Path
+        $original = $canonOrig.Path
+        if(Test-SysOrgExcludedPath -Path $current -Config $Config){
+            $failed++
+            Write-SysOrgLog "Undo REFUSED (CurrentLocation is a protected/excluded path): $current" -Level ERROR -LogFolder $logFolder
+            continue
+        }
+        if(Test-SysOrgExcludedPath -Path $original -Config $Config){
+            $failed++
+            Write-SysOrgLog "Undo REFUSED (restore target is a protected/excluded path): $original" -Level ERROR -LogFolder $logFolder
+            continue
+        }
+        if(Test-Path -LiteralPath $current){
+            if(Test-SysOrgReparsePoint -Path $current){
+                $failed++
+                Write-SysOrgLog "Undo REFUSED (CurrentLocation is a reparse point): $current" -Level ERROR -LogFolder $logFolder
+                continue
+            }
+            if(-not (Test-Path -LiteralPath $current -PathType Container) -and
+               (Test-SysOrgCloudPlaceholderAttributes -Attributes ([int](Get-Item -LiteralPath $current -Force).Attributes))){
+                $failed++
+                Write-SysOrgLog "Undo REFUSED (CurrentLocation is a cloud placeholder): $current" -Level ERROR -LogFolder $logFolder
+                continue
+            }
+        }
         if(-not (Test-Path -LiteralPath $current)){ $skippedMissing++; Write-SysOrgLog "Undo skip (missing): $current" -Level WARN -LogFolder $logFolder; continue }
         # P1-4: verify content has not changed since the move (file rows only)
         if($row.ContentHash -and (-not (Test-Path -LiteralPath $current -PathType Container))){

@@ -843,6 +843,21 @@ function New-SysOrgAppFolders {
     return ,$map
 }
 
+function ConvertTo-SysOrgCsvField {
+<#
+.SYNOPSIS
+    Escapes a single CSV field (v2.1.1): wraps in quotes and doubles embedded quotes.
+.DESCRIPTION
+    Replaces hand-formatted CSV lines for untrusted values (download URLs, file names with
+    commas or quotes). The output is Import-Csv-compatible and keeps the journal column
+    layout backward compatible with pre-2.1.1 files.
+.EXAMPLE
+    ConvertTo-SysOrgCsvField 'https://x.test/a,"b'   # -> '"https://x.test/a,""b"'
+#>
+    param([AllowEmptyString()][string]$Value)
+    return ('"' + ($Value -replace '"','""') + '"')
+}
+
 function Test-SysOrgElevated {
 <#
 .SYNOPSIS
@@ -852,6 +867,183 @@ function Test-SysOrgElevated {
 #>
     $id=[Security.Principal.WindowsIdentity]::GetCurrent()
     return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-SysOrgCloudPlaceholderAttributes {
+<#
+.SYNOPSIS
+    True when raw file attributes mark a cloud placeholder (OneDrive files-on-demand).
+.DESCRIPTION
+    Checks Offline (0x1000) and RecallOnDataAccess (0x400000) on the raw integer so
+    it behaves identically on Windows PowerShell 5.1 and PowerShell 7 - the
+    .NET Framework FileAttributes enum has no RecallOnDataAccess member, and
+    casting the value would throw. Hashing or opening such a file would silently
+    hydrate the whole cloud library, so the scanner must skip it. Lives in Core so
+    the plan executor can use it without importing the Scan module.
+.EXAMPLE
+    Test-SysOrgCloudPlaceholderAttributes -Attributes 0x400020   # -> True
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$Attributes)
+    return ((($Attributes -band 0x1000) -ne 0) -or (($Attributes -band 0x400000) -ne 0))
+}
+
+function Get-SysOrgCanonicalPlanPath {
+<#
+.SYNOPSIS
+    Canonicalizes a plan/journal path and rejects unsafe forms (v2.1.1, audit High #1).
+.DESCRIPTION
+    A plan or undo journal is UNTRUSTED INPUT. Before any path is used for a move it must
+    pass through this function. It canonicalizes with [IO.Path]::GetFullPath and rejects:
+      - empty / not absolute paths
+      - the \\?\ device namespace (GetFullPath would not normalize it, and it is how
+        exclusion rules are bypassed)
+      - any '..' segment (rejected BEFORE normalization so 'C:\x\..\Windows' is refused
+        instead of silently resolving to a different location than the exclusion check saw)
+      - any '..' segment that survives normalization (defense in depth)
+      - 8.3 short-name segments ('REPORT~1'), which defeat exclusion prefix matching
+    Returns [pscustomobject]@{ Path=<canonical>; Error=<'' or reason> }.
+.EXAMPLE
+    $c = Get-SysOrgCanonicalPlanPath -Path 'C:\Users\t\..\Windows\evil.txt'
+    $c.Error   # -> a reason; the executor records the action as Failed
+#>
+    param([AllowEmptyString()][string]$Path)
+    $err = ''
+    $canon = $null
+    if([string]::IsNullOrWhiteSpace($Path)){
+        return [pscustomobject]@{ Path=''; Error='path is empty' }
+    }
+    if($Path -like '\\?\*'){
+        return [pscustomobject]@{ Path=''; Error='device namespace path (\\?\ prefix) is not allowed' }
+    }
+    # Split on BOTH separators: on Windows '\' is the separator, on the portable test
+    # hosts '/' is, and plan strings always use '\'. A '..' segment in either form is refused.
+    foreach($seg in ($Path -split '[\\/]')){
+        if($seg -eq '..'){ return [pscustomobject]@{ Path=''; Error="parent-relative '..' segment is not allowed" } }
+        if($seg -match '~\d'){ return [pscustomobject]@{ Path=''; Error="8.3 short-name segment ('$seg') is not allowed" } }
+    }
+    if(-not [System.IO.Path]::IsPathRooted($Path)){
+        return [pscustomobject]@{ Path=''; Error='path is not absolute' }
+    }
+    try{
+        $canon = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        return [pscustomobject]@{ Path=''; Error=('path could not be canonicalized: ' + $_.Exception.Message) }
+    }
+    foreach($seg in ($canon -split '[\\/]')){
+        if($seg -eq '..'){ return [pscustomobject]@{ Path=''; Error="parent-relative '..' survived normalization" } }
+    }
+    return [pscustomobject]@{ Path=$canon; Error=$err }
+}
+
+function Test-SysOrgReparsePoint {
+<#
+.SYNOPSIS
+    True when the file or folder itself is a reparse point (junction, symlink, OneDrive link).
+.DESCRIPTION
+    Checked via the raw attributes (0x400 ReparsePoint) so it behaves identically on
+    Windows PowerShell 5.1 and PowerShell 7. On .NET Core hosts (PowerShell 7 on Linux)
+    symlinks do not carry the ReparsePoint attribute, so the LinkTarget property is
+    consulted as well when it exists.
+.EXAMPLE
+    Test-SysOrgReparsePoint -Path 'C:\Some\Junction'   # -> True
+#>
+    param([Parameter(Mandatory)][string]$Path)
+    try{
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if((([int]$item.Attributes) -band 0x400) -ne 0){ return $true }
+        if($item.PSObject.Properties['LinkTarget'] -and $item.LinkTarget){ return $true }
+    } catch { return $false }
+    return $false
+}
+
+function Test-SysOrgPlanDestinationAllowed {
+<#
+.SYNOPSIS
+    Checks that a plan action's destination is inside the area the plan was allowed to write.
+.DESCRIPTION
+    Executor-side re-validation (v2.1.1): the destination must be under the plan's
+    DestinationRoot, or - when DestinationStyle='KnownFolders' - under a resolved known
+    folder (freshly resolved, plus the plan's own profile folders, which are covered by
+    the plan integrity hash). Migration plans may only target under their own root.
+    Legacy plans without a DestinationRoot property cannot be containment-checked; they
+    are allowed and the executor warns.
+    Comparison is case-insensitive and separator-normalized for both platforms.
+.EXAMPLE
+    Test-SysOrgPlanDestinationAllowed -Destination 'C:\Windows\evil.txt' -Plan $plan -Config $cfg
+#>
+    param([Parameter(Mandatory)][string]$Destination,[Parameter(Mandatory)]$Plan,$Config)
+    $destN = ("$Destination").Replace('/','\').TrimEnd('\').ToLowerInvariant()
+    $roots = New-Object System.Collections.Generic.List[string]
+    $style = ''
+    if($Plan.PSObject.Properties['DestinationStyle']){ $style = "$($Plan.DestinationStyle)" }
+    $planRoot = $null
+    if($Plan.PSObject.Properties['DestinationRoot'] -and "$($Plan.DestinationRoot)"){
+        $planRoot = ("$($Plan.DestinationRoot)").Replace('/','\').TrimEnd('\')
+        [void]$roots.Add($planRoot.ToLowerInvariant())
+    }
+    if("$style" -eq 'KnownFolders'){
+        # Migration plans only ever target under their own root.
+        $isMigration = "$($Plan.PlanId)" -like 'migrate-*'
+        if(-not $isMigration){
+            try{
+                foreach($k in @(Get-SysOrgKnownFolders)){
+                    if($k.Path){ [void]$roots.Add((("$($k.Path)").Replace('/','\').TrimEnd('\')).ToLowerInvariant()) }
+                }
+            } catch { Write-Verbose "Known-folder containment check unavailable: $($_.Exception.Message)" }
+            if($Plan.PSObject.Properties['DriveProfile'] -and $Plan.DriveProfile){
+                foreach($k in @($Plan.DriveProfile.KnownFolders)){
+                    if($k.Path){ [void]$roots.Add((("$($k.Path)").Replace('/','\').TrimEnd('\')).ToLowerInvariant()) }
+                }
+            }
+        }
+    }
+    if($roots.Count -eq 0){
+        return [pscustomobject]@{ Allowed=$true; Legacy=$true; Reason='plan has no DestinationRoot; containment not verifiable' }
+    }
+    foreach($r in $roots){
+        if([string]::IsNullOrWhiteSpace($r)){ continue }
+        if($destN -eq $r -or $destN.StartsWith($r + '\',[StringComparison]::OrdinalIgnoreCase)){
+            return [pscustomobject]@{ Allowed=$true; Legacy=$false; Reason='' }
+        }
+    }
+    return [pscustomobject]@{ Allowed=$false; Legacy=$false; Reason=('destination is outside the plan root ({0})' -f $planRoot) }
+}
+
+function Get-SysOrgPlanIntegrityHash {
+<#
+.SYNOPSIS
+    SHA256 over the canonical serialization of a plan's action list (v2.1.1).
+.DESCRIPTION
+    Save-SysOrgPlan stores this hash in the plan JSON; Invoke-SysOrgPlan recomputes it from
+    the loaded actions and refuses to execute when they no longer match (hand-edited plans,
+    corrupted files). The serialization normalizes every action to 'Name=Value' pairs sorted
+    by property name, joined with ';' and newline separators, so the hash is stable across
+    the ConvertTo-Json/ConvertFrom-Json round trip and across PowerShell versions.
+.EXAMPLE
+    Get-SysOrgPlanIntegrityHash -Actions $plan.Actions
+#>
+    param([Parameter(Mandatory)]$Actions)
+    $all = @($Actions)
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach($a in $all){
+        if($null -eq $a){ continue }
+        # DateTime values are normalized to a round-trip-invariant string: ConvertFrom-Json
+        # parses ISO-8601-looking strings back into [datetime], so the canonical form must
+        # be stable across that conversion.
+        $props = @($a.PSObject.Properties | Sort-Object -Property Name)
+        [void]$lines.Add((@($props | ForEach-Object {
+            $v = $_.Value
+            if($v -is [datetime]){ '{0}={1}' -f $_.Name, $v.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) }
+            else { '{0}={1}' -f $_.Name, "$v" }
+        }) -join ';'))
+    }
+    $payload = ($lines -join "`n")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try{
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+    } finally { $sha.Dispose() }
 }
 
 Export-ModuleMember -Function *-SysOrg*

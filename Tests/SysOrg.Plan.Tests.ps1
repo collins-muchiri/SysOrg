@@ -45,7 +45,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'v1'
         $dest = Join-Path $TestDrive 'org2\Documents\2026\doc.txt'
-        $plan = [pscustomobject]@{ PlanId='plan-test-0002'
+        $plan = [pscustomobject]@{ PlanId='plan-20260101-093002'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dest; Reason='Category=Documents'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'plan2.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
@@ -56,7 +56,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
     }
     It '-Force resumes: journaled sources are skipped and the journal is preserved' {
         $planPath = Join-Path $TestDrive 'plan2.json'
-        $undoPath = Join-Path $TestDrive ('Undo\undo-plan-test-0002.csv')
+        $undoPath = Join-Path $TestDrive ('Undo\undo-plan-20260101-093002.csv')
         # @() : Import-Csv returns a SCALAR for a single data row, and PSCustomObject
         # has no intrinsic .Count on Windows PowerShell 5.1 (PS 7 does).
         @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 1
@@ -71,7 +71,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         Set-Content -LiteralPath $srcA -Value 'aa'; Set-Content -LiteralPath $srcB -Value 'bb'
         $dstA = Join-Path $TestDrive 'org3\Documents\2026\a.txt'
         $dstB = Join-Path $TestDrive 'org3\Documents\2026\b.txt'
-        $planId = 'plan-test-0003'
+        $planId = 'plan-20260101-093003'
         $plan = [pscustomobject]@{ PlanId=$planId
             Actions=@(
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='Category=Documents'; SizeBytes=2 },
@@ -101,7 +101,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
 
 Describe 'Undo content verification (P1-4)' {
     It 'skips restoring a file whose content changed since the move' {
-        $planId = 'plan-test-0004'
+        $planId = 'plan-20260101-093004'
         $current = Join-Path $TestDrive 'org4\Documents\2026\gone.txt'
         $original = Join-Path $TestDrive 'work4\gone.txt'
         New-Item -ItemType Directory -Path (Split-Path $current) -Force | Out-Null
@@ -238,5 +238,142 @@ Describe 'Plan construction' {
         $outSkip = @($plan.Skipped | Where-Object { $_.Source -eq $out.FullName })
         $outSkip[0].Reason | Should -Be 'Outside writable scope on system drive'
         $plan.Mutability.Allowed | Should -Be 1
+    }
+}
+
+Describe 'Executor re-validation (v2.1.1)' {
+    It 'refuses a hand-edited plan whose destination points outside the plan root' {
+        $src = Join-Path $TestDrive 'rv1\note.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v'
+        $plan = [pscustomobject]@{
+            PlanId = 'plan-20260101-093101'
+            DestinationRoot = (Join-Path $TestDrive 'rv1-org')
+            DestinationStyle = 'OrganizedRoot'
+            Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
+                Destination='C:\Windows\evil.txt'; Reason='Category=Documents'; SizeBytes=1 })
+        }
+        $planPath = Join-Path $TestDrive 'rv1.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        $cfgRv = @{ ExcludedPaths=@('C:\Windows'); ExcludedFilePatterns=@(); Move=@{ AllowCrossVolume=$true }
+                    Copies=@{ QuarantineFolderName='_Duplicates' }; FolderAudit=@{ Enabled=$false } }
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $cfgRv -AppRoot $TestDrive
+        $res.Summary.Failed | Should -Be 1
+        $res.Summary.Moved  | Should -Be 0
+        Test-Path -LiteralPath $src | Should -BeTrue   # nothing was touched
+    }
+    It 'refuses an action whose source path contains an ".." segment' {
+        $plan = [pscustomobject]@{
+            PlanId = 'plan-20260101-093102'
+            DestinationRoot = (Join-Path $TestDrive 'rv2-org')
+            Actions = @([pscustomobject]@{ Action='Move'; Kind='File'
+                Source=(Join-Path $TestDrive 'rv2\sub\..\target.txt')
+                Destination=(Join-Path (Join-Path $TestDrive 'rv2-org') 'target.txt'); Reason='test'; SizeBytes=1 })
+        }
+        $planPath = Join-Path $TestDrive 'rv2.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        $cfgRv2 = @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); Move=@{ AllowCrossVolume=$true }
+                     Copies=@{ QuarantineFolderName='_Duplicates' }; FolderAudit=@{ Enabled=$false } }
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $cfgRv2 -AppRoot $TestDrive
+        $res.Summary.Failed | Should -Be 1
+        $res.Summary.Moved  | Should -Be 0
+    }
+    It 'rejects an invalid PlanId before touching the journal' {
+        $plan = [pscustomobject]@{
+            PlanId = 'plan-..-evil'
+            Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\x\a.txt'; Destination='C:\y\a.txt'; Reason='test' })
+        }
+        $planPath = Join-Path $TestDrive 'rv3.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        { Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive } | Should -Throw '*not valid*'
+        { Undo-SysOrgPlan -PlanId 'plan-../evil' -AppRoot $TestDrive -Config $planCfg } | Should -Throw '*not valid*'
+    }
+    It 'skips an action whose source changed after planning and counts it as Skipped' {
+        $src = Join-Path $TestDrive 'rv4\doc.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v1'
+        $plan = [pscustomobject]@{
+            PlanId = 'plan-20260101-093104'
+            DestinationRoot = (Join-Path $TestDrive 'rv4-org')
+            DestinationStyle = 'OrganizedRoot'
+            Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
+                Destination=(Join-Path (Join-Path $TestDrive 'rv4-org') 'Documents\doc.txt')
+                Reason='Category=Documents'; SizeBytes=2
+                PlannedLength=99999
+                PlannedLastWriteTimeUtc='2020-01-01T00:00:00.0000000Z' })
+        }
+        $planPath = Join-Path $TestDrive 'rv4.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive
+        $res.Summary.Skipped | Should -Be 1
+        $res.Summary.Moved   | Should -Be 0
+        Test-Path -LiteralPath $src | Should -BeTrue
+    }
+    It 'accepts an action whose planned size and timestamp still match the file' {
+        $src = Join-Path $TestDrive 'rv5\doc.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v1'
+        $fi = Get-Item -LiteralPath $src
+        $plan = [pscustomobject]@{
+            PlanId = 'plan-20260101-093105'
+            DestinationRoot = (Join-Path $TestDrive 'rv5-org')
+            DestinationStyle = 'OrganizedRoot'
+            Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
+                Destination=(Join-Path (Join-Path $TestDrive 'rv5-org') 'Documents\doc.txt')
+                Reason='Category=Documents'; SizeBytes=2
+                PlannedLength=[int64]$fi.Length
+                PlannedLastWriteTimeUtc=$fi.LastWriteTimeUtc.ToString('o') })
+        }
+        $planPath = Join-Path $TestDrive 'rv5.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive
+        $res.Summary.Moved   | Should -Be 1
+        $res.Summary.Skipped | Should -Be 0
+    }
+    It 'refuses a tampered journal row that points into a protected path' {
+        $planId = 'plan-20260101-093106'
+        $current = Join-Path $TestDrive 'rv6\innocent.txt'
+        New-Item -ItemType Directory -Path (Split-Path $current) -Force | Out-Null
+        Set-Content -LiteralPath $current -Value 'keep me'
+        New-Item -ItemType Directory -Path (Join-Path $TestDrive 'Undo') -Force | Out-Null
+        $undoPath = Join-Path $TestDrive ('Undo\undo-' + $planId + '.csv')
+        Set-Content -LiteralPath $undoPath -Value @(
+            'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash',
+            ('"2026-01-01T00:00:00","{0}","File","Move","C:\Windows\evil.txt","{1}",""' -f $planId, $current)
+        ) -Encoding UTF8
+        $cfgTam = @{ ExcludedPaths=@('C:\Windows'); ExcludedFilePatterns=@(); Move=@{ AllowCrossVolume=$true } }
+        $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $cfgTam
+        $u.Failed   | Should -Be 1
+        $u.Restored | Should -Be 0
+        Test-Path -LiteralPath $current | Should -BeTrue        # untouched
+        Test-Path -LiteralPath 'C:\Windows\evil.txt' -ErrorAction SilentlyContinue | Should -BeFalse
+    }
+    It 'verifies the plan integrity hash: tampering refuses without -Force, executes with -Force' {
+        $src = Join-Path $TestDrive 'rv7\doc.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v1'
+        $plan = [pscustomobject]@{
+            PlanId = 'plan-20260101-093107'
+            DestinationRoot = (Join-Path $TestDrive 'rv7-org')
+            DestinationStyle = 'OrganizedRoot'
+            Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
+                Destination=(Join-Path (Join-Path $TestDrive 'rv7-org') 'Documents\doc.txt')
+                Reason='Category=Documents'; SizeBytes=[int64](Get-Item -LiteralPath $src).Length
+                PlannedLength=[int64](Get-Item -LiteralPath $src).Length
+                PlannedLastWriteTimeUtc=(Get-Item -LiteralPath $src).LastWriteTimeUtc.ToString('o') })
+        }
+        $plansFolder = Join-Path $TestDrive 'rv7-plans'
+        $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $plansFolder
+        # sanity: the saved plan carries the integrity hash
+        $saved = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+        $saved.IntegrityHash | Should -Not -BeNullOrEmpty
+        # tamper with the destination, keep everything else
+        $saved.Actions[0].Destination = (Join-Path (Join-Path $TestDrive 'rv7-org') 'Documents\doc-renamed.txt')
+        $tamperedPath = Join-Path $TestDrive 'rv7-tampered.json'
+        $saved | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tamperedPath
+        { Invoke-SysOrgPlan -PlanPath $tamperedPath -Config $planCfg -AppRoot $TestDrive } | Should -Throw '*integrity*'
+        $res = Invoke-SysOrgPlan -PlanPath $tamperedPath -Config $planCfg -AppRoot $TestDrive -Force
+        $res.Summary.Moved | Should -Be 1
+        Test-Path -LiteralPath (Join-Path (Join-Path $TestDrive 'rv7-org') 'Documents\doc-renamed.txt') | Should -BeTrue
     }
 }
