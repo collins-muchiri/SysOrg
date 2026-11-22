@@ -60,11 +60,12 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         $undoPath = Join-Path $TestDrive ('Undo\undo-plan-20260101-093002.csv')
         # @() : Import-Csv returns a SCALAR for a single data row, and PSCustomObject
         # has no intrinsic .Count on Windows PowerShell 5.1 (PS 7 does).
-        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 1
+        # v2.1.1: one action = one Pending row + one Done row.
+        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 2
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive -Force
         $res.Summary.Resumed | Should -Be 1
         $res.Summary.Moved   | Should -Be 0
-        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 1   # journal unchanged, no duplicate header
+        @(Import-Csv -LiteralPath $undoPath).Count | Should -Be 2   # journal unchanged, no duplicate header
     }
     It 'resume after a simulated crash: pre-seeded journal skips that source and completes the rest' {
         $srcA = Join-Path $TestDrive 'work3\a.txt'; $srcB = Join-Path $TestDrive 'work3\b.txt'
@@ -518,5 +519,167 @@ Describe 'Scheduled report hardening (v2.1.1)' {
         $file = New-SysOrgScanReport -Letter S -Config $cfg8 -AppRoot $appRoot -ScanRoots @($scanR)
         $file | Should -BeNullOrEmpty
         Test-Path -LiteralPath (Join-Path $appRoot 'Reports') | Should -BeFalse   # nothing was written
+    }
+}
+
+Describe 'Journal durability and undo lifecycle (v2.1.1)' {
+    It 'writes a Pending row before the move and a Done row after' {
+        $src = Join-Path $TestDrive 'jr1\doc.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v'
+        $planId = 'plan-20260101-094001'
+        $plan = [pscustomobject]@{ PlanId=$planId
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=(Join-Path $TestDrive 'jr1-org\Documents\2026\doc.txt'); Reason='test'; SizeBytes=2 }) }
+        $planPath = Join-Path $TestDrive 'jr1.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive
+        $res.Summary.Moved | Should -Be 1
+        $rows = @(Import-Csv -LiteralPath $res.UndoFile)
+        $rows.Count | Should -Be 2
+        $rows[0].Status | Should -Be 'Pending'
+        $rows[1].Status | Should -Be 'Done'
+        $rows[1].CurrentLocation | Should -Not -BeNullOrEmpty
+        $rows[1].OriginalSource  | Should -Be $src
+    }
+    It 'an orphaned Pending row whose source is gone is resolved as done on resume' {
+        $planId = 'plan-20260101-094002'
+        $srcA = Join-Path $TestDrive 'jr2\a.txt'
+        $srcB = Join-Path $TestDrive 'jr2\b.txt'
+        New-Item -ItemType Directory -Path (Split-Path $srcA) -Force | Out-Null
+        Set-Content -LiteralPath $srcA -Value 'aa'; Set-Content -LiteralPath $srcB -Value 'bb'
+        $dstA = Join-Path $TestDrive 'jr2-org\Documents\2026\a.txt'
+        $dstB = Join-Path $TestDrive 'jr2-org\Documents\2026\b.txt'
+        $plan = [pscustomobject]@{ PlanId=$planId
+            Actions=@(
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='test'; SizeBytes=2 },
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcB; Destination=$dstB; Reason='test'; SizeBytes=2 }) }
+        $planPath = Join-Path $TestDrive 'jr2.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        # simulate a crash: A was moved, only its Pending row exists (no Done row)
+        New-Item -ItemType Directory -Path (Split-Path $dstA) -Force | Out-Null
+        Move-Item -LiteralPath $srcA -Destination $dstA
+        New-Item -ItemType Directory -Path (Join-Path $TestDrive 'Undo') -Force | Out-Null
+        $undoPath = Join-Path $TestDrive ('Undo\undo-' + $planId + '.csv')
+        Set-Content -LiteralPath $undoPath -Value @(
+            'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash,Status',
+            ('"2026-01-01T00:00:00","{0}","File","Move","{1}","{2}","","Pending"' -f $planId, $srcA, $dstA)
+        ) -Encoding UTF8
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive -Force
+        $res.Summary.Resumed | Should -Be 1      # the orphan resolved as done
+        $res.Summary.Moved   | Should -Be 1      # B executed normally
+        $rows = @(Import-Csv -LiteralPath $undoPath)
+        @($rows | Where-Object { $_.OriginalSource -eq $srcA -and $_.Status -eq 'Done' }).Count | Should -Be 1
+        $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $planCfg
+        $u.Restored | Should -Be 2               # both rows are undoable
+    }
+    It 'an orphaned Pending row whose source still exists is retried' {
+        $planId = 'plan-20260101-094003'
+        $src = Join-Path $TestDrive 'jr3\a.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'aa'
+        $dst = Join-Path $TestDrive 'jr3-org\Documents\2026\a.txt'
+        $plan = [pscustomobject]@{ PlanId=$planId
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dst; Reason='test'; SizeBytes=2 }) }
+        $planPath = Join-Path $TestDrive 'jr3.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        New-Item -ItemType Directory -Path (Join-Path $TestDrive 'Undo') -Force | Out-Null
+        $undoPath = Join-Path $TestDrive ('Undo\undo-' + $planId + '.csv')
+        Set-Content -LiteralPath $undoPath -Value @(
+            'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash,Status',
+            ('"2026-01-01T00:00:00","{0}","File","Move","{1}","","","Pending"' -f $planId, $src)
+        ) -Encoding UTF8
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive -Force
+        $res.Summary.Resumed | Should -Be 0      # NOT treated as done
+        $res.Summary.Moved   | Should -Be 1      # retried and completed
+        $rows = @(Import-Csv -LiteralPath $undoPath)
+        @($rows | Where-Object { $_.Status -eq 'Retried' }).Count | Should -Be 1
+        @($rows | Where-Object { $_.Status -eq 'Done' }).Count | Should -Be 1
+    }
+    It 'a legacy 7-column journal still resumes and undoes (no Status column appended)' {
+        $planId = 'plan-20260101-094004'
+        $srcA = Join-Path $TestDrive 'jr4\a.txt'
+        $srcB = Join-Path $TestDrive 'jr4\b.txt'
+        New-Item -ItemType Directory -Path (Split-Path $srcA) -Force | Out-Null
+        Set-Content -LiteralPath $srcA -Value 'aa'; Set-Content -LiteralPath $srcB -Value 'bb'
+        $dstA = Join-Path $TestDrive 'jr4-org\Documents\2026\a.txt'
+        $dstB = Join-Path $TestDrive 'jr4-org\Documents\2026\b.txt'
+        $plan = [pscustomobject]@{ PlanId=$planId
+            Actions=@(
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='test'; SizeBytes=2 },
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcB; Destination=$dstB; Reason='test'; SizeBytes=2 }) }
+        $planPath = Join-Path $TestDrive 'jr4.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        New-Item -ItemType Directory -Path (Split-Path $dstA) -Force | Out-Null
+        Move-Item -LiteralPath $srcA -Destination $dstA
+        New-Item -ItemType Directory -Path (Join-Path $TestDrive 'Undo') -Force | Out-Null
+        $undoPath = Join-Path $TestDrive ('Undo\undo-' + $planId + '.csv')
+        Set-Content -LiteralPath $undoPath -Value @(
+            'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash',
+            ('"2026-01-01T00:00:00","{0}","File","Move","{1}","{2}",""' -f $planId, $srcA, $dstA)
+        ) -Encoding UTF8
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive -Force
+        $res.Summary.Resumed | Should -Be 1
+        $res.Summary.Moved   | Should -Be 1
+        $raw = Get-Content -LiteralPath $undoPath
+        ($raw | Where-Object { $_ -match ',Status' }).Count | Should -Be 0   # layout untouched
+        $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $planCfg
+        $u.Restored | Should -Be 2
+    }
+    It 'a fully successful undo renames the journal to .undone.csv; a partial undo keeps it' {
+        # full success
+        $planId = 'plan-20260101-094005'
+        $src = Join-Path $TestDrive 'jr5\doc.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v'
+        $plan = [pscustomobject]@{ PlanId=$planId
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=(Join-Path $TestDrive 'jr5-org\Documents\2026\doc.txt'); Reason='test'; SizeBytes=2 }) }
+        $planPath = Join-Path $TestDrive 'jr5.json'
+        $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $planCfg -AppRoot $TestDrive
+        $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $planCfg
+        $u.Restored | Should -Be 1
+        Test-Path -LiteralPath $res.UndoFile | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $TestDrive ('Undo\undo-' + $planId + '.undone.csv')) | Should -BeTrue
+        # partial: one of two destinations is missing -> SkippedMissing -> journal stays
+        $planId2 = 'plan-20260101-094006'
+        $s1 = Join-Path $TestDrive 'jr6\one.txt'; $s2 = Join-Path $TestDrive 'jr6\two.txt'
+        New-Item -ItemType Directory -Path (Split-Path $s1) -Force | Out-Null
+        Set-Content -LiteralPath $s1 -Value '1'; Set-Content -LiteralPath $s2 -Value '2'
+        $d1 = Join-Path $TestDrive 'jr6-org\Documents\2026\one.txt'
+        $d2 = Join-Path $TestDrive 'jr6-org\Documents\2026\two.txt'
+        $plan2 = [pscustomobject]@{ PlanId=$planId2
+            Actions=@(
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$s1; Destination=$d1; Reason='test'; SizeBytes=1 },
+                [pscustomobject]@{ Action='Move'; Kind='File'; Source=$s2; Destination=$d2; Reason='test'; SizeBytes=1 }) }
+        $planPath2 = Join-Path $TestDrive 'jr6.json'
+        $plan2 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath2
+        $res2 = Invoke-SysOrgPlan -PlanPath $planPath2 -Config $planCfg -AppRoot $TestDrive
+        Remove-Item -LiteralPath $d2 -Force            # user deleted one moved file
+        $u2 = Undo-SysOrgPlan -PlanId $planId2 -AppRoot $TestDrive -Config $planCfg
+        $u2.SkippedMissing | Should -Be 1
+        Test-Path -LiteralPath $res2.UndoFile | Should -BeTrue   # kept for inspection
+    }
+    It 'journal and provenance rows are properly CSV-escaped (commas and quotes survive)' {
+        # provenance sidecar: URLs can contain quotes and commas
+        $plan = [pscustomobject]@{ PlanId='plan-20260101-094007'; DestinationRoot='X:\org'
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source='X:\a.txt'; Destination='X:\org\a.txt'; Reason='r'; SizeBytes=1 })
+            Provenance=@([pscustomobject]@{ Source='X:\a.txt'; SourceBucket='Test'; HostUrl='https://x.test/a,"b,c";d'; ReferrerUrl='' }) }
+        $plansFolder = Join-Path $TestDrive 'jr7-plans'
+        $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $plansFolder
+        $provFile = Join-Path $plansFolder 'plan-20260101-094007-provenance.csv'
+        Test-Path -LiteralPath $provFile | Should -BeTrue
+        $rows = @(Import-Csv -LiteralPath $provFile)
+        $rows[0].HostUrl | Should -Be 'https://x.test/a,"b,c";d'
+        # journal: a file name containing a comma moves and comes back intact
+        $src = Join-Path $TestDrive 'jr8\a,b.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v'
+        $plan2 = [pscustomobject]@{ PlanId='plan-20260101-094008'
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=(Join-Path $TestDrive 'jr8-org\Documents\2026\a,b.txt'); Reason='test'; SizeBytes=2 }) }
+        $planPath2 = Join-Path $TestDrive 'jr8.json'
+        $plan2 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath2
+        $res = Invoke-SysOrgPlan -PlanPath $planPath2 -Config $planCfg -AppRoot $TestDrive
+        $rows2 = @(Import-Csv -LiteralPath $res.UndoFile)
+        (@($rows2 | Where-Object { $_.Status -eq 'Done' })[0]).OriginalSource | Should -Be $src
     }
 }

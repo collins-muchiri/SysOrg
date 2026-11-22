@@ -680,6 +680,9 @@ function Save-SysOrgPlan {
     param($Plan,[string]$PlansFolder)
     if(-not (Test-Path -LiteralPath $PlansFolder)){ New-Item -ItemType Directory -Path $PlansFolder -Force | Out-Null }
     $path = Join-Path $PlansFolder ('{0}.json' -f $Plan.PlanId)
+    if(-not $Plan.PSObject.Properties['ProvenanceFile']){
+        [void]($Plan | Add-Member -NotePropertyName ProvenanceFile -NotePropertyValue '')
+    }
     if($Plan.PSObject.Properties['ProvenanceFile']){
         $Plan.ProvenanceFile = (Join-Path $PlansFolder ('{0}-provenance.csv' -f $Plan.PlanId))
     }
@@ -968,6 +971,7 @@ function Invoke-SysOrgPlan {
     param([Parameter(Mandatory)][string]$PlanPath,$Config,[Parameter(Mandatory)][string]$AppRoot,[switch]$Force)
     try { $plan = Get-Content -LiteralPath $PlanPath -Raw | ConvertFrom-Json }
     catch { throw "Plan file could not be read: $($_.Exception.Message)" }
+    $alreadyDone = @{}
 
     # v2.1.1: the PlanId is used in the journal path - reject anything that is not the
     # documented format (blocks journal-name injection like 'plan-..\\evil').
@@ -996,12 +1000,26 @@ function Invoke-SysOrgPlan {
     $undoPath = Join-Path $undoFolder ('undo-{0}.csv' -f $plan.PlanId)
 
     # P1-3: re-execution guard with resume support
-    $alreadyDone = @{}
-    if(Test-Path -LiteralPath $undoPath){
+    # v2.1.1: journals carry a Status column (appended at the END, so old 7-column journals
+    # remain readable and undoable). Done rows (and all rows of legacy journals) mark a
+    # source as already handled; orphaned Pending rows are resolved against the actual
+    # filesystem state after the writer is open.
+    $journalExists = Test-Path -LiteralPath $undoPath
+    $journalRows = @()
+    $journalHasStatus = $false
+    if($journalExists){
         if(-not $Force){
             throw "Plan '$($plan.PlanId)' already has an undo journal. Undo it first, or pass -Force to resume (journaled actions are skipped)."
         }
-        @(Import-Csv -LiteralPath $undoPath) | ForEach-Object { $alreadyDone[$_.OriginalSource] = $true }
+        $journalRows = @(Import-Csv -LiteralPath $undoPath)
+        $headerLine = ''
+        try { $headerLine = (Get-Content -LiteralPath $undoPath -TotalCount 1) } catch { }
+        $journalHasStatus = ("$headerLine" -match ',Status\s*$')
+        foreach($r in $journalRows){
+            $st = ''
+            if($r.PSObject.Properties['Status']){ $st = "$($r.Status)" }
+            if(($st -eq '') -or ($st -ieq 'Done')){ $alreadyDone[$r.OriginalSource] = $true }
+        }
     }
 
     $summary = @{ Moved=0; Copied=0; FolderMoves=0; Numbered=0; Quarantined=0; CollisionDuplicate=0
@@ -1059,15 +1077,75 @@ function Invoke-SysOrgPlan {
     # -----------------------------------------------------------------------------
 
 
-    # P1-1: journal is appended and flushed after EVERY row, not written once at the end
-    $journalExists = Test-Path -LiteralPath $undoPath
-    $writer = New-Object System.IO.StreamWriter($undoPath, $true, [System.Text.Encoding]::UTF8)
-    $writer.AutoFlush = $true
+    # P1-1: journal is appended and flushed after EVERY row, not written once at the end.
+    # v2.1.1: the stream opens with WriteThrough and every row is flushed to disk
+    # (Flush($true)) so a crash cannot lose rows the OS still held in cache - the journal
+    # must survive a power cut, not just a process kill.
+    $writer = $null
+    try {
+        $fs = New-Object System.IO.FileStream($undoPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite, 1, [System.IO.FileOptions]::WriteThrough)
+        $writer = New-Object System.IO.StreamWriter($fs, [System.Text.Encoding]::UTF8)
+        $writer.AutoFlush = $true
+    } catch { throw "Undo journal could not be opened: $($_.Exception.Message)" }
+
+    function Add-SysOrgJournalRow {
+        # NOTE: reads the enclosing function's locals via dynamic scoping (same pattern as
+        # Add-SysOrgPlanSkip) - $script: qualifiers here would miss those locals entirely.
+        param([string]$Kind,[string]$Action,[string]$OriginalSource,[string]$CurrentLocation,[string]$Hash,[string]$Status)
+        # Legacy 7-column journals keep their layout: no Pending/Retried markers are written
+        # for them (the orphan logic does not apply), but normal Done rows still are.
+        if((-not $journalHasStatus) -and $Status -and ($Status -ne 'Done')){ return }
+        $line = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
+                (ConvertTo-SysOrgCsvField $Kind) + ',' + (ConvertTo-SysOrgCsvField $Action) + ',' +
+                (ConvertTo-SysOrgCsvField $OriginalSource) + ',' + (ConvertTo-SysOrgCsvField $CurrentLocation) + ',' +
+                (ConvertTo-SysOrgCsvField $Hash)
+        if($journalHasStatus){ $line += ',' + (ConvertTo-SysOrgCsvField $Status) }
+        $writer.WriteLine($line)
+        # crash-safe: push the row past every buffer, down to the disk
+        $writer.Flush()
+        $fs.Flush($true)
+    }
 
     try {
         if(-not $journalExists){
-            $writer.WriteLine('Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash')
+            $writer.WriteLine('Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash,Status')
+            $writer.Flush(); $fs.Flush($true)
+            $journalHasStatus = $true   # the journal we just created has the Status column
         }
+
+        # v2.1.1: resolve orphaned Pending rows (a crash between the Pending row and the
+        # Done row) against the ACTUAL filesystem state before deciding to skip or retry.
+        if($journalHasStatus -and $journalRows.Count -gt 0){
+            $doneSet = @{}
+            foreach($r in $journalRows){
+                $st = ''; if($r.PSObject.Properties['Status']){ $st = "$($r.Status)" }
+                if(($st -eq '') -or ($st -ieq 'Done')){ $doneSet[$r.OriginalSource] = $true }
+            }
+            $planActionBySource = @{}
+            foreach($pa in @($plan.Actions)){ $planActionBySource["$($pa.Source)"] = $pa }
+            foreach($r in $journalRows){
+                $st = ''; if($r.PSObject.Properties['Status']){ $st = "$($r.Status)" }
+                if($st -ine 'Pending'){ continue }
+                if($doneSet.ContainsKey($r.OriginalSource)){ continue }   # a later Done row exists
+                $plannedDest = ''
+                if($planActionBySource.ContainsKey($r.OriginalSource)){ $plannedDest = "$($planActionBySource[$r.OriginalSource].Destination)" }
+                if(-not (Test-Path -LiteralPath $r.OriginalSource)){
+                    # the move happened but the process died before the Done row: mark it done
+                    # so the source is skipped and remains undoable (planned destination used).
+                    # The Resumed counter is incremented by the main loop's alreadyDone skip.
+                    Add-SysOrgJournalRow -Kind "$($r.Kind)" -Action "$($r.Action)" -OriginalSource $r.OriginalSource `
+                        -CurrentLocation $plannedDest -Hash "$($r.ContentHash)" -Status 'Done'
+                    $alreadyDone[$r.OriginalSource] = $true
+                    Write-SysOrgLog "Resume: orphaned Pending row resolved as done (source is gone): $($r.OriginalSource)" -LogFolder $logFolder
+                } else {
+                    # the move never happened: mark retried so the row is no longer orphaned
+                    Add-SysOrgJournalRow -Kind "$($r.Kind)" -Action "$($r.Action)" -OriginalSource $r.OriginalSource `
+                        -CurrentLocation '' -Hash '' -Status 'Retried'
+                    Write-SysOrgLog "Resume: orphaned Pending row retried (source still present): $($r.OriginalSource)" -LogFolder $logFolder
+                }
+            }
+        }
+
         $allActions = @($plan.Actions)
         $i = 0; $total = $allActions.Count
 
@@ -1164,6 +1242,13 @@ function Invoke-SysOrgPlan {
                 else { $hashBefore = Get-SysOrgFileHash -Path $aSource }
             }
 
+            # v2.1.1: Pending row BEFORE the move - a crash between Pending and Done leaves
+            # an orphan that resume resolves against the actual filesystem state.
+            if($journalHasStatus){
+                Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
+                    -CurrentLocation $aDestination -Hash "$hashBefore" -Status 'Pending'
+            }
+
             if($kind -eq 'Folder'){
                 $result = Invoke-SysOrgSafeMoveFolder -Source $aSource -Destination $aDestination -Config $Config
             } else {
@@ -1186,22 +1271,16 @@ function Invoke-SysOrgPlan {
                             Write-SysOrgLog "Moved: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
                         }
                     }
-                    # P0-fix: format into a variable FIRST, then write (the -f operator binds
-                    # only to its immediate next expression inside a method-call argument list).
+                    # P0-fix note: the row is built by the journal helper, then flushed to
+                    # disk (WriteThrough + Flush($true)) so a crash cannot lose it.
                     # v2.1.1: fields are CSV-escaped and the journal stores the CANONICAL source.
-                    $journalLine = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
-                                   (ConvertTo-SysOrgCsvField $kind) + ',' + (ConvertTo-SysOrgCsvField "$($a.Action)") + ',' +
-                                   (ConvertTo-SysOrgCsvField $aSource) + ',' + (ConvertTo-SysOrgCsvField "$($result.Destination)") + ',' +
-                                   (ConvertTo-SysOrgCsvField "$hashBefore")
-                    $writer.WriteLine($journalLine)
+                    Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
+                        -CurrentLocation "$($result.Destination)" -Hash "$hashBefore" -Status 'Done'
                 }
                 'CopiedVerified' {
                     if($kind -eq 'Folder'){ $summary.FolderMoves++ } else { $summary.Copied++ }
-                    $journalLine = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
-                                   (ConvertTo-SysOrgCsvField $kind) + ',' + (ConvertTo-SysOrgCsvField "$($a.Action)") + ',' +
-                                   (ConvertTo-SysOrgCsvField $aSource) + ',' + (ConvertTo-SysOrgCsvField "$($result.Destination)") + ',' +
-                                   (ConvertTo-SysOrgCsvField "$hashBefore")
-                    $writer.WriteLine($journalLine)
+                    Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
+                        -CurrentLocation "$($result.Destination)" -Hash "$hashBefore" -Status 'Done'
                     Write-SysOrgLog "Copied+verified: $($a.Source) -> $($result.Destination) ($($result.Message))" -Level WARN -LogFolder $logFolder
                 }
                 'CollisionDuplicate' {
@@ -1214,11 +1293,11 @@ function Invoke-SysOrgPlan {
                     $r2 = Invoke-SysOrgSafeMove -Source $aSource -Destination (Join-Path $qRoot (Split-Path $aSource -Leaf)) -Config $Config
                     if(($r2.Status -eq 'Moved') -or ($r2.Status -eq 'CopiedVerified')){
                         $summary.Quarantined++
-                        $journalLine = (ConvertTo-SysOrgCsvField (Get-Date -Format s)) + ',' + (ConvertTo-SysOrgCsvField $plan.PlanId) + ',' +
-                                       (ConvertTo-SysOrgCsvField 'File') + ',' + (ConvertTo-SysOrgCsvField 'Quarantine') + ',' +
-                                       (ConvertTo-SysOrgCsvField $aSource) + ',' + (ConvertTo-SysOrgCsvField "$($r2.Destination)") + ',' +
-                                       (ConvertTo-SysOrgCsvField "$hashBefore")
-                        $writer.WriteLine($journalLine)
+                        # Done row for the ORIGINAL pending action: the quarantine move is this
+                        # action's resolution, so resume skips the source and undo restores
+                        # Source -> quarantine location.
+                        Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
+                            -CurrentLocation "$($r2.Destination)" -Hash "$hashBefore" -Status 'Done'
                         Write-SysOrgLog "Collision duplicate quarantined: $($a.Source) -> $($r2.Destination)" -Level ACTION -LogFolder $logFolder
                     } else {
                         $summary.Failed++
@@ -1228,6 +1307,12 @@ function Invoke-SysOrgPlan {
                 default {
                     $summary.Failed++
                     Write-SysOrgLog "FAILED: $($a.Source): $($result.Message)" -Level ERROR -LogFolder $logFolder
+                    # v2.1.1: nothing moved - neutralize the Pending row so it is not
+                    # treated as an orphan on the next resume.
+                    if($journalHasStatus){
+                        Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
+                            -CurrentLocation '' -Hash '' -Status 'Retried'
+                    }
                 }
             }
         }
@@ -1267,7 +1352,15 @@ function Undo-SysOrgPlan {
     $undoPath = Join-Path (Join-Path $AppRoot 'Undo') ('undo-{0}.csv' -f $PlanId)
     if(-not (Test-Path -LiteralPath $undoPath)){ throw "No undo journal found for plan '$PlanId'." }
     $logFolder = Join-Path $AppRoot 'Logs'
-    $rows = @(Import-Csv -LiteralPath $undoPath)
+    $allRows = @(Import-Csv -LiteralPath $undoPath)
+    # v2.1.1: only Done rows (and rows of legacy journals, which carry no Status) are
+    # undoable. Orphaned Pending rows and Retried markers describe moves that did NOT
+    # complete and are deliberately ignored here.
+    $rows = @($allRows | Where-Object {
+        $st = ''
+        if($_.PSObject.Properties['Status']){ $st = "$($_.Status)" }
+        ($st -eq '') -or ($st -ieq 'Done')
+    })
     $restored=0; $failed=0; $skippedMissing=0; $skippedChanged=0
 
     for($i=$rows.Count-1; $i -ge 0; $i--){
@@ -1332,6 +1425,20 @@ function Undo-SysOrgPlan {
         } else {
             $failed++; Write-SysOrgLog "Undo FAILED: $current : $($r.Message)" -Level ERROR -LogFolder $logFolder
         }
+    }
+    # v2.1.1: after a FULLY successful undo the journal is renamed to
+    # undo-<PlanId>.undone.csv, which lifts the re-execution guard - the plan can be
+    # re-executed deliberately. A partial undo keeps the journal in place.
+    if(($restored -gt 0) -and ($failed -eq 0) -and ($skippedMissing -eq 0) -and ($skippedChanged -eq 0) -and ($restored -eq $rows.Count)){
+        $undoFolder = Join-Path $AppRoot 'Undo'
+        $undonePath = Join-Path $undoFolder ('undo-{0}.undone.csv' -f $PlanId)
+        if(Test-Path -LiteralPath $undonePath){
+            $undonePath = Join-Path $undoFolder ('undo-{0}.undone-{1}.csv' -f $PlanId, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        }
+        try{
+            Rename-Item -LiteralPath $undoPath -NewName (Split-Path $undonePath -Leaf) -ErrorAction Stop
+            Write-SysOrgLog "Journal archived to '$undonePath' - the plan can be re-executed deliberately now." -LogFolder $logFolder
+        } catch { Write-Verbose "Journal rename failed: $($_.Exception.Message)" }
     }
     return [pscustomobject]@{ Restored=$restored; Failed=$failed; SkippedMissing=$skippedMissing; SkippedChanged=$skippedChanged }
 }
