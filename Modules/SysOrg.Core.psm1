@@ -94,6 +94,8 @@ function Test-SysOrgConfig {
     if(@('NumberCopies','Quarantine','ReportOnly') -notcontains $cpol){ $errors += "Copies.Policy must be NumberCopies, Quarantine, or ReportOnly (got '$cpol')." }
     $cstyle = Get-SysOrgSetting $Config 'Copies.SuffixStyle' 'Parentheses'
     if(@('Parentheses','DashCopy') -notcontains $cstyle){ $errors += "Copies.SuffixStyle must be Parentheses or DashCopy (got '$cstyle')." }
+    $renameToKeeper = Get-SysOrgSetting $Config 'Copies.RenameToKeeper' $false
+    if(-not ($renameToKeeper -is [bool])){ $errors += 'Copies.RenameToKeeper must be $true or $false (got ' + "$renameToKeeper" + ').' }
     $groupBy = Get-SysOrgSetting $Config 'Downloads.GroupBy' 'SourceFirst'
     if(@('SourceFirst','TypeFirst') -notcontains $groupBy){ $errors += "Downloads.GroupBy must be SourceFirst or TypeFirst (got '$groupBy')." }
     $cross = Get-SysOrgSetting $Config 'Families.CrossTypeLink' 'SameName'
@@ -192,7 +194,8 @@ function Import-SysOrgConfig {
                       NoiseTokens=@('copy','copie','final','new','old','backup','bak','draft','rev','revised','edit','edited','version','untitled')
                       StripVersionSuffix=$true; KeepDates=$true; MaxNameLength=60 }
         Copies   = @{ Policy='NumberCopies'; SuffixStyle='Parentheses'; StartIndex=2
-                      MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates' }
+                      MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'
+                      RenameToKeeper=$false }
         Downloads = @{ Roots=@('Downloads'); GroupBy='SourceFirst'; DateFolders='Year'
                        UseZoneIdentifier=$true; UnknownSourceFolder='_NoSource' }
         Projects = @{ Enabled=$true; Destination='Documents\Projects\Code'; Markers=@()

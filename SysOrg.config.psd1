@@ -113,8 +113,12 @@
         MaxNameLength     = 60
     }
 
-    # Exact copies policy (rev 2.1: numbering replaces quarantine as the default).
-    #   NumberCopies = Report.docx, Report - Copy.docx  ->  Report.docx, Report (2).docx (kept!)
+    # Exact copies policy (v2.1.1: copies keep their OWN name by default).
+    #   NumberCopies = exact copies are kept. A copy keeps its own stem and extension and is
+    #                  numbered only when the name collides in the destination folder:
+    #                  Report.docx + Report - Copy.docx -> Report.docx + Report - Copy.docx.
+    #                  RenameToKeeper=$true restores the v2.1.0 behaviour where every copy
+    #                  takes the keeper's stem (Report (2).docx, Report (3).docx).
     #   Quarantine   = copies move to _Duplicates\<PlanId>\ (rev 2.0 behavior, opt-in)
     #   ReportOnly   = copies are listed, nothing moves
     Copies = @{
@@ -124,6 +128,7 @@
         MinFileSizeKB        = 256             # ignore tiny files (thousands of 1 KB dupes)
         HeaderHashKB         = 64              # fast pre-filter before full SHA256
         QuarantineFolderName = '_Duplicates'   # used only when Policy = Quarantine
+        RenameToKeeper       = $false          # $true = copies take the keeper's stem (v2.1.0 behaviour)
     }
 
     # Downloads branch: provenance-aware routing of downloaded files.

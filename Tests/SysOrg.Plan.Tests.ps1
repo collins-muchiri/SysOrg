@@ -176,7 +176,7 @@ Describe 'Plan construction' {
         $plan.Actions[0].Action | Should -Be 'Quarantine'
         $plan.Actions[0].Hash | Should -Be 'ABCD1234ABCD1234'
     }
-    It 'NumberCopies: the keeper keeps its name and copies are numbered in the keeper folder (W6)' {
+    It 'NumberCopies (v2.1.1 default): copies keep their own names in the keeper folder (W6)' {
         $root = Join-Path $TestDrive ('ncfix-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $root -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $root 'Data.bin') -Value ('X' * 1200)
@@ -200,14 +200,14 @@ Describe 'Plan construction' {
         $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $fakeProf -DupGroups $dups -Config $ncCfg
         @($plan.Actions).Count | Should -Be 3
         $plan.Copies.Policy | Should -Be 'NumberCopies'
-        $plan.Copies.Numbered | Should -Be 2
+        $plan.Copies.Numbered | Should -Be 0     # no name collisions -> nothing renumbered
         $keeper = @($plan.Actions | Where-Object { $_.Destination -like '*Data.bin' })
         $keeper.Count | Should -Be 1
         $keeper[0].Source | Should -Be (Join-Path $root 'Data.bin')   # oldest = keeper keeps its name
-        $numbered = @($plan.Actions | Where-Object { $_.CopyIndex })
-        @($numbered | Where-Object { $_.Destination -like '*Data (2).bin' }).Count | Should -Be 1
-        @($numbered | Where-Object { $_.Destination -like '*Data (3).bin' }).Count | Should -Be 1
-        ($numbered | ForEach-Object { Split-Path $_.Destination -Parent } | Select-Object -Unique).Count | Should -Be 1   # same folder as the keeper
+        @($plan.Actions | Where-Object { $_.Destination -like '*Data (2).bin' }).Count | Should -Be 1   # own name kept
+        @($plan.Actions | Where-Object { $_.Destination -like '*Data (3).bin' }).Count | Should -Be 1   # own name kept
+        ($plan.Actions | Where-Object { $_.CopyIndex }).Count | Should -Be 0
+        ($plan.Actions | ForEach-Object { Split-Path $_.Destination -Parent } | Select-Object -Unique).Count | Should -Be 1   # same folder as the keeper
     }
     It 'mutability denials appear in Skipped with reasons and never in Actions (W3)' {
         $sysProf = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='System'; ProposedScope='KnownFolders'
@@ -404,5 +404,87 @@ Describe 'Project folder plan actions and preview (v2.1.1)' {
         $fa[0].FilesInside        | Should -Be 2
         $fa[0].NonCodeFilesInside | Should -Be 1   # notes.txt (main.py is code; .git is VCS metadata)
         { Show-SysOrgPlan -Plan $plan -Config $planCfg5 } | Should -Not -Throw
+    }
+}
+
+Describe 'Copies keep their own names (v2.1.1)' {
+    BeforeAll {
+        function New-SysOrgNumberCopiesPlan {
+            param([Parameter(Mandatory)]$Records,$Config)
+            return (New-SysOrgPlan -Letter T -Inventory $Records -DriveProfile $script:fakeProf -DupGroups @(Find-SysOrgDuplicates -Inventory $Records -Config $Config) -Config $Config)
+        }
+        $script:c6Cfg = @{ Copies = @{ Policy='NumberCopies'; StartIndex=2; MinFileSizeKB=1; HeaderHashKB=64 }
+                    OrganizedRoots=@{ '*'='__AUTO__' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                    SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                    Families=@{Enabled=$false}; Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}
+                    DateFolders='None'; MaxPlanActions=5000 }
+    }
+    It 'different-named identical files keep their own names' {
+        $root = Join-Path $TestDrive ('c6a-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'Alpha.docx') -Value ('A' * 1200)
+        Set-Content -LiteralPath (Join-Path $root 'Beta.docx')  -Value ('A' * 1200)   # identical content, own name
+        (Get-Item -LiteralPath (Join-Path $root 'Alpha.docx')).LastWriteTime = Get-Date '2026-01-01'
+        (Get-Item -LiteralPath (Join-Path $root 'Beta.docx')).LastWriteTime  = Get-Date '2026-01-02'
+        $inv = @(
+            [pscustomobject]@{ FullName=(Join-Path $root 'Alpha.docx'); Name='Alpha.docx'; Stem='Alpha'; Extension='.docx'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-01'); Directory=$root; Category='Documents' },
+            [pscustomobject]@{ FullName=(Join-Path $root 'Beta.docx'); Name='Beta.docx'; Stem='Beta'; Extension='.docx'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-02'); Directory=$root; Category='Documents' }
+        )
+        $plan = New-SysOrgNumberCopiesPlan -Records $inv -Config $c6Cfg
+        $beta = @($plan.Actions | Where-Object { $_.Source -eq (Join-Path $root 'Beta.docx') })[0]
+        (Split-Path $beta.Destination -Leaf) | Should -Be 'Beta.docx'      # own stem, own extension
+        $beta.CopyIndex | Should -BeNullOrEmpty                            # no collision -> not numbered
+        (Split-Path $beta.Destination -Parent) | Should -Be (Split-Path (@($plan.Actions | Where-Object { $_.Source -eq (Join-Path $root 'Alpha.docx') })[0].Destination) -Parent)
+    }
+    It 'same-named copies still get (2) in the destination folder' {
+        $a = Join-Path $TestDrive ('c6b1-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $b = Join-Path $TestDrive ('c6b2-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $a -Force | Out-Null
+        New-Item -ItemType Directory -Path $b -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $a 'Report - Copy.docx') -Value ('R' * 1200)
+        Set-Content -LiteralPath (Join-Path $b 'Report - Copy.docx') -Value ('R' * 1200)   # same name, different folder
+        (Get-Item -LiteralPath (Join-Path $a 'Report - Copy.docx')).LastWriteTime = Get-Date '2026-01-01'
+        (Get-Item -LiteralPath (Join-Path $b 'Report - Copy.docx')).LastWriteTime = Get-Date '2026-01-02'
+        $inv = @(
+            [pscustomobject]@{ FullName=(Join-Path $a 'Report - Copy.docx'); Name='Report - Copy.docx'; Stem='Report - Copy'; Extension='.docx'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-01'); Directory=$a; Category='Documents' },
+            [pscustomobject]@{ FullName=(Join-Path $b 'Report - Copy.docx'); Name='Report - Copy.docx'; Stem='Report - Copy'; Extension='.docx'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-02'); Directory=$b; Category='Documents' }
+        )
+        $plan = New-SysOrgNumberCopiesPlan -Records $inv -Config $c6Cfg
+        $plan.Copies.Numbered | Should -Be 1
+        $numbered = @($plan.Actions | Where-Object { $_.CopyIndex })
+        $numbered.Count | Should -Be 1
+        (Split-Path $numbered[0].Destination -Leaf) | Should -Be 'Report - Copy (2).docx'   # numbered only on collision
+    }
+    It 'Copies.RenameToKeeper=$true restores the v2.1.0 naming (opt-in)' {
+        $root = Join-Path $TestDrive ('c6c-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'Alpha.docx') -Value ('A' * 1200)
+        Set-Content -LiteralPath (Join-Path $root 'Beta copy.docx') -Value ('A' * 1200)
+        (Get-Item -LiteralPath (Join-Path $root 'Alpha.docx')).LastWriteTime = Get-Date '2026-01-01'
+        (Get-Item -LiteralPath (Join-Path $root 'Beta copy.docx')).LastWriteTime = Get-Date '2026-01-02'
+        $inv = @(
+            [pscustomobject]@{ FullName=(Join-Path $root 'Alpha.docx'); Name='Alpha.docx'; Stem='Alpha'; Extension='.docx'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-01'); Directory=$root; Category='Documents' },
+            [pscustomobject]@{ FullName=(Join-Path $root 'Beta copy.docx'); Name='Beta copy.docx'; Stem='Beta copy'; Extension='.docx'; Length=1200
+                LastWriteTime=(Get-Date '2026-01-02'); Directory=$root; Category='Documents' }
+        )
+        $optIn = @{ Copies = @{ Policy='NumberCopies'; StartIndex=2; MinFileSizeKB=1; HeaderHashKB=64; RenameToKeeper=$true }
+                    OrganizedRoots=@{ '*'='__AUTO__' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                    SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                    Families=@{Enabled=$false}; Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}
+                    DateFolders='None'; MaxPlanActions=5000 }
+        $plan = New-SysOrgNumberCopiesPlan -Records $inv -Config $optIn
+        $beta = @($plan.Actions | Where-Object { $_.Source -eq (Join-Path $root 'Beta copy.docx') })[0]
+        (Split-Path $beta.Destination -Leaf) | Should -Be 'Alpha (2).docx'   # keeper's stem, numbered
+        $beta.CopyIndex | Should -Be 2
+    }
+    It 'Test-SysOrgConfig rejects a non-boolean Copies.RenameToKeeper' {
+        $cfg = @{ DateFolders='Year'; Copies=@{Policy='NumberCopies'; RenameToKeeper='maybe'}; MaxPlanActions=10
+                  PreserveMinFiles=1; InventoryCacheHours=1; PreserveSingleCategoryRatio=0.9 }
+        { Test-SysOrgConfig -Config $cfg } | Should -Throw '*RenameToKeeper*'
     }
 }

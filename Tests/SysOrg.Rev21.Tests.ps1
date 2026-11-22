@@ -93,18 +93,18 @@ Describe 'W6 fixture: Report + byte-identical copy + Report final v2' {
         $keeper = @($plan.Actions | Where-Object { $_.Source -eq $p1 })[0]
         (Split-Path $keeper.Destination -Leaf) | Should -Be 'Report.docx'
         $copy = @($plan.Actions | Where-Object { $_.Source -eq $p2 })[0]
-        (Split-Path $copy.Destination -Leaf) | Should -Be 'Report (2).docx'
-        $copy.CopyIndex | Should -Be 2
+        (Split-Path $copy.Destination -Leaf) | Should -Be 'Report - Copy.docx'   # v2.1.1: copies keep their own name
+        $copy.CopyIndex | Should -BeNullOrEmpty
         $v2 = @($plan.Actions | Where-Object { $_.Source -eq $p3 })[0]
         (Split-Path $v2.Destination -Leaf) | Should -Be 'Report final v2.docx'   # original name never rewritten
         $plan.Families[0].Name | Should -Be 'Report'
 
-        # execute + undo: numbering is fully reversible (9.6)
+        # execute + undo: fully reversible (9.6)
         $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder (New-SysOrgTestPlans)
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $cfg -AppRoot $TestDrive
         $res.Summary.Moved | Should -Be 3
         Test-Path -LiteralPath (Join-Path $famRoot 'Report.docx') | Should -BeTrue
-        Test-Path -LiteralPath (Join-Path $famRoot 'Report (2).docx') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $famRoot 'Report - Copy.docx') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $famRoot 'Report final v2.docx') | Should -BeTrue
         Test-Path -LiteralPath $p1 | Should -BeFalse
         $u = Undo-SysOrgPlan -PlanId $plan.PlanId -AppRoot $TestDrive -Config $cfg
@@ -114,8 +114,8 @@ Describe 'W6 fixture: Report + byte-identical copy + Report final v2' {
     }
 }
 
-Describe 'W6/W7 fixture: three identical files, deterministic numbering' {
-    It 'keeper is the oldest write time; (2) and (3) follow LastWriteTime then natural order' {
+Describe 'W6/W7 fixture: three identical files, deterministic handling' {
+    It 'keeper is the oldest write time; the copies keep their own names beside it (v2.1.1)' {
         $src = Join-Path $TestDrive ('w67-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $src -Force | Out-Null
         $pA = Join-Path $src 'first.bin'
@@ -132,14 +132,16 @@ Describe 'W6/W7 fixture: three identical files, deterministic numbering' {
         $plan = New-SysOrgPlan -Letter $letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $cfg -KnownFolders @()
         @($plan.Actions).Count | Should -Be 3
         $keeper = @($plan.Actions | Where-Object { $_.CopyIndex -eq $null -and "$($_.Action)" -eq 'Move' })[0]
-        $keeper.Source | Should -Be $pB
-        $n2 = @($plan.Actions | Where-Object { $_.CopyIndex -eq 2 })[0]
-        $n3 = @($plan.Actions | Where-Object { $_.CopyIndex -eq 3 })[0]
-        $n2.Source | Should -Be $pC      # next-oldest gets (2)
-        $n3.Source | Should -Be $pA      # newest gets (3)
-        (Split-Path $n2.Destination -Leaf) | Should -Be 'second (2).bin'
-        (Split-Path $n3.Destination -Leaf) | Should -Be 'second (3).bin'
-        (Split-Path $n2.Destination -Parent) | Should -Be (Split-Path $keeper.Destination -Parent)
+        $keeper.Source | Should -Be $pB                                   # oldest = keeper
+        (Split-Path $keeper.Destination -Leaf) | Should -Be 'second.bin'
+        $c1 = @($plan.Actions | Where-Object { $_.Source -eq $pC })[0]
+        $c2 = @($plan.Actions | Where-Object { $_.Source -eq $pA })[0]
+        (Split-Path $c1.Destination -Leaf) | Should -Be 'third.bin'       # own name, no collision
+        (Split-Path $c2.Destination -Leaf) | Should -Be 'first.bin'
+        $c1.CopyIndex | Should -BeNullOrEmpty
+        $c2.CopyIndex | Should -BeNullOrEmpty
+        (Split-Path $c1.Destination -Parent) | Should -Be (Split-Path $keeper.Destination -Parent)
+        (Split-Path $c2.Destination -Parent) | Should -Be (Split-Path $keeper.Destination -Parent)
     }
 }
 

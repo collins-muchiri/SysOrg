@@ -381,8 +381,7 @@ function New-SysOrgPlan {
             elseif($copiesPolicy -eq 'NumberCopies'){
                 if($keeperFolder){
                     $keeperRec = $byPath[$keeperPath]
-                    $stem = "$($keeperRec.Stem)"
-                    $ext = "$($keeperRec.Extension)"
+                    $renameToKeeper = [bool](Get-SysOrgSetting $Config 'Copies.RenameToKeeper' $false)
                     $withKeys = @()
                     foreach($m in $members){
                         $withKeys += [pscustomobject]@{ Rec=$m; Key=(Get-SysOrgNaturalKey -Name "$($m.FullName)") }
@@ -392,15 +391,43 @@ function New-SysOrgPlan {
                     $folderKey = $keeperFolder.ToLowerInvariant()
                     foreach($m in $orderedMembers){
                         if($actions.Count -ge $maxActions){ $capped = $true; break }
-                        $n++
-                        $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $n -Style $suffixStyle
-                        $i = $n
-                        # 9.5: plan-time assignment checks the destination for existing files
-                        while($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or
-                              (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate))){
-                            $i++
-                            if($i -gt 999){ $candidate = ([guid]::NewGuid().ToString('N').Substring(0,8)) + $ext; break }
-                            $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $i -Style $suffixStyle
+                        if($renameToKeeper){
+                            # v2.1.1 opt-in (Copies.RenameToKeeper=$true): the legacy rev 2.1.0
+                            # behaviour - every copy takes the keeper's stem and is numbered.
+                            $stem = "$($keeperRec.Stem)"
+                            $ext = "$($keeperRec.Extension)"
+                            $n++
+                            $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $n -Style $suffixStyle
+                            $i = $n
+                            # 9.5: plan-time assignment checks the destination for existing files
+                            while($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or
+                                  (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate))){
+                                $i++
+                                if($i -gt 999){ $candidate = ([guid]::NewGuid().ToString('N').Substring(0,8)) + $ext; break }
+                                $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $i -Style $suffixStyle
+                            }
+                            $copyIndex = $i
+                        } else {
+                            # v2.1.1 default: a copy keeps its OWN stem and extension; it is
+                            # numbered only when the name collides in the destination folder.
+                            $stem = "$($m.Stem)"
+                            $ext = "$($m.Extension)"
+                            $candidate = ($stem + $ext)
+                            $copyIndex = $null
+                            if($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or
+                               (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate))){
+                                $i = $startIndex - 1
+                                while($true){
+                                    $i++
+                                    if($i -gt 999){ $candidate = ([guid]::NewGuid().ToString('N').Substring(0,8)) + $ext; $copyIndex = $i; break }
+                                    $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $i -Style $suffixStyle
+                                    if((-not $usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant())) -and
+                                       (-not (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate)))){
+                                        $copyIndex = $i
+                                        break
+                                    }
+                                }
+                            }
                         }
                         $usedNames[$folderKey + '|' + $candidate.ToLowerInvariant()] = $true
                         $dest = $keeperFolder + '\' + $candidate
@@ -414,15 +441,22 @@ function New-SysOrgPlan {
                             if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
                             if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
                         }
+                        $reason = if($renameToKeeper){
+                            ('Exact copy {0} of {1}; content verified by SHA256' -f $copyIndex, ($orderedMembers.Count + 1))
+                        } else {
+                            'Exact copy (content verified by SHA256); keeps its own name'
+                        }
                         $actions.Add([pscustomobject]@{
                             Action='Move'; Kind='File'; Source="$($m.FullName)"; Destination=$dest; DestRoot=$keeperFolder
-                            SizeBytes=[int64]$m.Length; Family=$keeperFam; CopyIndex=$n; SourceBucket=$null
-                            Reason=('Exact copy {0} of {1}; content verified by SHA256' -f $n, ($orderedMembers.Count + 1))
+                            SizeBytes=[int64]$m.Length; Family=$keeperFam; CopyIndex=$copyIndex; SourceBucket=$null
+                            Reason=$reason
                             Hash="$($dg.Hash)"; DifferentContent=$false
+                            PlannedLength=[int64]$m.Length
+                            PlannedLastWriteTimeUtc=([datetime]$m.LastWriteTime).ToUniversalTime().ToString('o')
                             OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
                         })
-                        $copiesAudit.Numbered++
-                        $groupAudit.Copies += @{ Source="$($m.FullName)"; Assigned=$candidate; Index=$n }
+                        if($copyIndex){ $copiesAudit.Numbered++ }
+                        $groupAudit.Copies += @{ Source="$($m.FullName)"; Assigned=$candidate; Index=$copyIndex }
                     }
                 }
             }
