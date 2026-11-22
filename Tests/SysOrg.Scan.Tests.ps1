@@ -367,8 +367,8 @@ Describe 'Project folder detection and preview stats (v2.1.1)' {
         Set-Content -LiteralPath (Join-Path $root 'real\Makefile')     -Value 'all:'
         Set-Content -LiteralPath (Join-Path $root 'real\CMakeLists.txt') -Value 'proj()'
         $found = @(Get-SysOrgProjectFolders -Roots @($root) -Config $projCfg -DriveProfile $projProf)
-        ($found | Where-Object { $_.Name -eq 'lone' }).Count | Should -Be 0
-        ($found | Where-Object { $_.Name -eq 'real' }).Count | Should -Be 1
+        @($found | Where-Object { $_.Name -eq 'lone' }).Count | Should -Be 0
+        @($found | Where-Object { $_.Name -eq 'real' }).Count | Should -Be 1
     }
     It 'a VCS marker alone still qualifies (.git)' {
         $root = Join-Path $TestDrive ('vcs-' + [guid]::NewGuid().ToString('N').Substring(0,6))

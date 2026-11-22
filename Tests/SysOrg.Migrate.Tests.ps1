@@ -95,12 +95,12 @@ Describe 'v2.1 -> Findable layout migration (Phase 6)' {
         $plan.PlanId | Should -BeLike 'migrate-*'
         (@($plan.Actions).Count) | Should -BeGreaterThan 0
         # the _Index file is never planned and never skipped-as-moved
-        (@($plan.Actions) | Where-Object { "$($_.Source)" -like '*_Index*' }).Count | Should -Be 0
+        @(@($plan.Actions) | Where-Object { "$($_.Source)" -like '*_Index*' }).Count | Should -Be 0
         # whole-folder unit moves where every file shares one target
         $folderMoves = @(@($plan.Actions) | Where-Object { "$($_.Kind)" -eq 'Folder' })
         $folderMoves.Count | Should -Be 2   # Documents\2024 -> Finance\Invoices\2024 AND Documents\Other -> General\2024
-        (@($folderMoves) | Where-Object { "$($_.Destination)" -like '*Documents\Finance\Invoices\2024' }).Count | Should -Be 1
-        (@($folderMoves) | Where-Object { "$($_.Destination)" -like '*Documents\General\2024' }).Count | Should -Be 1
+        @(@($folderMoves) | Where-Object { "$($_.Destination)" -like '*Documents\Finance\Invoices\2024' }).Count | Should -Be 1
+        @(@($folderMoves) | Where-Object { "$($_.Destination)" -like '*Documents\General\2024' }).Count | Should -Be 1
         foreach($a in @($plan.Actions)){
             "$($a.Destination)" | Should -BeLike "$root*"
         }
@@ -133,7 +133,7 @@ Describe 'v2.1 -> Findable layout migration (Phase 6)' {
         }
         $plan = New-SysOrgLayoutMigrationPlan -Letter T -Config $cfg -TargetProfile 'Findable'
         (@($plan.Actions).Count) | Should -Be 0
-        (@($plan.Skipped) | Where-Object { $_.Reason -like 'Already in its Findable place*' }).Count | Should -BeGreaterThan 0
+        @(@($plan.Skipped) | Where-Object { $_.Reason -like 'Already in its Findable place*' }).Count | Should -BeGreaterThan 0
     }
 
     It 'executes and undoes a layout migration through the normal executor' {

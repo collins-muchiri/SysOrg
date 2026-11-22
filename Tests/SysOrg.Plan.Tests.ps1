@@ -215,7 +215,7 @@ Describe 'Plan construction' {
         $keeper[0].Source | Should -Be (Join-Path $root 'Data.bin')   # oldest = keeper keeps its name
         @($plan.Actions | Where-Object { $_.Destination -like '*Data (2).bin' }).Count | Should -Be 1   # own name kept
         @($plan.Actions | Where-Object { $_.Destination -like '*Data (3).bin' }).Count | Should -Be 1   # own name kept
-        ($plan.Actions | Where-Object { $_.CopyIndex }).Count | Should -Be 0
+        @($plan.Actions | Where-Object { $_.CopyIndex }).Count | Should -Be 0
         ($plan.Actions | ForEach-Object { Split-Path $_.Destination -Parent } | Select-Object -Unique).Count | Should -Be 1   # same folder as the keeper
     }
     It 'mutability denials appear in Skipped with reasons and never in Actions (W3)' {
@@ -633,7 +633,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         $res.Summary.Resumed | Should -Be 1
         $res.Summary.Moved   | Should -Be 1
         $raw = Get-Content -LiteralPath $undoPath
-        ($raw | Where-Object { $_ -match ',Status' }).Count | Should -Be 0   # layout untouched
+        @($raw | Where-Object { $_ -match ',Status' }).Count | Should -Be 0   # layout untouched
         $u = Undo-SysOrgPlan -PlanId $planId -AppRoot $TestDrive -Config $planCfg
         $u.Restored | Should -Be 2
     }

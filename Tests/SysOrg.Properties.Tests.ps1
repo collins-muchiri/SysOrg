@@ -128,7 +128,7 @@ Describe 'Property: idempotence, conservation, layout bounds' {
         $rootsInfo = Get-SysOrgScanRoots -Letter T -Config $cfgRescan -Roots @($org)
         $inv2 = @(Get-SysOrgInventory -Letter T -Config $cfgRescan -Roots @($org) -NoCache)
         $plan2 = New-SysOrgPlan -Letter T -Inventory $inv2 -DriveProfile $fakeProf -Config $cfg
-        (@($plan2.Actions) | Where-Object { "$($_.Action)" -eq 'Move' }).Count | Should -Be 0
+        @(@($plan2.Actions) | Where-Object { "$($_.Action)" -eq 'Move' }).Count | Should -Be 0
     }
 
     It 'every planned destination respects depth <= 4 and the root set, with no collisions' {
@@ -146,7 +146,7 @@ Describe 'Property: idempotence, conservation, layout bounds' {
             (@($allowed.Roots) + @($allowed.Exempt)) | Should -Contain $segs[0]
             $dests["$($a.Destination)"] = $true
         }
-        (@($plan.Actions) | Where-Object { "$($_.Action)" -eq 'Move' }).Count | Should -Be ($dests.Count)
+        @(@($plan.Actions) | Where-Object { "$($_.Action)" -eq 'Move' }).Count | Should -Be ($dests.Count)
     }
 
     It 'protected paths never appear in a plan (source or destination)' {

@@ -35,12 +35,12 @@ Describe 'Decision record and safety gates (Phase 2.1)' {
         $d.RuleId | Should -Be 'gate'
         $d.Destination | Should -BeNullOrEmpty
         $d.Confidence | Should -Be 0.0
-        (@($d.Signals) | Where-Object { $_ -like 'Gate: Protected path' }).Count | Should -Be 1
+        @(@($d.Signals) | Where-Object { $_ -like 'Gate: Protected path' }).Count | Should -Be 1
     }
 
     It 'an ungated file records the gate-passed signal and a destination' {
         $d = Invoke-SysOrgClassifyPipeline -Path 'C:\Users\t\Documents\Invoice KRA 2024.pdf' -Extension '.pdf' -Category 'Documents' -Config $script:cfg -DriveProfile $script:prof
-        (@($d.Signals) | Where-Object { $_ -like 'Gate: passed*' }).Count | Should -Be 1
+        @(@($d.Signals) | Where-Object { $_ -like 'Gate: passed*' }).Count | Should -Be 1
         $d.Destination | Should -Be 'Documents\Finance\Invoices'
         $d.Confidence | Should -BeGreaterThan 0
     }
@@ -51,20 +51,20 @@ Describe 'Context signals (Phase 2.2)' {
     It 'detects screenshot, screen-recording, messaging and voice patterns' {
         $c1 = Get-SysOrgContextSignals -Path 'C:\x\Screenshot_2024-01-01.png'
         $c1.IsScreenshot | Should -BeTrue
-        (@($c1.Signals) | Where-Object { $_ -eq 'Context: screenshot filename pattern' }).Count | Should -Be 1
+        @(@($c1.Signals) | Where-Object { $_ -eq 'Context: screenshot filename pattern' }).Count | Should -Be 1
         $c2 = Get-SysOrgContextSignals -Path 'C:\x\screen recording demo.mp4'
         $c2.IsScreenRecording | Should -BeTrue
         $c3 = Get-SysOrgContextSignals -Path 'C:\x\WhatsApp Image 2024-01-01.jpg'
         $c3.IsMessaging | Should -BeTrue
         $c4 = Get-SysOrgContextSignals -Path 'C:\x\VOICE_2024-01-01-WA0001.m4a'
         $c4.IsVoiceNote | Should -BeTrue
-        (@($c4.Signals) | Where-Object { $_ -eq 'Context: voice-recording filename pattern' }).Count | Should -Be 1
+        @(@($c4.Signals) | Where-Object { $_ -eq 'Context: voice-recording filename pattern' }).Count | Should -Be 1
     }
 
     It 'download-root membership comes from the drive profile' {
         $in = Get-SysOrgContextSignals -Path 'C:\dl\setup.exe' -DownloadRoots @('C:\dl')
         $in.InDownloads | Should -BeTrue
-        (@($in.Signals) | Where-Object { $_ -eq 'Context: inside a download root' }).Count | Should -Be 1
+        @(@($in.Signals) | Where-Object { $_ -eq 'Context: inside a download root' }).Count | Should -Be 1
         $out = Get-SysOrgContextSignals -Path 'C:\work\setup.exe' -DownloadRoots @('C:\dl')
         $out.InDownloads | Should -BeFalse
     }
@@ -72,7 +72,7 @@ Describe 'Context signals (Phase 2.2)' {
     It 'an URL bucket is honored as a messaging source' {
         $c = Get-SysOrgContextSignals -Path 'C:\dl\photo.jpg' -UrlBucket 'WhatsApp'
         $c.IsMessaging | Should -BeTrue
-        (@($c.Signals) | Where-Object { $_ -eq 'Context: messaging source WhatsApp' }).Count | Should -Be 1
+        @(@($c.Signals) | Where-Object { $_ -eq 'Context: messaging source WhatsApp' }).Count | Should -Be 1
     }
 }
 
@@ -198,7 +198,7 @@ Describe 'True type: magic-byte sniffing (Phase 2.3)' {
         $tt.Category | Should -Be 'Pictures'
         $d = Invoke-SysOrgClassifyPipeline -Path $p -Extension '.txt' -Category 'Documents' -Config $script:cfg -DriveProfile $script:prof
         $d.Category | Should -Be 'Pictures'
-        (@($d.Signals) | Where-Object { $_ -like 'TrueType: content is image/png*' }).Count | Should -Be 1
+        @(@($d.Signals) | Where-Object { $_ -like 'TrueType: content is image/png*' }).Count | Should -Be 1
     }
 
     It 'detects a type when the extension is missing (%PDF with no extension)' {

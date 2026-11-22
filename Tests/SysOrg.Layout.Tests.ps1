@@ -376,7 +376,7 @@ Describe 'Findable plan: full pipeline integration (Phase 2.9)' {
         (@($plan.Actions).Count) | Should -Be 0
         @($plan.NeedsDecision).Count | Should -Be 1
         $plan.NeedsDecision[0].Disposition | Should -Be 'left in place'
-        (@($plan.Skipped) | Where-Object { $_.Reason -like 'Needs a decision*' }).Count | Should -Be 1
+        @(@($plan.Skipped) | Where-Object { $_.Reason -like 'Needs a decision*' }).Count | Should -Be 1
     }
 
     It 'Review.Mode=Move files unplaceable files under _Review\<Year> (still previewed)' {
