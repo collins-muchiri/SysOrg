@@ -477,3 +477,85 @@ Describe 'Source buckets: AI map, registrable domains, short labels, extensibili
         { Get-SysOrgSourceMap -AppRoot $shapeApp } | Should -Throw '*Sources.psd1*'
     }
 }
+
+Describe 'Family folder names: word-boundary truncation and common prefixes (v3.0.1 A5)' {
+
+    It 'prefers the longest common word-prefix of the members over the longest stem' {
+        $members = @(
+            [pscustomobject]@{ Stem='Peer Education Support Supervision Report January' }
+            [pscustomobject]@{ Stem='Peer Education Support Supervision Report February' }
+            [pscustomobject]@{ Stem='Peer Education Support Supervision Report March' }
+        )
+        $name = Get-SysOrgFamilyFolderName -Members $members -MaxNameLength 60
+        $name | Should -Be 'Peer Education Support Supervision Report'
+    }
+
+    It 'truncates an over-limit family name on a WORD boundary with a 4-char hash suffix' {
+        $longName = 'Peer Education Support Supervision Report January February March April May June July August September October'
+        $name = Get-SysOrgTruncatedFolderName -Name $longName -MaxLength 60
+        $name.Length | Should -BeLessOrEqual 60
+        $name | Should -Match '-[0-9a-f]{4}$'
+        # never cut mid-word: what precedes the hash suffix ends a complete word
+        $stem = $name.Substring(0, $name.Length - 5)
+        $stem | Should -Match '\S$'
+        $stem | Should -Not -Match '\s$'
+        ($longName.ToLowerInvariant().StartsWith(($stem -replace '\s+',' ').ToLowerInvariant() + ' ')) | Should -BeTrue
+        # the canonical example shape from the spec
+        $name | Should -BeLike 'Peer Education Support*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+    }
+
+    It 'is deterministic: same input -> same name; different inputs -> different suffixes' {
+        $a = Get-SysOrgTruncatedFolderName -Name 'Quarterly Narrative Report For The Donor Funded Water Programme In The County Sub-Counties Phase One' -MaxLength 60
+        $b = Get-SysOrgTruncatedFolderName -Name 'Quarterly Narrative Report For The Donor Funded Water Programme In The County Sub-Counties Phase One' -MaxLength 60
+        $c = Get-SysOrgTruncatedFolderName -Name 'Quarterly Narrative Report For The Donor Funded Water Programme In The County Sub-Counties Phase Two' -MaxLength 60
+        $a | Should -Be $b
+        $a | Should -Not -Be $c
+    }
+
+    It 'falls back to the most-frequent stem when members share no common word' {
+        $members = @(
+            [pscustomobject]@{ Stem='invoice' }
+            [pscustomobject]@{ Stem='receipt' }
+            [pscustomobject]@{ Stem='receipt' }
+        )
+        (Get-SysOrgFamilyFolderName -Members $members -MaxNameLength 60) | Should -Be 'receipt'
+    }
+
+    It 'a single word longer than the limit is cut to the budget (documented last resort)' {
+        $word = 'x' * 80
+        $name = Get-SysOrgTruncatedFolderName -Name $word -MaxLength 60
+        $name.Length | Should -BeLessOrEqual 60
+        $name | Should -Match '-[0-9a-f]{4}$'
+    }
+
+    It 'names within the limit pass through sanitized and unchanged' {
+        (Get-SysOrgTruncatedFolderName -Name 'Quarterly Narrative Report' -MaxLength 60) | Should -Be 'Quarterly Narrative Report'
+        (Get-SysOrgCommonWordPrefix -Stems @('report')) | Should -Be 'report'
+        (Get-SysOrgCommonWordPrefix -Stems @('alpha','beta')) | Should -BeNullOrEmpty
+    }
+
+    It 'a long family name can never push the full destination path past the 200-char budget' {
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Layout.psm1') -Force
+        # the Findable layout enforces the path budget on the whole path
+        $longFam = Get-SysOrgTruncatedFolderName -Name 'Peer Education Support Supervision Report January February March April May June July August September October November' -MaxLength 60
+        $p = Compress-SysOrgFindablePath -Path ('C:\Organized\Documents\Work\2026\' + $longFam + '\a very long file name that also needs shortening eventually report.pdf') -Budget 200
+        $p.Length | Should -BeLessOrEqual 200
+    }
+}
+
+Describe 'Family folder name casing (v3.0.1 A5 regression)' {
+    It 'keeps the members original casing: Report family stays Report, not report' {
+        $members = @(
+            [pscustomobject]@{ Stem='Report' }
+            [pscustomobject]@{ Stem='Report - Copy' }
+            [pscustomobject]@{ Stem='Report final v2' }
+        )
+        (Get-SysOrgFamilyFolderName -Members $members -MaxNameLength 60) | Should -Be 'Report'
+        $members2 = @(
+            [pscustomobject]@{ Stem='Peer Education Support Supervision Report January' }
+            [pscustomobject]@{ Stem='peer education support supervision report FEBRUARY' }
+        )
+        # casing comes from the most frequent member carrying the prefix (natural tie-break)
+        (Get-SysOrgFamilyFolderName -Members $members2 -MaxNameLength 60) | Should -Be 'Peer Education Support Supervision Report'
+    }
+}

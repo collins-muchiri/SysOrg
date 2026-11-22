@@ -590,11 +590,94 @@ function Get-SysOrgNameFamilies {
     return [pscustomobject]@{ Lookup=$lookup; Families=$families.ToArray() }
 }
 
+function Get-SysOrgCommonWordPrefix {
+<#
+.SYNOPSIS
+    The longest common word-prefix of a set of stems (v3.0.1 A5).
+.DESCRIPTION
+    Tokenizes every stem into lowercase word tokens and walks the sequences in
+    lockstep; the walk stops at the first differing position. Returns the common
+    tokens joined with spaces, or $null when there is no common word (or any stem
+    has no words at all). Deterministic and order-independent.
+.EXAMPLE
+    Get-SysOrgCommonWordPrefix -Stems @('Peer Education Support Supervision Report January','Peer Education Support Supervision Report February')
+    # -> 'peer education support supervision report'
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Stems)
+    $valid = @(@($Stems) | Where-Object { -not [string]::IsNullOrWhiteSpace("$_") })
+    if($valid.Count -eq 0){ return $null }
+    $seqs = New-Object System.Collections.Generic.List[object]
+    foreach($s in $valid){
+        $words = @([regex]::Split("$s".ToLowerInvariant(), '[^a-z0-9]+') | Where-Object { "$_" -ne '' })
+        if($words.Count -eq 0){ return $null }   # one wordless member -> no common prefix
+        [void]$seqs.Add($words)
+    }
+    $minCount = ($seqs | ForEach-Object { $_.Count } | Measure-Object -Minimum).Minimum
+    $common = New-Object System.Collections.Generic.List[string]
+    for($i=0; $i -lt $minCount; $i++){
+        $w = $seqs[0][$i]
+        foreach($seq in $seqs){
+            if("$($seq[$i])" -cne $w){ return $(if($common.Count -gt 0){ ($common -join ' ') } else { $null }) }
+        }
+        [void]$common.Add($w)
+    }
+    if($common.Count -eq 0){ return $null }
+    return ($common -join ' ')
+}
+
+function Get-SysOrgTruncatedFolderName {
+<#
+.SYNOPSIS
+    Folder-name truncation on a WORD BOUNDARY with a deterministic hash suffix (v3.0.1 A5).
+.DESCRIPTION
+    Names that fit are returned sanitized and unchanged. Names over the limit are
+    cut at the last word boundary that fits and get a '-' + 4-hex SHA256 suffix of
+    the FULL original name, so different long names never collapse into the same
+    folder: 'Peer Education Support Supervision Report-a3f9'. A name that is one
+    single word longer than the limit (no word boundary at all) is cut at the
+    budget - documented last resort, the hash suffix still keeps it collision-safe.
+    The suffix is computed from the ORIGINAL name (before sanitizing), so the same
+    input always produces the same folder name on every host and run.
+.EXAMPLE
+    Get-SysOrgTruncatedFolderName -Name 'Peer Education Support Supervision Report January 2026 Final' -MaxLength 60
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name,[int]$MaxLength=60)
+    $n = "$Name"
+    if($n.Length -le $MaxLength){ return (Get-SysOrgSafeFolderName -Name $n -MaxLength $MaxLength) }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try{
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($n.ToLowerInvariant())
+        $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+    } finally { $sha.Dispose() }
+    $suffix = ('-{0}' -f $hash.Substring(0,4).ToLowerInvariant())
+    $budget = $MaxLength - $suffix.Length
+    if($budget -lt 4){ $budget = 4 }
+    $cut = $n.Substring(0, $budget)
+    # never cut mid-word: drop the trailing partial word (unless there is no space at all)
+    $lastSpace = $cut.LastIndexOf(' ')
+    if($lastSpace -gt 0){ $cut = $cut.Substring(0, $lastSpace).TrimEnd() }
+    $cut = $cut.Trim()
+    if([string]::IsNullOrWhiteSpace($cut)){ $cut = $n.Substring(0, $budget).Trim() }
+    return (Get-SysOrgSafeFolderName -Name ($cut + $suffix) -MaxLength $MaxLength)
+}
+
 function Get-SysOrgFamilyFolderName {
 <#
 .SYNOPSIS
     Family folder name: most frequent original stem among members, sanitized.
 .DESCRIPTION
+    v3.0.1 A5: the LONGEST COMMON WORD-PREFIX of the members is preferred over the
+    most frequent stem - 'Peer Education Support Supervision Report January' +
+    '... February' produce 'Peer Education Support Supervision Report', not one
+    member's date. When the members share no common word, the previous rule
+    (most frequent original stem, ties by natural order) applies unchanged.
+    Over-length names are truncated on a word boundary with a deterministic
+    4-character hash suffix (never mid-word) via Get-SysOrgTruncatedFolderName.
+    The Findable layout additionally enforces the 200-character path budget on the
+    FULL destination path (Compress-SysOrgFindablePath), so a family folder name can
+    never push a path beyond the budget.
     Ties break by natural name order (deterministic across runs, W7).
 .EXAMPLE
     Get-SysOrgFamilyFolderName -Members $records -MaxNameLength 60   # -> 'Report'
@@ -602,20 +685,55 @@ function Get-SysOrgFamilyFolderName {
     param([Parameter(Mandatory)]$Members,[int]$MaxNameLength=60)
     $stemCounts = @{}
     $stemOriginal = @{}
+    $allStems = New-Object System.Collections.Generic.List[string]
     foreach($m in @($Members)){
         $orig = [string]$m.Stem
+        if([string]::IsNullOrWhiteSpace($orig)){ continue }
+        [void]$allStems.Add($orig)
         $k2 = $orig.ToLowerInvariant()
         if(-not $stemCounts.ContainsKey($k2)){ $stemCounts[$k2] = 0; $stemOriginal[$k2] = $orig }
         $stemCounts[$k2]++
     }
-    $best = $null; $bestCount = -1
-    $ordered = Sort-SysOrgNatural -Values @($stemCounts.Keys)
-    foreach($st in $ordered){
-        if($stemCounts[$st] -gt $bestCount){ $bestCount = $stemCounts[$st]; $best = $st }
+    # A5: prefer the members' longest common word-prefix (a TRUE family name over a
+    # single member's name), fall back to the most-frequent stem.
+    $best = $null
+    $prefix = Get-SysOrgCommonWordPrefix -Stems $allStems.ToArray()
+    if($prefix -and ("$prefix".Length -ge 4)){
+        # restore the ORIGINAL casing/separators from a member stem that carries the
+        # prefix - the prefix itself is lowercase ('report'), but the folder must read
+        # like the user's own name ('Report'); path comparisons are case-insensitive
+        # on Windows and the tests rely on the original casing.
+        $prefixWords = @([regex]::Split("$prefix", ' ') | Where-Object { "$_" -ne '' })
+        $bestPrefix = $null
+        $bestCount = -1
+        $orderedStems = Sort-SysOrgNatural -Values @($stemOriginal.Keys)
+        foreach($k in $orderedStems){
+            $orig = [string]$stemOriginal[$k]
+            $ow = @([regex]::Split($orig.ToLowerInvariant(), '[^a-z0-9]+') | Where-Object { "$_" -ne '' })
+            if($ow.Count -lt $prefixWords.Count){ continue }
+            $match = $true
+            for($i=0; $i -lt $prefixWords.Count; $i++){
+                if("$($ow[$i])" -cne "$($prefixWords[$i])"){ $match = $false; break }
+            }
+            if(-not $match){ continue }
+            if($stemCounts[$k] -gt $bestCount){
+                $bestCount = $stemCounts[$k]
+                $tokens = @([regex]::Matches($orig, '[A-Za-z0-9]+') | Select-Object -First $prefixWords.Count | ForEach-Object { "$($_.Value)" })
+                $bestPrefix = ($tokens -join ' ')
+            }
+        }
+        if($bestPrefix){ $best = $bestPrefix } else { $best = $prefix }
     }
-    if(-not $best){ $best = 'Family' }
-    else { $best = $stemOriginal[$best] }   # keep the original stem's casing
-    return (Get-SysOrgSafeFolderName -Name $best -MaxLength $MaxNameLength)
+    else {
+        $bestCount = -1
+        $ordered = Sort-SysOrgNatural -Values @($stemCounts.Keys)
+        foreach($st in $ordered){
+            if($stemCounts[$st] -gt $bestCount){ $bestCount = $stemCounts[$st]; $best = $st }
+        }
+        if(-not $best){ $best = 'Family' }
+        else { $best = $stemOriginal[$best] }   # keep the original stem's casing
+    }
+    return (Get-SysOrgTruncatedFolderName -Name $best -MaxLength $MaxNameLength)
 }
 
 function Get-SysOrgProjectFolders {
