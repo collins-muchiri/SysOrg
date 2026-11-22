@@ -342,7 +342,7 @@ Describe 'Event clustering (Phase 2.7)' {
         }
         $r = Get-SysOrgEventClusters -Records $recs -Config $script:cfg
         (@($r.Map.Keys).Count) | Should -Be 20
-        $r.Map['C:\pics\IMG_0000.jpg'] | Should -Match '^Events\\2024-06-01 to 06-01$'
+        $r.Map['C:\pics\IMG_0000.jpg'] | Should -Match '^Pictures\\Events\\2024-06-01 to 06-01$'
     }
 
     It 'photos spread across days stay in their date leaves (no event)' {

@@ -87,6 +87,25 @@ function New-SysOrgPlan {
     $layoutMin = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
     $layoutPathBudget = [int](Get-SysOrgSetting $Config 'Layout.MaxPathChars' 200)
     $relBaseOf = @{}
+    $noDateOf = @{}   # rule-matched leaves carry their own date tokens - never add another
+    # v3.0 Phase 2.9: decision records per source + rule sets loaded ONCE (fail closed:
+    # an invalid user-rules file refuses the whole plan)
+    $decOf = @{}
+    $needsDecision = New-Object System.Collections.Generic.List[object]
+    $minConfidence = [double](Get-SysOrgSetting $Config 'Classify.MinConfidence' 0.40)
+    $reviewMode = "$(Get-SysOrgSetting $Config 'Review.Mode' 'Report')"
+    $reviewFolder = "$(Get-SysOrgSetting $Config 'Review.FolderName' '_Review')"
+    $planAppRoot = "$(Get-SysOrgSetting $Config 'AppRoot' '')"
+    $userRules = @()
+    $learnedRules = @()
+    if($findable){
+        $userRules = @(Get-SysOrgUserRules -Config $Config -AppRoot $planAppRoot)
+        $learnedPath = "$(Get-SysOrgSetting $Config 'Rules.LearnedRulesPath' '')"
+        if([string]::IsNullOrWhiteSpace($learnedPath)){
+            try { $learnedPath = ((Get-SysOrgDestinationRoot -Letter $Letter -Config $Config) + '\_Index\LearnedRules.psd1') } catch { $learnedPath = '' }
+        }
+        $learnedRules = @(Get-SysOrgLearnedRules -Config $Config -Path $learnedPath)
+    }
 
     $copiesPolicy = "$(Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies')"
     $qFolder      = "$(Get-SysOrgSetting $Config 'Copies.QuarantineFolderName' '_Duplicates')"
@@ -246,14 +265,52 @@ function New-SysOrgPlan {
             } else {
                 if($folderMap.ContainsKey($category)){ $pk = "$($folderMap[$category])" } else { $pk = "$($folderMap['Other'])" }
             }
-            # v3.0 Findable: the leaf base comes from the Findable routing table
-            # (subtype heuristics now; the Phase 2 Decision pipeline feeds richer signals
-            # into the same contract). Downloads keeps its provenance branch shape.
+            # v3.0 Findable: the FULL Decision pipeline runs here (context, true type,
+            # metadata extractors, date resolution, lexicon, user/learned rules,
+            # confidence gating). Safety gates already passed above - the pipeline's
+            # gate stage is unused in the plan path.
             if($findable){
-                $subtype = Get-SysOrgFindableSubtype -Category $category -Name "$($f.Name)" -Source "$sourceName"
-                $typeLeaf = Get-SysOrgFindableTypeLeaf -Category $category
-                $rb = Get-SysOrgFindableRelBase -Category $category -Subtype $subtype -Source "$sourceName" -Name "$($f.Name)" -InDownloads:$downloadContext -TypeLeaf $typeLeaf
-                $pk = "$($rb.RelBase)"
+                $dec = Invoke-SysOrgClassifyPipeline -Path $src -Extension "$($f.Extension)" -Category "$category" `
+                    -Config $Config -DriveProfile $DriveProfile -UrlBucket "$bucket" `
+                    -IncludeMetadata -UserRules $userRules -LearnedRules $learnedRules -AppRoot "$planAppRoot"
+                $decOf[$src] = $dec
+                $inReviewMove = $false
+                if($dec.NeedsDecision){
+                    # below MinConfidence: never moved silently. Review.Mode='Report'
+                    # leaves the file in place; Mode='Move' files it under _Review\<Year>.
+                    if("$reviewMode" -ieq 'Move'){
+                        $inReviewMove = $true
+                        $reviewLeaf = ('{0}\{1}' -f "$reviewFolder", $((Get-Date).ToString('yyyy')))
+                        $pk = $reviewLeaf
+                        [void]$needsDecision.Add([pscustomobject]@{ Source=$src; Confidence=$dec.Confidence; Disposition='moved to review folder' })
+                    } else {
+                        [void]$needsDecision.Add([pscustomobject]@{ Source=$src; Confidence=$dec.Confidence; Disposition='left in place' })
+                        Add-SysOrgPlanSkip -Source $src -Reason ('Needs a decision: confidence {0} below {1} ({2})' -f $dec.Confidence, $minConfidence, $dec.RuleId)
+                        continue
+                    }
+                }
+                if(-not $inReviewMove){
+                    if($dec.RuleId -like 'user:*' -or $dec.RuleId -like 'learned:*'){
+                        # rule destination templates expand with the decision context; the
+                        # template IS the leaf base (no additional date segment)
+                        $ctxTok = @{ Stem=[System.IO.Path]::GetFileNameWithoutExtension("$($f.Name)"); Source="$sourceName" }
+                        $decDate = $dec.Date
+                        if($null -eq $decDate){ $decDate = $f.LastWriteTime }
+                        $ctxTok.Year = ([datetime]$decDate).ToString('yyyy')
+                        $ctxTok.Month = ([datetime]$decDate).ToString('MM')
+                        $ctxTok.Day = ([datetime]$decDate).ToString('dd')
+                        $ctxTok.Date = ([datetime]$decDate).ToString('yyyy-MM-dd')
+                        if($dec.Meta){
+                            if($dec.Meta.Artist){ $ctxTok.Artist = "$($dec.Meta.Artist)" }
+                            if($dec.Meta.Album){ $ctxTok.Album = "$($dec.Meta.Album)" }
+                        }
+                        $pk = (Expand-SysOrgRuleTemplate -Template $dec.Destination -Context $ctxTok)
+                        $noDateOf[$src] = $true
+                    } else {
+                        $pk = "$($dec.Destination)"
+                    }
+                    if([string]::IsNullOrWhiteSpace($pk)){ $pk = "$($folderMap['Other'])" }
+                }
                 $relBaseOf[$src] = $pk
             }
             $context[$src] = @{ Rel=$pk; Category=$category; Source=$sourceName; InDownloads=$inDownloads }
@@ -271,10 +328,32 @@ function New-SysOrgPlan {
 
     # v3.0 Findable: adaptive date granularity is computed over the WHOLE routed set
     # (per leaf), so a leaf only splits when it really exceeds the cap. Family leaves
-    # stay date-free unless they themselves exceed the cap.
+    # stay date-free unless they themselves exceed the cap. Dates come from the
+    # Decision records (metadata > filename > filesystem), and photo/video events
+    # (Phase 2.7) override the date segment with their 'Events\<range>' leaf.
     $destRelOf = @{}
+    $eventMap = @{}
     if($findable){
         $routedArr = $routed.ToArray()
+        $mediaRecs = New-Object System.Collections.Generic.List[object]
+        foreach($f in $routedArr){
+            $src2 = "$($f.FullName)"
+            $dec = $null
+            if($decOf.ContainsKey($src2)){ $dec = $decOf[$src2] }
+            if(-not $dec){ continue }
+            if($dec.Category -in @('Pictures','Videos')){
+                $decDate = $dec.Date
+                if($null -eq $decDate){ $decDate = $f.LastWriteTime }
+                $lat = $null; $lon = $null
+                if($dec.Meta){
+                    if($dec.Meta.ContainsKey('GpsLat')){ $lat = $dec.Meta['GpsLat'] }
+                    if($dec.Meta.ContainsKey('GpsLon')){ $lon = $dec.Meta['GpsLon'] }
+                }
+                [void]$mediaRecs.Add([pscustomobject]@{ Path=$src2; Date=$decDate; GpsLat=$lat; GpsLon=$lon })
+            }
+        }
+        try { $events = Get-SysOrgEventClusters -Records $mediaRecs.ToArray() -Config $Config; $eventMap = $events.Map } catch { $eventMap = @{} }
+
         $recs = New-Object System.Collections.Generic.List[object]
         foreach($f in $routedArr){
             $src2 = "$($f.FullName)"
@@ -284,7 +363,15 @@ function New-SysOrgPlan {
                 if($folderMap.ContainsKey("$($f.Category)")){ $rb = "$($folderMap[$($f.Category)])" } else { $rb = "$($folderMap['Other'])" }
             }
             $isFam = $fam.Lookup.ContainsKey($src2)
-            [void]$recs.Add([pscustomobject]@{ Key=$rb; FileKey=$src2; Date=$f.LastWriteTime; Family=$isFam })
+            $decDate = $f.LastWriteTime
+            $takesDate = $true
+            if($noDateOf.ContainsKey($src2)){ $takesDate = $false }
+            if($decOf.ContainsKey($src2)){
+                $dec = $decOf[$src2]
+                if($dec.Date){ $decDate = $dec.Date }
+                if(-not $noDateOf.ContainsKey($src2)){ $takesDate = [bool]$dec.TakesDate }
+            }
+            [void]$recs.Add([pscustomobject]@{ Key=$rb; FileKey=$src2; Date=$decDate; Family=$isFam; TakesDate=$takesDate })
         }
         $segs = Add-SysOrgFindableDateSegments -Records $recs.ToArray() -Cap $layoutCap -MinPerFolder $layoutMin
         foreach($f in $routedArr){
@@ -293,14 +380,19 @@ function New-SysOrgPlan {
             if($fam.Lookup.ContainsKey($src2)){ $famInfo2 = $fam.Lookup[$src2] }
             if($famInfo2 -and $famInfo2.Partition){
                 $destRelOf[$src2] = [string]$famInfo2.Partition
+            } elseif($eventMap.ContainsKey($src2)){
+                $destRelOf[$src2] = [string]$eventMap[$src2]   # Pictures\Events\<range>: the range IS the leaf
             } else {
                 $rb = ''
                 if($relBaseOf.ContainsKey($src2)){ $rb = [string]$relBaseOf[$src2] }
                 if(-not $rb){
                     if($folderMap.ContainsKey("$($f.Category)")){ $rb = "$($folderMap[$($f.Category)])" } else { $rb = "$($folderMap['Other'])" }
                 }
+                $takesDate = $true
+                if($noDateOf.ContainsKey($src2)){ $takesDate = $false }
+                elseif($decOf.ContainsKey($src2)){ $takesDate = [bool]$decOf[$src2].TakesDate }
                 $seg = ''
-                if($segs.ContainsKey($rb.ToLowerInvariant()) -and $segs[$rb.ToLowerInvariant()].ContainsKey($src2)){ $seg = [string]$segs[$rb.ToLowerInvariant()][$src2] }
+                if($takesDate -and $segs.ContainsKey($rb.ToLowerInvariant()) -and $segs[$rb.ToLowerInvariant()].ContainsKey($src2)){ $seg = [string]$segs[$rb.ToLowerInvariant()][$src2] }
                 if($seg){ $destRelOf[$src2] = ($rb + '\' + $seg) } else { $destRelOf[$src2] = $rb }
             }
         }
@@ -388,6 +480,13 @@ function New-SysOrgPlan {
             }
             # v2.1.1: capture plan-time metadata so the executor can detect a source that
             # changed between planning and execution. Stored as a round-trip-safe UTC string.
+            # v3.0: Decision provenance rides along (confidence, rule, review flag).
+            $decConf = $null; $decRule = $null; $decReview = $false
+            if($decOf.ContainsKey($src)){
+                $decConf = $decOf[$src].Confidence
+                $decRule = $decOf[$src].RuleId
+                $decReview = (@($decOf[$src].Flags) -contains 'review')
+            }
             $actions.Add([pscustomobject]@{
                 Action='Move'; Kind='File'; Source=$src; Destination=$dest; DestRoot=$destRoot
                 SizeBytes=[int64]$f.Length; Family=$famName; CopyIndex=$null
@@ -395,6 +494,7 @@ function New-SysOrgPlan {
                 PlannedLength=[int64]$f.Length
                 PlannedLastWriteTimeUtc=([datetime]$f.LastWriteTime).ToUniversalTime().ToString('o')
                 OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
+                Confidence=$decConf; RuleId=$decRule; ReviewFlag=$decReview
             })
             $actionFolderBySrc[$src] = $destFolder
         } catch {
@@ -643,6 +743,7 @@ function New-SysOrgPlan {
         Copies          = [pscustomobject]$copiesAudit
         Mutability      = [pscustomobject]@{ Allowed=$mutAllowed; DeniedTotal=$deniedTotal; Denied=$deniedList }
         OneDrive        = [pscustomobject]@{ SyncOut=@($odSyncOut.ToArray()); IntoCloud=@($odIntoCloud.ToArray()) }
+        NeedsDecision   = $needsDecision.ToArray()
         Warnings        = @($warnings.ToArray())
         Provenance      = @($provRows.ToArray())
         ProvenanceFile  = ''
@@ -977,6 +1078,22 @@ function Show-SysOrgPlan {
         Write-Host ("Name collisions with different content: {0} (renamed safely at execution; originals are never overwritten)" -f $dc.Count) -ForegroundColor Yellow
     }
 
+    # v3.0 Phase 2.9: needs-a-decision files (below MinConfidence) + review-flagged moves
+    $reviewMoves = @($fileMoves | Where-Object { $_.PSObject.Properties['ReviewFlag'] -and $_.ReviewFlag })
+    if($reviewMoves.Count -gt 0){
+        Write-Host ''
+        Write-Host ("Review-flagged moves (confidence below {0}): {1} - planned, but worth a look" -f 0.70, $reviewMoves.Count) -ForegroundColor Yellow
+    }
+    if($Plan.PSObject.Properties['NeedsDecision'] -and @($Plan.NeedsDecision).Count -gt 0){
+        Write-Host ''
+        Write-Host ("NEEDS A DECISION ({0} file(s) - not moved automatically):" -f @($Plan.NeedsDecision).Count) -ForegroundColor Yellow
+        foreach($nd in (@($Plan.NeedsDecision) | Select-Object -First 10)){
+            Write-Host ('  ' + $nd.Source + '  [confidence ' + $nd.Confidence + ' - ' + $nd.Disposition + ']') -ForegroundColor DarkYellow
+        }
+        if(@($Plan.NeedsDecision).Count -gt 10){ Write-Host ('  ... and {0} more' -f (@($Plan.NeedsDecision).Count - 10)) -ForegroundColor DarkGray }
+        Write-Host '  These files are listed, never dumped into a junk folder. Use -Explain <path> to see why.' -ForegroundColor Gray
+    }
+
     # v2.1.1: per folder move, show the file count, the number of non-code files inside,
     # and any blocked-extension files found OUTSIDE build-output directories (surfaced -
     # the folder still moves; the user sees the risk before confirming).
@@ -1010,7 +1127,9 @@ function Show-SysOrgPlan {
     Write-Host 'Sample moves:' -ForegroundColor White
     $moves | Select-Object -First $SampleSize | ForEach-Object {
         Write-Host ('  ' + $_.Source) -ForegroundColor DarkGray
-        Write-Host ('    -> {0}   [{1}]' -f $_.Destination, $_.Reason) -ForegroundColor Gray
+        $confTag = ''
+        if($_.PSObject.Properties['Confidence'] -and ($null -ne $_.Confidence)){ $confTag = ('  [conf {0}]' -f $_.Confidence) }
+        Write-Host ('    -> {0}   [{1}]{2}' -f $_.Destination, $_.Reason, $confTag) -ForegroundColor Gray
     }
     if($moves.Count -gt $SampleSize){ Write-Host ('  ... and {0} more moves' -f ($moves.Count - $SampleSize)) }
     Write-Host ''

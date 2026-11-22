@@ -233,10 +233,17 @@ Describe 'Findable plan integration' {
                 $i++
                 $dir = Join-Path $work 'src'
                 # keep name patterns realistic; voice notes must START with 'VOICE'
-                $name = if($k.C -eq 'Audio'){ ('VOICE_2024-0{0}-WA1.m4a' -f $c) } else { ("{0}{1}" -f $c, $k.N) }
-                $inv += [pscustomobject]@{ FullName=(Join-Path $dir $name); Name=$name
+                $name = if($k.C -eq 'Audio'){ ('VOICE_2024-0{0}-WA1.m4a' -f $c) } else { ("{0}-{1}{2}" -f [System.IO.Path]::GetFileNameWithoutExtension($k.N), $c, [System.IO.Path]::GetExtension($k.N)) }
+                $fp = Join-Path $dir $name
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                Set-Content -LiteralPath $fp -Value ('x' * 30) -Encoding ASCII
+                # the v3.0 pipeline reads the REAL file: min(Creation,LastWrite) needs both set
+                $stamp = Get-Date '2024-06-15'
+                $fi = Get-Item -LiteralPath $fp
+                $fi.CreationTime = $stamp; $fi.LastWriteTime = $stamp
+                $inv += [pscustomobject]@{ FullName=$fp; Name=$name
                     Stem=[System.IO.Path]::GetFileNameWithoutExtension($name); Extension=[System.IO.Path]::GetExtension($name)
-                    Length=10; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category=$k.C }
+                    Length=30; LastWriteTime=$stamp; Directory=$dir; Category=$k.C }
             }
         }
         $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $script:baseCfg
@@ -276,6 +283,12 @@ Describe 'Findable plan integration' {
             KnownFolders=@(); DownloadRoots=@((Join-Path $work 'src')); Artifacts=@(); TopLevelDirs=@() }
         $inv = @([pscustomobject]@{ FullName=(Join-Path $work 'src\setup-vlc-3.0.exe'); Name='setup-vlc-3.0.exe'; Stem='setup-vlc-3.0'
             Extension='.exe'; Length=10; LastWriteTime=(Get-Date '2024-06-15'); Directory=(Join-Path $work 'src'); Category='Installers' })
+        New-Item -ItemType Directory -Path (Join-Path $work 'src') -Force | Out-Null
+        $exePath = Join-Path $work 'src\setup-vlc-3.0.exe'
+        Set-Content -LiteralPath $exePath -Value 'MZ fake installer' -Encoding ASCII
+        $stampExe = Get-Date '2024-06-15'
+        $fiExe = Get-Item -LiteralPath $exePath
+        $fiExe.CreationTime = $stampExe; $fiExe.LastWriteTime = $stampExe
         $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $prof -Config $script:baseCfg
         (@($plan.Actions).Count) | Should -Be 1
         "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*Downloads\_NoSource\Software\2024\setup-vlc-3.0.exe'
@@ -315,5 +328,135 @@ Describe 'Findable plan integration' {
         foreach($a in @($plan.Actions)){
             "$($a.Destination)".Length | Should -BeLessOrEqual 200
         }
+    }
+}
+
+Describe 'Findable plan: full pipeline integration (Phase 2.9)' {
+
+    BeforeAll {
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Metadata.psm1') -Force
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Classify.psm1') -Force
+    }
+
+    It 'a tax document routes via the lexicon with confidence on the action' {
+        $dir = Join-Path $TestDrive 'src-lex'
+        $txt = Join-Path $dir 'KRA PAYE return 2024.txt'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Set-Content -LiteralPath $txt -Value 'KENYA PAYE tax return for 2024. VAT and withholding tax. itax pin P051234456X.' -Encoding UTF8
+        $stamp = Get-Date '2024-06-15'
+        $fi = Get-Item -LiteralPath $txt
+        $fi.CreationTime = $stamp; $fi.LastWriteTime = $stamp
+        $inv = @([pscustomobject]@{ FullName=$txt; Name='KRA PAYE return 2024.txt'; Stem='KRA PAYE return 2024'
+            Extension='.txt'; Length=90; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Documents' })
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $script:baseCfg
+        (@($plan.Actions).Count) | Should -Be 1
+        $a = @($plan.Actions)[0]
+        "$($a.Destination)" | Should -BeLike '*Documents\Finance\Tax\2024\KRA PAYE return 2024.txt'
+        $a.RuleId | Should -Be 'lexicon'
+        $a.Confidence | Should -BeGreaterOrEqual 0.70
+        $a.ReviewFlag | Should -BeFalse
+    }
+
+    It 'an unplaceable file is left in place and listed as needing a decision' {
+        $dir = Join-Path $TestDrive 'src-mystery'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $p = Join-Path $dir 'blob.bin'
+        [System.IO.File]::WriteAllBytes($p, [byte[]]@(1,2,3,4,5,6,7,8,9,10,11,12))
+        $stampB1 = Get-Date '2024-06-15'
+        $fiB1 = Get-Item -LiteralPath $p
+        $fiB1.CreationTime = $stampB1; $fiB1.LastWriteTime = $stampB1
+        $inv = @([pscustomobject]@{ FullName=$p; Name='blob.bin'; Stem='blob'
+            Extension='.bin'; Length=12; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Other' })
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $script:baseCfg
+        (@($plan.Actions).Count) | Should -Be 0
+        @($plan.NeedsDecision).Count | Should -Be 1
+        $plan.NeedsDecision[0].Disposition | Should -Be 'left in place'
+        (@($plan.Skipped) | Where-Object { $_.Reason -like 'Needs a decision*' }).Count | Should -Be 1
+    }
+
+    It 'Review.Mode=Move files unplaceable files under _Review\<Year> (still previewed)' {
+        $cfg2 = @{} + $script:baseCfg
+        $cfg2.Review = @{ Mode='Move'; FolderName='_Review' }
+        $dir = Join-Path $TestDrive 'src-mystery2'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $p = Join-Path $dir 'blob2.bin'
+        [System.IO.File]::WriteAllBytes($p, [byte[]]@(1,2,3,4,5,6,7,8,9,10,11,12))
+        $stampB = Get-Date '2024-06-15'
+        $fiB = Get-Item -LiteralPath $p
+        $fiB.CreationTime = $stampB; $fiB.LastWriteTime = $stampB
+        $inv = @([pscustomobject]@{ FullName=$p; Name='blob2.bin'; Stem='blob2'
+            Extension='.bin'; Length=12; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Other' })
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $cfg2
+        (@($plan.Actions).Count) | Should -Be 1
+        "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*_Review\*\blob2.bin'
+    }
+
+    It 'a user rule wins over the built-in pipeline and its template expands' {
+        $rulesPath = Join-Path $TestDrive 'UserRules2.psd1'
+        Set-Content -LiteralPath $rulesPath -Value "@{ Rules = @( @{ Name='tax-pdf'; Priority=1; When=@{ NameRegex='(?i)kra' }; Destination='Documents\Work\{Year}' } ) }" -Encoding UTF8
+        $cfg2 = @{} + $script:baseCfg
+        $cfg2.Rules = @{ UserRulesPath=$rulesPath; LexiconPath=''; ApplyLearned=$false; LearnedRulesPath='' }
+        $dir = Join-Path $TestDrive 'src-rule'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $p = Join-Path $dir 'KRA payment slip.txt'
+        Set-Content -LiteralPath $p -Value 'payment received' -Encoding UTF8
+        $stampRule = Get-Date '2024-06-15'
+        $fiRule = Get-Item -LiteralPath $p
+        $fiRule.CreationTime = $stampRule; $fiRule.LastWriteTime = $stampRule
+        $inv = @([pscustomobject]@{ FullName=$p; Name='KRA payment slip.txt'; Stem='KRA payment slip'
+            Extension='.txt'; Length=20; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Documents' })
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $cfg2
+        (@($plan.Actions).Count) | Should -Be 1
+        "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*Documents\Work\2024\KRA payment slip.txt'
+        (@($plan.Actions)[0].RuleId) | Should -Be 'user:tax-pdf'
+    }
+
+    It 'tagged music routes to Music\<Artist>\<Album> without a date segment' {
+        $dir = Join-Path $TestDrive 'src-music'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $p = Join-Path $dir 'song.mp3'
+        [System.IO.File]::WriteAllBytes($p, [System.Text.Encoding]::ASCII.GetBytes('ID3' + [char]3 + [char]0 + 'some mp3 bytes here for the test file'))
+        $stampM = Get-Date '2024-06-15'
+        $fiM = Get-Item -LiteralPath $p
+        $fiM.CreationTime = $stampM; $fiM.LastWriteTime = $stampM
+        $inv = @([pscustomobject]@{ FullName=$p; Name='song.mp3'; Stem='song'
+            Extension='.mp3'; Length=40; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Audio' })
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $script:baseCfg
+        (@($plan.Actions).Count) | Should -Be 1
+        # no ID3 artist -> _Untagged with a date segment
+        "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*Music\_Untagged\2024\song.mp3'
+    }
+
+    It 'a 20-photo burst routes to Pictures\Events\<range>' {
+        $dir = Join-Path $TestDrive 'src-event'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $inv = @()
+        $base = [datetime]::new(2024,6,1,9,0,0)
+        for($i=0; $i -lt 20; $i++){
+            $p = Join-Path $dir ('IMG_{0:D4}.jpg' -f $i)
+            Set-Content -LiteralPath $p -Value ('x' * 30) -Encoding ASCII
+            $stampI = $base.AddMinutes($i)
+            $fiI = Get-Item -LiteralPath $p
+            $fiI.CreationTime = $stampI; $fiI.LastWriteTime = $stampI
+            $inv += [pscustomobject]@{ FullName=$p; Name=('IMG_{0:D4}.jpg' -f $i); Stem=('IMG_{0:D4}' -f $i)
+                Extension='.jpg'; Length=30; LastWriteTime=$base.AddMinutes($i); Directory=$dir; Category='Pictures' }
+        }
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $script:baseCfg
+        (@($plan.Actions).Count) | Should -Be 20
+        "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*Pictures\Events\2024-06-01 to 06-01\IMG_*.jpg'
+    }
+
+    It 'an invalid user-rules file fails the whole plan (fail closed)' {
+        $bad = Join-Path $TestDrive 'BadRulesPlan.psd1'
+        Set-Content -LiteralPath $bad -Value "@{ Rules = @( @{ Name='r'; Priority=1; When=@{ NameRegex='(' }; Destination='X' } ) }" -Encoding UTF8
+        $cfg2 = @{} + $script:baseCfg
+        $cfg2.Rules = @{ UserRulesPath=$bad; LexiconPath=''; ApplyLearned=$false; LearnedRulesPath='' }
+        $dir = Join-Path $TestDrive 'src-badrules'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $p = Join-Path $dir 'note.txt'
+        Set-Content -LiteralPath $p -Value 'hi' -Encoding ASCII
+        $inv = @([pscustomobject]@{ FullName=$p; Name='note.txt'; Stem='note'
+            Extension='.txt'; Length=2; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Documents' })
+        { New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $cfg2 } | Should -Throw '*NameRegex*'
     }
 }

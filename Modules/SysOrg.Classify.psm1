@@ -44,6 +44,8 @@ function New-SysOrgDecision {
         RuleId        = ''          # 'gate:*', 'user:<name>', 'learned:<name>', 'context:*', 'type:*', 'lexicon:*', 'default'
         Date          = $null
         DateSource    = ''
+        TakesDate     = $true        # false for event/music/installer leaves
+        Meta          = $null        # metadata hashtable when -IncludeMetadata
         Signals       = New-Object System.Collections.Generic.List[string]
         NeedsDecision = $false      # below Classify.MinConfidence -> left in place / _Review
         Flags         = New-Object System.Collections.Generic.List[string]   # 'review', 'gate', ...
@@ -211,7 +213,7 @@ function Invoke-SysOrgClassifyPipeline {
     $resolved = $null
     if($IncludeMetadata){
         try {
-            $meta = Get-SysOrgFileMetadata -Path $Path -Extension $ext -Category $cat -Extractors $Extractors
+            $meta = Get-SysOrgFileMetadata -Path $Path -Extension $ext -Extractors $Extractors
             if($meta){ [void]$d.Signals.Add(('Metadata: ' + $meta.Source + ' -> ' + (Get-SysOrgMetadataSummary -Metadata $meta))) }
         } catch { [void]$d.Signals.Add(('Metadata: failed soft (' + $_.Exception.Message + ')')) }
         try {
@@ -270,6 +272,8 @@ function Invoke-SysOrgClassifyPipeline {
             $d.Category = 'Music'
         }
         $d.Destination = $rb.RelBase
+        $d.TakesDate = [bool]$rb.TakesDate
+        if($meta){ $d.Meta = $meta }
     } catch { [void]$d.Signals.Add(('Destination: failed soft (' + $_.Exception.Message + ')')) }
 
     return $d
@@ -852,7 +856,8 @@ function Get-SysOrgEventClusters {
         $start = [datetime]$members[0].Date
         $end = [datetime]$members[$members.Count - 1].Date
         $endLabel = if($start.Year -eq $end.Year){ $end.ToString('MM-dd') } else { $end.ToString('yyyy-MM-dd') }
-        $eventId = ('Events\{0} to {1}' -f $start.ToString('yyyy-MM-dd'), $endLabel)
+        # the Findable tree hosts events under Pictures\Events (photos and videos alike)
+        $eventId = ('Pictures\Events\{0} to {1}' -f $start.ToString('yyyy-MM-dd'), $endLabel)
         foreach($m in $members){ $map["$($m.Path)"] = $eventId }
     }
     return [pscustomobject]@{ Map=$map; Clusters=$clusters.ToArray() }

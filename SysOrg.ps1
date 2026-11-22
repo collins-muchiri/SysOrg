@@ -55,6 +55,7 @@ Import-Module (Join-Path $moduleRoot 'SysOrg.KnownFolders.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Drives.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Layout.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Metadata.psm1')    -Force
+Import-Module (Join-Path $moduleRoot 'SysOrg.Classify.psm1')    -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
@@ -444,6 +445,21 @@ if($AuditDrive){
 }
 if($Benchmark){
     Invoke-SysOrgBenchmarkFlow -Corpus $BenchmarkCorpus -Files $BenchmarkFiles -BenchSeed $BenchmarkSeed
+    return
+}
+if($Explain){
+    # v3.0 Phase 2.9: the full Decision for ONE file - every signal, rule and the
+    # confidence math. Read-only: nothing is moved, nothing is planned.
+    if(-not (Test-Path -LiteralPath $Explain)){
+        Write-Host ("File not found: {0}" -f $Explain) -ForegroundColor Red
+        return
+    }
+    $ext = [System.IO.Path]::GetExtension($Explain).ToLowerInvariant()
+    try { $cat = Get-SysOrgCategory -Extension $ext -Config $Config } catch { $cat = 'Other' }
+    $profX = $null
+    try { $profX = @(Get-SysOrgDriveProfile -Config $Config -Letters 'C')[0] } catch { $profX = $null }
+    $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata
+    Show-SysOrgDecision -Decision $dec
     return
 }
 if($UndoPlan){
