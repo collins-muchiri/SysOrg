@@ -9,6 +9,7 @@ BeforeAll {
     Import-Module (Join-Path $repo 'Modules\SysOrg.Core.psm1')        -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.KnownFolders.psm1') -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Scan.psm1')        -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Audit.psm1')       -Force   # the inventory's folder gates live here
     Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1')        -Force
     $script:fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
         KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
@@ -486,5 +487,36 @@ Describe 'Copies keep their own names (v2.1.1)' {
         $cfg = @{ DateFolders='Year'; Copies=@{Policy='NumberCopies'; RenameToKeeper='maybe'}; MaxPlanActions=10
                   PreserveMinFiles=1; InventoryCacheHours=1; PreserveSingleCategoryRatio=0.9 }
         { Test-SysOrgConfig -Config $cfg } | Should -Throw '*RenameToKeeper*'
+    }
+}
+
+Describe 'Scheduled report hardening (v2.1.1)' {
+    It 'writes the report under <AppRoot>\Reports and prints the drive profile line' {
+        $appRoot = Join-Path $TestDrive ('app7-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path (Join-Path $appRoot 'Cache') -Force | Out-Null
+        $scanR = Join-Path $TestDrive ('scan7-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $scanR -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $scanR 'a.txt') -Value 'a'
+        $prof = [pscustomobject]@{ Letter='S'; Role='Data'; ProposedScope='FullDrive'; DestinationRoot='X:\_Organized'; KnownFolders=@(); DownloadRoots=@() }
+        $cfg7 = @{ ReportsFolderName='_Reports'; ScanRoots=@{}; TypeMap=@{}; Copies=@{Policy='ReportOnly'}
+                   ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+                   Families=@{Enabled=$false}; FolderAudit=@{Enabled=$false}; Downloads=@{UseZoneIdentifier=$false}
+                   PreserveExistingFolders=$false }
+        $file = New-SysOrgScanReport -Letter S -Config $cfg7 -AppRoot $appRoot -DriveProfile $prof -ScanRoots @($scanR)
+        $file | Should -Not -BeNullOrEmpty
+        (Split-Path (Split-Path $file -Parent) -Leaf) | Should -Be 'Reports'
+        (Split-Path $file -Parent) | Should -BeLike "$appRoot*"
+        (Get-Content -LiteralPath $file -Raw) | Should -Match 'Drive profile: role=Data'
+    }
+    It 'skips drives with empty scan roots instead of writing an empty report' {
+        $appRoot = Join-Path $TestDrive ('app8-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $scanR = Join-Path $TestDrive ('scan8-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $scanR -Force | Out-Null    # exists but empty
+        $cfg8 = @{ ReportsFolderName='_Reports'; ScanRoots=@{}; TypeMap=@{}; Copies=@{Policy='ReportOnly'}
+                   ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+                   Families=@{Enabled=$false}; FolderAudit=@{Enabled=$false}; Downloads=@{UseZoneIdentifier=$false} }
+        $file = New-SysOrgScanReport -Letter S -Config $cfg8 -AppRoot $appRoot -ScanRoots @($scanR)
+        $file | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $appRoot 'Reports') | Should -BeFalse   # nothing was written
     }
 }

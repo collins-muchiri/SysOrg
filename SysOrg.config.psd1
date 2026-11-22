@@ -194,5 +194,5 @@
     InventoryCacheHours   = 24
     ReportsFolderName     = '_Reports'
     ScheduledTaskName     = 'SysOrg Weekly Scan'
-    ScheduledDrives       = @('*')          # drives included in scheduled reports; e.g. @('C','D')
+    ScheduledDrives       = @('*')          # drives in scheduled reports; '*' = every FIXED (internal) drive only, e.g. @('C','D')
 }

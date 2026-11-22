@@ -1348,15 +1348,37 @@ function New-SysOrgScanReport {
 .SYNOPSIS
     Report-only scan used by the weekly scheduled task. Writes a text report;
     moves nothing. Always uses the narrowed ScanRoots scope and never reads cache.
+.DESCRIPTION
+    v2.1.1: the report is written under <AppRoot>\Reports\ (never at a drive root),
+    the drive profile is built fresh inside the function (or accepted via the optional
+    -DriveProfile parameter) so the "Drive profile" line actually prints, and a drive
+    whose scan roots contain no files is SKIPPED instead of producing an empty report
+    (returns $null).
 .EXAMPLE
     New-SysOrgScanReport -Letter C -Config $cfg -AppRoot C:\SysOrg
 #>
-    param([Parameter(Mandatory)][string]$Letter,$Config,[Parameter(Mandatory)][string]$AppRoot)
+    param([Parameter(Mandatory)][string]$Letter,$Config,[Parameter(Mandatory)][string]$AppRoot,$DriveProfile,[string[]]$ScanRoots)
     $logFolder = Join-Path $AppRoot 'Logs'
     Write-SysOrgLog "Scheduled report scan starting for drive $Letter`:" -LogFolder $logFolder
+    # v2.1.1: build the drive profile fresh (or take the caller's) - the 'Drive profile'
+    # line referenced an undefined $prof before this fix.
+    $prof = $DriveProfile
+    if(-not $prof){
+        try{
+            $profiles = @(Get-SysOrgDriveProfile -Config $Config -Letters $Letter)
+            if($profiles.Count -gt 0){ $prof = $profiles[0] }
+        } catch { Write-Verbose "Drive profile unavailable for $Letter`: $($_.Exception.Message)" }
+    }
+    $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=(Join-Path $AppRoot 'Cache'); NoCache=$true }
+    if($ScanRoots -and @($ScanRoots).Count -gt 0){ $invParams.Roots = $ScanRoots } else { $invParams.DefaultScope = $true }
     # @() wrapping: the inventory and duplicate functions stream their records
     # (an empty result emits nothing), so callers must collect with @().
-    $inv = @(Get-SysOrgInventory -Letter $Letter -Config $Config -CacheFolder (Join-Path $AppRoot 'Cache') -DefaultScope -NoCache)
+    $inv = @(Get-SysOrgInventory @invParams)
+    if($inv.Count -eq 0){
+        # v2.1.1: skip drives with empty scan roots instead of writing an empty report.
+        Write-SysOrgLog "Scheduled report skipped for drive $Letter`: no files found in the scan roots." -Level WARN -LogFolder $logFolder
+        return $null
+    }
     $catCounts = $inv | Group-Object Category | Sort-Object Count -Descending
     $dupGroups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config)
     $folderMap = Get-SysOrgFolderMap -Config $Config
@@ -1369,7 +1391,8 @@ function New-SysOrgScanReport {
     }
     $fam = Get-SysOrgNameFamilies -Inventory $inv -PartitionLookup $pk -Config $Config
 
-    $reportsFolder = Join-Path (Get-SysOrgDestinationRoot -Letter $Letter -Config $Config) (Get-SysOrgSetting $Config 'ReportsFolderName' '_Reports')
+    # v2.1.1: reports live under the app folder, never at a drive root.
+    $reportsFolder = Join-Path $AppRoot 'Reports'
     if(-not (Test-Path -LiteralPath $reportsFolder)){ New-Item -ItemType Directory -Path $reportsFolder -Force | Out-Null }
     $file = Join-Path $reportsFolder ('SysOrg-ScanReport-{0}-{1}.txt' -f $Letter, (Get-Date -Format 'yyyyMMdd-HHmm'))
 

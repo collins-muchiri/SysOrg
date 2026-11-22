@@ -121,8 +121,8 @@ function Invoke-SysOrgFolderAuditFlow {
     param([string]$Letter)
     $audit = Get-SysOrgFolderAudit -Letter $Letter -Config $Config -MaxDepth (Get-SysOrgSetting $Config 'FolderAudit.MaxTopLevelDepth' 2)
     Show-SysOrgFolderAudit -Audit $audit
-    $destRoot  = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
-    $repFolder = Join-Path $destRoot (Get-SysOrgSetting $Config 'ReportsFolderName' '_Reports')
+    # v2.1.1: reports live under the app folder (Reports\), never at a drive root.
+    $repFolder = Join-Path $appRoot 'Reports'
     $rep = Write-SysOrgFolderAuditReport -Audit $audit -ReportFolder $repFolder
     Write-Host ("Audit report saved: {0}" -f $rep) -ForegroundColor Green
 }
@@ -279,6 +279,9 @@ if($ScheduledReport){
     foreach($d in @(Get-SysOrgDrive)){
         $letter = $d.Drive.TrimEnd(':')
         if(($letters -contains '*') -or ($letters -contains $letter)){
+            # v2.1.1: the '*' default covers fixed, NON-REMOVABLE drives only - no scheduled
+            # reports for USB sticks or card readers. Explicitly listed letters are honored.
+            if(($letters -contains '*') -and ("$($d.Location)" -ne 'Internal')){ continue }
             try {
                 [void](New-SysOrgScanReport -Letter $letter -Config $Config -AppRoot $appRoot)
             } catch {
