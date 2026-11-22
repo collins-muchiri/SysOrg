@@ -559,3 +559,72 @@ Describe 'Family folder name casing (v3.0.1 A5 regression)' {
         (Get-SysOrgFamilyFolderName -Members $members2 -MaxNameLength 60) | Should -Be 'Peer Education Support Supervision Report'
     }
 }
+
+Describe 'User collections detection (v3.0.1 B2)' {
+
+    BeforeAll {
+        function New-SysOrgB2Record {
+            param([string]$Dir,[string]$Name,[string]$Ext,[string]$Cat)
+            # string concat, NOT Join-Path: these are synthetic Windows-shaped paths and
+            # pwsh on non-Windows hosts resolves drive-qualified Join-Path against providers
+            [pscustomobject]@{ FullName=("$Dir\$Name"); Name=$Name; Stem=([System.IO.Path]::GetFileNameWithoutExtension($Name))
+                Extension=$Ext; Length=[long]10; LastWriteTime=(Get-Date '2026-01-01'); Directory=$Dir; Category=$Cat }
+        }
+    }
+
+    It 'detects a UNDP collection with a nested Workshop subfolder as ONE unit (outer wins)' {
+        $root = 'C:\Users\t\Documents'
+        $inv = @()
+        foreach($i in 1..8){ $inv += New-SysOrgB2Record -Dir "$root\UNDP\Workshop" -Name "report $i.docx" -Ext '.docx' -Cat 'Documents' }
+        foreach($i in 1..4){ $inv += New-SysOrgB2Record -Dir "$root\UNDP" -Name "summary $i.docx" -Ext '.docx' -Cat 'Documents' }
+        $c = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($root) -Config @{} -KnownFolders @())
+        $c.Count | Should -Be 1
+        $c[0].Name | Should -Be 'UNDP'
+        $c[0].Files | Should -Be 12
+        $c[0].MajorityCategory | Should -Be 'Documents'
+        $c[0].MajorityRatio | Should -Be 1.0
+    }
+
+    It 'generic names, bare dates and camera defaults are never collections' {
+        $root = 'C:\Users\t\Documents'
+        $inv = @()
+        foreach($d in @('New folder','2024','2024-06','IMG_0001','Screenshots','WhatsApp Video')){
+            foreach($i in 1..6){ $inv += New-SysOrgB2Record -Dir "$root\$d" -Name "file$i.txt" -Ext '.txt' -Cat 'Documents' }
+        }
+        $c = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($root) -Config @{} -KnownFolders @())
+        $c.Count | Should -Be 0
+    }
+
+    It 'respects the bounds: subtrees over Folders.MaxFiles and folders beyond Folders.MaxDepth disqualify' {
+        $root = 'C:\Users\t\Documents'
+        $big = @(); foreach($i in 1..201){ $big += New-SysOrgB2Record -Dir "$root\Huge" -Name "f$i.txt" -Ext '.txt' -Cat 'Documents' }
+        @(Get-SysOrgUserCollections -Inventory $big -Roots @($root) -Config @{} -KnownFolders @()).Count | Should -Be 0
+        # a folder whose FILE-BEARING candidates sit beyond MaxDepth under excluded
+        # (generic/date) ancestors is never a collection
+        $deep = @(); foreach($i in 1..5){ $deep += New-SysOrgB2Record -Dir "$root\New folder\2024\06\15" -Name "f$i.txt" -Ext '.txt' -Cat 'Documents' }
+        @(Get-SysOrgUserCollections -Inventory $deep -Roots @($root) -Config @{} -KnownFolders @()).Count | Should -Be 0
+        # a folder at depth 2 within the bound IS a unit even under excluded ancestors
+        $mid = @(); foreach($i in 1..5){ $mid += New-SysOrgB2Record -Dir "$root\New folder\2024\UNDP" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
+        $c = @(Get-SysOrgUserCollections -Inventory $mid -Roots @($root) -Config @{} -KnownFolders @())
+        ($c | Where-Object Name -eq 'UNDP').Count | Should -Be 1
+        # a folder containing ONLY subfolders is still the outer unit (structure intact)
+        $nested = @(); foreach($i in 1..5){ $nested += New-SysOrgB2Record -Dir "$root\Programme X\Workshop" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
+        $c2 = @(Get-SysOrgUserCollections -Inventory $nested -Roots @($root) -Config @{} -KnownFolders @())
+        ($c2 | Where-Object Name -eq 'Programme X').Count | Should -Be 1
+    }
+
+    It 'reports mixed-content candidates with their honest majority ratio' {
+        $root = 'C:\Users\t\Documents'
+        $inv = @()
+        foreach($i in 1..5){ $inv += New-SysOrgB2Record -Dir "$root\Mixed" -Name "doc$i.docx" -Ext '.docx' -Cat 'Documents' }
+        foreach($i in 1..5){ $inv += New-SysOrgB2Record -Dir "$root\Mixed" -Name "pic$i.jpg" -Ext '.jpg' -Cat 'Images' }
+        $c = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($root) -Config @{} -KnownFolders @())
+        ($c | Where-Object Name -eq 'Mixed').MajorityRatio | Should -Be 0.5
+    }
+
+    It 'PreserveUserCollections=$false disables detection' {
+        $root = 'C:\Users\t\Documents'
+        $inv = @(); foreach($i in 1..6){ $inv += New-SysOrgB2Record -Dir "$root\UNDP" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
+        @(Get-SysOrgUserCollections -Inventory $inv -Roots @($root) -Config @{ Folders=@{ PreserveUserCollections=$false } } -KnownFolders @()).Count | Should -Be 0
+    }
+}

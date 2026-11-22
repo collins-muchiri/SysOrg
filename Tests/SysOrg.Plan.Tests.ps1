@@ -8,6 +8,9 @@ BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo 'Modules\SysOrg.Core.psm1')        -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.KnownFolders.psm1') -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Layout.psm1')      -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Metadata.psm1')    -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Classify.psm1')    -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Scan.psm1')        -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Audit.psm1')       -Force   # the inventory's folder gates live here
     Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1')        -Force
@@ -829,5 +832,102 @@ Describe 'Honest skip taxonomy (v3.0.1 A3)' {
         $tax.ProtectedCount | Should -Be 1
         $tax.PreservedCount | Should -Be 1
         $tax.Headline | Should -Be '50 scanned: 0 planned, 1 preserved, 1 protected, 0 need a decision.'
+    }
+}
+
+Describe 'User collections: one unit, structure intact (v3.0.1 B2)' {
+
+    It 'plans a UNDP collection with a nested Workshop folder as ONE MoveFolder unit and executes it intact' {
+        $work = Join-Path $TestDrive ('b2-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $srcRoot = Join-Path $work 'src'
+        $undp = Join-Path $srcRoot 'UNDP'
+        $shop = Join-Path $undp 'Workshop'
+        New-Item -ItemType Directory -Path $shop -Force | Out-Null
+        $inv = @()
+        foreach($i in 1..8){
+            $p = Join-Path $shop ("workshop report $i.docx")
+            Set-Content -LiteralPath $p -Value ("w$i")
+            $inv += [pscustomobject]@{ FullName=$p; Name="workshop report $i.docx"; Stem="workshop report $i"; Extension='.docx'
+                Length=[long]10; LastWriteTime=(Get-Date '2026-01-05'); Directory=$shop; Category='Documents' }
+        }
+        foreach($i in 1..4){
+            $p = Join-Path $undp ("summary $i.docx")
+            Set-Content -LiteralPath $p -Value ("s$i")
+            $inv += [pscustomobject]@{ FullName=$p; Name="summary $i.docx"; Stem="summary $i"; Extension='.docx'
+                Length=[long]10; LastWriteTime=(Get-Date '2026-01-05'); Directory=$undp; Category='Documents' }
+        }
+        $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $b2Cfg = @{ OrganizedRoots=@{ 'T' = (Join-Path $work 'org') }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                    SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$true
+                    Copies=@{Policy='NumberCopies';StartIndex=2;MinFileSizeKB=1}; Families=@{Enabled=$true}
+                    Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; DateFolders='Year'
+                    LayoutProfile='Windows'; TypeMap=@{}
+                    Folders=@{ PreserveUserCollections=$true; MaxFiles=200; MaxDepth=3; MinMajorityRatio=0.6 } }
+        Import-Module (Join-Path $PSScriptRoot '..\Modules\SysOrg.Scan.psm1') -Force
+        $cols = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($srcRoot) -Config $b2Cfg -KnownFolders @())
+        ($cols | Where-Object Name -eq 'UNDP').Count | Should -Be 1
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $b2Cfg -KnownFolders @() -UserCollections $cols
+        # ONE folder action for the collection; its files are never planned individually
+        $folderActs = @($plan.Actions | Where-Object { "$($_.Kind)" -eq 'Folder' })
+        $folderActs.Count | Should -Be 1
+        $folderActs[0].Source | Should -Be $undp
+        $folderActs[0].Collection | Should -BeTrue
+        $folderActs[0].Destination | Should -BeLike '*Documents\Work\UNDP'
+        @($plan.Skipped | Where-Object { $_.Reason -match 'user collection folder' }).Count | Should -Be 12
+        @($plan.Skipped | Where-Object { $_.Reason -match 'user collection folder' } | ForEach-Object { $_.Group } | Select-Object -Unique) | Should -Be 'Preserved'
+        # execute: structure intact - Workshop subfolder and all 12 files survive as they are
+        $plansDir = Join-Path $work 'Plans'
+        $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $plansDir
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $b2Cfg -AppRoot (Join-Path $work 'app')
+        $res.Summary.FolderMoves | Should -Be 1
+        $res.Summary.Failed | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $folderActs[0].Destination 'Workshop') | Should -BeTrue
+        (Get-ChildItem -LiteralPath (Join-Path $folderActs[0].Destination 'Workshop') -File).Count | Should -Be 8
+        (Get-ChildItem -LiteralPath $folderActs[0].Destination -File).Count | Should -Be 4
+        # undo restores the whole unit
+        $u = Undo-SysOrgPlan -PlanId $plan.PlanId -AppRoot (Join-Path $work 'app') -Config $b2Cfg
+        $u.Restored | Should -Be 1
+        Test-Path -LiteralPath $undp | Should -BeTrue
+        (Get-ChildItem -LiteralPath (Join-Path $undp 'Workshop') -File).Count | Should -Be 8
+    }
+
+    It 'a low-confidence collection is left in place and reported for a decision' {
+        $work = Join-Path $TestDrive ('b2low-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $srcRoot = Join-Path $work 'src'
+        New-Item -ItemType Directory -Path (Join-Path $srcRoot 'Mixed') -Force | Out-Null
+        $inv = @()
+        foreach($i in 1..5){
+            $p = Join-Path $srcRoot 'Mixed' ("doc$i.docx"); Set-Content -LiteralPath $p -Value 'd'
+            $inv += [pscustomobject]@{ FullName=$p; Name="doc$i.docx"; Stem="doc$i"; Extension='.docx'
+                Length=[long]5; LastWriteTime=(Get-Date '2026-01-05'); Directory=(Join-Path $srcRoot 'Mixed'); Category='Documents' }
+        }
+        foreach($i in 1..5){
+            $p = Join-Path $srcRoot 'Mixed' ("pic$i.jpg"); Set-Content -LiteralPath $p -Value 'p'
+            $inv += [pscustomobject]@{ FullName=$p; Name="pic$i.jpg"; Stem="pic$i"; Extension='.jpg'
+                Length=[long]5; LastWriteTime=(Get-Date '2026-01-05'); Directory=(Join-Path $srcRoot 'Mixed'); Category='Images' }
+        }
+        $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $b2Cfg = @{ OrganizedRoots=@{ 'T' = (Join-Path $work 'org') }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                    SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                    Copies=@{Policy='NumberCopies';StartIndex=2;MinFileSizeKB=1}; Families=@{Enabled=$false}
+                    Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; DateFolders='Year'
+                    LayoutProfile='Windows'; TypeMap=@{}
+                    Folders=@{ PreserveUserCollections=$true; MaxFiles=200; MaxDepth=3; MinMajorityRatio=0.6 } }
+        Import-Module (Join-Path $PSScriptRoot '..\Modules\SysOrg.Scan.psm1') -Force
+        $cols = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($srcRoot) -Config $b2Cfg -KnownFolders @())
+        ($cols | Where-Object Name -eq 'Mixed').MajorityRatio | Should -Be 0.5
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $b2Cfg -KnownFolders @() -UserCollections $cols
+        # no collection action; the unit is left in place and needs a decision
+        @($plan.Actions | Where-Object { $_.PSObject.Properties['Collection'] -and $_.Collection }).Count | Should -Be 0
+        @($plan.NeedsDecision | Where-Object { $_.Disposition -match 'collection' }).Count | Should -Be 1
+        $skip = @($plan.Skipped | Where-Object { $_.Reason -match 'User collection left for a decision' })
+        $skip.Count | Should -Be 1
+        $skip[0].Group | Should -Be 'Decision'
+        # the collection is NEVER flattened: its 10 files wait with the unit, reported
+        # in the taxonomy's 'left for a decision' group
+        @($plan.Skipped | Where-Object { $_.Reason -match 'user collection folder \(left in place' }).Count | Should -Be 10
+        @($plan.Actions).Count | Should -Be 0
     }
 }

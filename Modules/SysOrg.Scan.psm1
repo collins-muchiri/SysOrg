@@ -736,6 +736,222 @@ function Get-SysOrgFamilyFolderName {
     return (Get-SysOrgTruncatedFolderName -Name $best -MaxLength $MaxNameLength)
 }
 
+function Get-SysOrgUserCollections {
+<#
+.SYNOPSIS
+    Detects USER COLLECTIONS: non-generic, user-named folders inside the scan roots
+    that are treated as ONE unit (v3.0.1 B2).
+.DESCRIPTION
+    A user-named folder is a signal: it is never flattened into per-file moves.
+    A candidate must be
+      - non-generic (not in Folders.GenericNames, not a bare date '2024'/'2024-06',
+        not an auto-generated camera/screenshot/messaging name like 'IMG_0001'),
+        not a known-folder/category name itself
+      - bounded: at most Folders.MaxFiles (200) files in the whole subtree,
+        at most Folders.MaxDepth (3) levels below the nearest scan root
+      - not a known folder, the app root, a destination root, a project folder or
+        inside an already-detected collection (the OUTER folder wins: a 'UNDP'
+        folder with a nested 'Workshop' subfolder is ONE unit)
+    Returns candidates with the majority category of their contents (extension
+    routing), the majority Findable subtype, the majority ratio (= confidence) and
+    the proposed whole-unit destination '<CategoryLeaf>[\<Subtype>]\\<FolderName>'.
+    The caller (plan) moves the folder whole when the confidence is high enough and
+    mutability allows it, or leaves it in place when the confidence is low.
+    Deterministic: candidates sorted by path; no randomness.
+.EXAMPLE
+    $c = Get-SysOrgUserCollections -Inventory $inv -Roots @('C:\Users\t\Documents') -Config $cfg -KnownFolders $kf
+    $c[0].Name   # -> 'UNDP'
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()]$Inventory,[AllowEmptyCollection()][string[]]$Roots,
+          $Config,[object[]]$KnownFolders)
+    $result = New-Object System.Collections.Generic.List[object]
+    if(-not (Get-SysOrgSetting $Config 'Folders.PreserveUserCollections' $true)){ return $result.ToArray() }
+    if(-not $Inventory -or @($Inventory).Count -eq 0){ return $result.ToArray() }
+    if(-not $Roots -or @($Roots).Count -eq 0){ return $result.ToArray() }
+    $maxFiles = [int](Get-SysOrgSetting $Config 'Folders.MaxFiles' 200)
+    $maxDepth = [int](Get-SysOrgSetting $Config 'Folders.MaxDepth' 3)
+    $minRatio = [double](Get-SysOrgSetting $Config 'Folders.MinMajorityRatio' 0.6)
+    # built-in generic names: the shipped config carries the same list, but a partial
+    # test config must not widen what counts as a collection
+    $genericNames = @(Get-SysOrgSetting $Config 'Folders.GenericNames' @(
+        'new folder','untitled','copy of','archive','backup','old','misc','miscellaneous','various',
+        'stuff','things','random','temp','tmp','downloads','desktop','documents','pictures','videos','music'))
+    $generic = @($genericNames | ForEach-Object { "$_".ToLowerInvariant() })
+
+    # v3.0.1 B2: keys are the NATIVE path lowercased - no separator rewriting, so the
+    # detection works identically on Windows ('\') and portable hosts ('/').
+    $guard = New-Object System.Collections.Generic.HashSet[string]
+    $appRoot = Get-SysOrgSetting $Config 'AppRoot' $null
+    if($appRoot){ [void]$guard.Add(("$appRoot").TrimEnd('\').TrimEnd('/').ToLowerInvariant()) }
+    foreach($k in @($KnownFolders)){ if($k.Path){ [void]$guard.Add(("$($k.Path)").TrimEnd('\').TrimEnd('/').ToLowerInvariant()) } }
+
+    $categoryNames = @{}
+    try { $categoryNames = Get-SysOrgCategoryNames -KnownFolders $KnownFolders } catch { $categoryNames = @{} }
+    # separator-agnostic parent/leaf on the KEY string: Split-Path normalizes to the
+    # host separator, which would break key matching for Windows-shaped paths on
+    # portable hosts (and vice versa)
+    function Get-SysOrgB2ParentKey {
+        param([string]$Key)
+        $i1 = "$Key".LastIndexOf('\'); $i2 = "$Key".LastIndexOf('/')
+        $i = [Math]::Max($i1, $i2)
+        if($i -le 0){ return $null }
+        return "$Key".Substring(0, $i)
+    }
+    function Get-SysOrgB2Leaf {
+        param([string]$Key)
+        $i1 = "$Key".LastIndexOf('\'); $i2 = "$Key".LastIndexOf('/')
+        $i = [Math]::Max($i1, $i2)
+        if($i -lt 0){ return "$Key" }
+        return "$Key".Substring($i + 1)
+    }
+
+    $rootSet = New-Object System.Collections.Generic.List[string]
+    foreach($r in @($Roots)){
+        if([string]::IsNullOrWhiteSpace("$r")){ continue }
+        [void]$rootSet.Add(("$r").TrimEnd('\').TrimEnd('/').ToLowerInvariant())
+    }
+
+    # per-directory file counts and category tallies (inventory-based: no second walk)
+    $ownCount = @{}
+    $catByDir = @{}
+    $subTypeByDir = @{}
+    $origOf = @{}          # lowercase key -> first-seen ORIGINAL-cased path (for emission)
+    $dirSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach($f in @($Inventory)){
+        if("$($f.Category)" -eq 'SkippedLongPath'){ continue }
+        $dNative = ("$($f.Directory)").TrimEnd('\').TrimEnd('/')
+        $d = $dNative.ToLowerInvariant()
+        if(-not $origOf.ContainsKey($d)){ $origOf[$d] = $dNative }
+        if(-not $ownCount.ContainsKey($d)){ $ownCount[$d] = 0; $catByDir[$d] = @{}; $subTypeByDir[$d] = @{} }
+        $ownCount[$d]++
+        $c = "$($f.Category)"
+        if(-not $catByDir[$d].ContainsKey($c)){ $catByDir[$d][$c] = 0 }
+        $catByDir[$d][$c]++
+        # the majority Findable subtype per file (cheap stem heuristics), tallied per dir
+        $st = ''
+        try { $st = Get-SysOrgFindableSubtype -Category "$($f.Category)" -Name "$($f.Name)" } catch { $st = 'General' }
+        if(-not $subTypeByDir[$d].ContainsKey($st)){ $subTypeByDir[$d][$st] = 0 }
+        $subTypeByDir[$d][$st]++
+        [void]$dirSet.Add($d)
+    }
+    # include ANCESTOR directories of every file-bearing dir so outer folders that
+    # contain only subfolders (e.g. UNDP\Workshop) can be the collection unit too
+    foreach($d in @(@($dirSet))){
+        $cur = $d
+        $curOrig = if($origOf.ContainsKey($d)){ [string]$origOf[$d] } else { $d }
+        while($true){
+            $cur2 = Get-SysOrgB2ParentKey -Key $cur
+            if([string]::IsNullOrEmpty($cur2)){ break }
+            $curOrig2 = Get-SysOrgB2ParentKey -Key $curOrig
+            $cl = $cur2.ToLowerInvariant()
+            if($cl.Length -le 3){ break }
+            $isRoot = $false; $underRoot = $false
+            foreach($rl in $rootSet){
+                if($cl -eq $rl){ $isRoot = $true }
+                elseif($cl.StartsWith($rl, [StringComparison]::OrdinalIgnoreCase)){ $underRoot = $true }
+            }
+            if($isRoot -or (-not $underRoot)){ break }
+            if(-not $dirSet.Contains($cl)){
+                [void]$dirSet.Add($cl)
+                if((-not $origOf.ContainsKey($cl)) -and (-not [string]::IsNullOrEmpty($curOrig2))){ $origOf[$cl] = $curOrig2 }
+            } else { break }
+            $cur = $cur2
+            $curOrig = $curOrig2
+        }
+    }
+    # bottom-up SUBTREE tallies: process deepest directories first; each processed dir
+    # pushes its subtree totals up into a pending accumulator for its parent (order-safe).
+    $subCount = @{}
+    $subCat = @{}
+    $subType = @{}
+    $pending = @{}
+    foreach($d in (@($dirSet) | Sort-Object { $_.Length } -Descending)){
+        $total = 0
+        if($ownCount.ContainsKey($d)){ $total = [int]$ownCount[$d] }
+        $cT = @{}
+        if($catByDir.ContainsKey($d)){ foreach($c in $catByDir[$d].Keys){ $cT[$c] = [int]$catByDir[$d][$c] } }
+        $sT = @{}
+        if($subTypeByDir.ContainsKey($d)){ foreach($s in $subTypeByDir[$d].Keys){ $sT[$s] = [int]$subTypeByDir[$d][$s] } }
+        if($pending.ContainsKey($d)){
+            $total += [int]$pending[$d]['Count']
+            foreach($c in $pending[$d]['Cat'].Keys){ $cT[$c] = [int]$cT[$c] + [int]$pending[$d]['Cat'][$c] }
+            foreach($s in $pending[$d]['Sub'].Keys){ $sT[$s] = [int]$sT[$s] + [int]$pending[$d]['Sub'][$s] }
+        }
+        $subCount[$d] = $total
+        $subCat[$d] = $cT
+        $subType[$d] = $sT
+        # propagate MY subtree totals to my parent (key-derived, separator-agnostic)
+        $p = Get-SysOrgB2ParentKey -Key $d
+        if($p){
+            if($dirSet.Contains($p)){
+                if(-not $pending.ContainsKey($p)){ $pending[$p] = @{ Count=0; Cat=@{}; Sub=@{} } }
+                $pending[$p]['Count'] += $total
+                foreach($c in $cT.Keys){ $pending[$p]['Cat'][$c] = [int]$pending[$p]['Cat'][$c] + [int]$cT[$c] }
+                foreach($s in $sT.Keys){ $pending[$p]['Sub'][$s] = [int]$pending[$p]['Sub'][$s] + [int]$sT[$s] }
+            }
+        }
+    }
+
+    # candidates ordered shallowest-first: the outer folder wins over nested ones
+    $candidates = @(@($dirSet) | Sort-Object { $_.Length }, { $_ })
+    $taken = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach($dir in $candidates){
+        $dl = $dir.ToLowerInvariant()
+        # skip subtree of an already-detected collection (nested 'Workshop' inside 'UNDP')
+        $inTaken = $false
+        foreach($t in $taken){
+            if($dl -eq $t -or $dl.StartsWith($t + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or $dl.StartsWith($t + '\',[StringComparison]::OrdinalIgnoreCase)){ $inTaken = $true; break }
+        }
+        if($inTaken){ continue }
+        # never the app root, a known folder, a destination root, or a scan root itself
+        if($guard.Contains($dl)){ continue }
+        if(Test-SysOrgDestinationPath -Path $dir -Config $Config){ continue }
+        if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
+        $depth = $null
+        foreach($rl in $rootSet){
+            if($dl -eq $rl){ $depth = -1; break }
+            if($dl.StartsWith($rl, [StringComparison]::OrdinalIgnoreCase)){
+                $rest = $dl.Substring($rl.Length).TrimStart('\','/')
+                $between = @("$rest".Split([char[]]@('\','/')) | Where-Object { "$_" -ne '' })
+                $d2 = $between.Count - 1      # 0 = direct child of the root
+                if($null -eq $depth -or $d2 -lt $depth){ $depth = $d2 }
+            }
+        }
+        if($null -eq $depth -or $depth -lt 0 -or $depth -ge $maxDepth){ continue }
+        $leaf = Get-SysOrgB2Leaf -Key $dir
+        $lc = $leaf.ToLowerInvariant()
+        if($generic -contains $lc){ continue }
+        if($lc -match '^(19|20)\d{2}([\-_. ]?(0[1-9]|1[0-2]))?([\-_. ]?(0[1-9]|[12]\d|3[01]))?$'){ continue }   # bare date folder
+        if($lc -match '^(0[1-9]|1[0-2])$'){ continue }    # bare month folder ('06')
+        if($lc -match '^([0-2]\d|3[01])$'){ continue }    # bare day folder ('15')
+        if($lc -match '^(img|vid|pxl|dsc|dji)[-_ ]?\d'){ continue }          # camera defaults
+        if($lc -match '^(screenshot|screen[_ ]?rec|screen[_ ]?capt)'){ continue }
+        if($lc -match '^(whatsapp|telegram|signal)[-_ ]?(image|video|audio|voice)?'){ continue }   # messaging defaults
+        if(Test-SysOrgCategoryFolderName -Name $leaf -CategoryNames $categoryNames){ continue }   # an existing category folder is structure, not a collection
+        $totalFiles = [int]$subCount[$dir]
+        if($totalFiles -lt 1 -or $totalFiles -gt $maxFiles){ continue }
+        $catTally = $subCat[$dir]
+        $totalSeen = $totalFiles
+        $top = $catTally.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+        $ratio = if($totalSeen -gt 0){ [Math]::Round([double]$top.Value / [double]$totalSeen, 4) } else { 0.0 }
+        $topSub = 'General'
+        $sT = $subType[$dir]
+        if($sT.Count -gt 0){ $topSub = ($sT.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key }
+        [void]$taken.Add($dl)
+        # emit the ORIGINAL-cased native path (exactly as the inventory carried it) so
+        # callers on any host can move the folder; $dir stays the normalized key
+        $nativePath = $dir
+        if($origOf.ContainsKey($dir)){ $nativePath = [string]$origOf[$dir] }
+        [void]$result.Add([pscustomobject]@{
+            Path=$nativePath; Name=$leaf; SafeName=(Get-SysOrgSafeFolderName -Name $leaf -MaxLength 60)
+            MajorityCategory=[string]$top.Key; MajoritySubtype=[string]$topSub
+            MajorityRatio=$ratio; Files=$totalFiles; Depth=$depth
+        })
+    }
+    return $result.ToArray()
+}
+
 function Get-SysOrgProjectFolders {
 <#
 .SYNOPSIS

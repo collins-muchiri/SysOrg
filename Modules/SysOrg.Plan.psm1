@@ -63,6 +63,7 @@ function New-SysOrgPlan {
           $Config,
           $KnownFolders,
           $ProjectFolders,
+          $UserCollections,
           $FileCache,
           [hashtable]$NewCacheEntries)
 
@@ -141,6 +142,25 @@ function New-SysOrgPlan {
     # project-folder coverage: files under a detected project move as one unit
     $projectDirSet = @{}
     foreach($pf in @($ProjectFolders)){ $projectDirSet[(("$($pf.Path)").Replace('/','\').TrimEnd('\')).ToLowerInvariant()] = $true }
+
+    # v3.0.1 B2: user collections move as ONE unit - their files are never planned
+    # individually and never flattened. Deterministic processing order (path-sorted).
+    # Keys are the NATIVE path lowercased (no separator rewriting) so matching works
+    # identically on Windows and portable hosts.
+    $collectionDirSet = @{}   # lowercase native dir -> @{ Move=<bool>; Reason=<string> }
+    $collectionList = New-Object System.Collections.Generic.List[object]
+    $colMinRatioEarly = [double](Get-SysOrgSetting $Config 'Folders.MinMajorityRatio' 0.6)
+    foreach($uc in (@($UserCollections) | Sort-Object { ("$($_.Path)").ToLowerInvariant() })){
+        if(-not $uc){ continue }
+        if(-not "$($uc.Path)"){ continue }
+        $cp = ("$($uc.Path)").TrimEnd('\').TrimEnd('/')
+        $ck = $cp.ToLowerInvariant()
+        $moves = ([double]$uc.MajorityRatio -ge $colMinRatioEarly)
+        $collectionDirSet[$ck] = @{ Move=$moves }
+        $collectionList.Add([pscustomobject]@{ Path=$cp; Name="$($uc.Name)"; SafeName="$($uc.SafeName)";
+            MajorityCategory="$($uc.MajorityCategory)"; MajoritySubtype="$($uc.MajoritySubtype)";
+            MajorityRatio=[double]$uc.MajorityRatio; Files=[int]$uc.Files; Moves=$moves })
+    }
 
     $multipart = Get-SysOrgMultipartSets -Inventory $Inventory -Config $Config
     $multipartMap = $multipart.Map
@@ -235,6 +255,30 @@ function New-SysOrgPlan {
             }
             if($inProject){
                 Add-SysOrgPlanSkip -Source $src -Reason 'Inside a detected code project folder (moved as one unit)' -Group 'Preserved'
+                continue
+            }
+            # v3.0.1 B2: a user collection moves as ONE unit - files inside are never
+            # planned individually. Collections deliberately come BEFORE the organized-
+            # heuristic preservation: the point of B2 is that a bounded, user-named
+            # folder (often single-category, which the heuristic would silently
+            # 'preserve') is treated as one intentional unit. Mutability still gates
+            # the collection move itself.
+            $cur = $parentDir.ToLowerInvariant()
+            $inCollection = $null
+            while($cur -and ($cur.Length -gt 3)){
+                if($collectionDirSet.ContainsKey($cur)){ $inCollection = $cur; break }
+                $cur2 = $null
+                try { $cur2 = Split-Path $cur -Parent } catch { $cur2 = $null }
+                if(-not $cur2 -or ("$cur2").Length -ge $cur.Length){ break }
+                $cur = ("$cur2")
+            }
+            if($inCollection){
+                # never flattened: the whole unit moves (or waits for a decision) together
+                if($collectionDirSet[$inCollection]['Move']){
+                    Add-SysOrgPlanSkip -Source $src -Reason 'Inside a user collection folder (moved as one unit)' -Group 'Preserved'
+                } else {
+                    Add-SysOrgPlanSkip -Source $src -Reason 'Inside a user collection folder (left in place, below confidence - never flattened)' -Group 'Decision'
+                }
                 continue
             }
             # preservation: organized heuristic + localized category recognition (W2)
@@ -691,6 +735,55 @@ function New-SysOrgPlan {
         [void]$groupsAudit.Add([pscustomobject]$groupAudit)
     }
     $copiesAudit.Groups = @($groupsAudit.ToArray())
+
+    # v3.0.1 B2: user collections - ONE MoveFolder unit each (mutability checked at the
+    # folder itself; low-confidence collections are left in place and reported).
+    foreach($uc in $collectionList){
+        if($actions.Count -ge $maxActions){ $capped = $true; break }
+        try{
+            $cp = "$($uc.Path)"
+            # majority category -> routing leaf; an informative subtype rides along
+            $cat2 = "$($uc.MajorityCategory)"
+            $rel2 = ''
+            if($folderMap.ContainsKey($cat2)){ $rel2 = "$($folderMap[$cat2])" } else { $rel2 = "$($folderMap['Other'])" }
+            $sub2 = "$($uc.MajoritySubtype)"
+            if($sub2 -and (@('General','Unsorted') -notcontains $sub2)){ $rel2 = ($rel2 + '\' + $sub2) }
+            $db2 = Get-SysOrgDestinationBase -RelBase $rel2 -DriveProfile $DriveProfile -Config $Config -KnownFolders $KnownFolders
+            $destFolder2 = $db2.Base + '\' + "$($uc.SafeName)"
+            if($cp -ieq $destFolder2){
+                Add-SysOrgPlanSkip -Source $cp -Reason 'User collection already in its place (idempotent re-plan)' -Group 'Preserved'
+                continue
+            }
+            if(-not [bool]$uc.Moves){
+                Add-SysOrgPlanSkip -Source $cp -Reason ('User collection left for a decision: majority confidence {0} below {1}' -f $uc.MajorityRatio, $colMinRatioEarly) -Group 'Decision'
+                [void]$needsDecision.Add([pscustomobject]@{ Source=$cp; Confidence=$uc.MajorityRatio; Disposition='collection left in place (low confidence)' })
+                continue
+            }
+            $mut2 = Test-SysOrgFileMutable -Path $cp -Extension '' -DriveProfile $DriveProfile -Config $Config -Container
+            if(-not $mut2.Allowed){
+                Add-SysOrgPlanSkip -Source $cp -Reason ("User collection not moved: {0}" -f $mut2.Reason) -Group 'Protected'
+                continue
+            }
+            $stats2 = Get-SysOrgFolderMoveStats -Path $cp -Config $Config -DriveProfile $DriveProfile
+            $syncOut2 = $false; $intoCloud2 = $false
+            if(Test-SysOrgUnderOneDrive -Path $cp){
+                if(-not (Test-SysOrgUnderOneDrive -Path $destFolder2)){ $syncOut2 = $true; [void]$odSyncOut.Add($cp) }
+            } elseif(Test-SysOrgUnderOneDrive -Path $destFolder2){
+                $intoCloud2 = $true; [void]$odIntoCloud.Add($destFolder2)
+            }
+            $actions.Add([pscustomobject]@{
+                Action='Move'; Kind='Folder'; Source=$cp; Destination=$destFolder2; DestRoot=$db2.DisplayRoot
+                SizeBytes=[int64]0; Family=$null; CopyIndex=$null; SourceBucket=$null
+                Reason=('User collection: majority {0} ({1}% of {2} files); moved whole, structure intact' -f $cat2, [Math]::Round(100 * [double]$uc.MajorityRatio), $uc.Files)
+                FilesInside=$uc.Files; NonCodeFilesInside=$stats2.NonCode
+                BlockedFilesCount=$stats2.BlockedCount; BlockedFileSamples=$stats2.BlockedSamples
+                DifferentContent=$false; OneDriveSyncOut=$syncOut2; OneDriveIntoCloud=$intoCloud2
+                Confidence=$uc.MajorityRatio; RuleId='collection'; ReviewFlag=$false; Collection=$true
+            })
+        } catch {
+            Add-SysOrgPlanSkip -Source "$($uc.Path)" -Reason ("User collection error: {0}" -f $_.Exception.Message) -Group 'Other'
+        }
+    }
 
     # code project folders: one MoveFolder unit each (mutability checked at the folder itself)
     $projCfgDest = "$(Get-SysOrgSetting $Config 'Projects.Destination' 'Documents\Projects\Code')"
@@ -1293,6 +1386,19 @@ function Show-SysOrgPlan {
         }
         if(@($Plan.NeedsDecision).Count -gt 10){ Write-Host ('  ... and {0} more' -f (@($Plan.NeedsDecision).Count - 10)) -ForegroundColor DarkGray }
         Write-Host '  These files are listed, never dumped into a junk folder. Use -Explain <path> to see why.' -ForegroundColor Gray
+    }
+
+    # v3.0.1 B2: user collections are listed SEPARATELY in the preview
+    $collectionMoves = @($folderMoves | Where-Object { $_.PSObject.Properties['Collection'] -and $_.Collection })
+    if($collectionMoves.Count -gt 0){
+        Write-Host ''
+        Write-Host ('User collections (moved whole, structure intact): {0}' -f $collectionMoves.Count) -ForegroundColor White
+        foreach($cm in $collectionMoves){
+            $confTxt = ''
+            if($cm.PSObject.Properties['Confidence'] -and ($null -ne $cm.Confidence)){ $confTxt = ('  [confidence {0}]' -f $cm.Confidence) }
+            Write-Host ('  ' + $cm.Source + ' -> ' + $cm.Destination + ('  ({0} file(s))' -f $cm.FilesInside) + $confTxt) -ForegroundColor Gray
+        }
+        Write-Host '  Collections are never flattened - every nested folder moves as it is.' -ForegroundColor DarkGray
     }
 
     # v2.1.1: per folder move, show the file count, the number of non-code files inside,

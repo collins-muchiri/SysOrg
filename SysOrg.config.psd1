@@ -171,6 +171,23 @@
         VerifyCrossVolumeHashes = $true
     }
 
+    # v3.0.1 B2: respect user collections. A non-generic folder name inside a scanned
+    # root ('UNDP', 'Field Workshop', ...) is a signal: the folder moves as ONE unit
+    # (structure intact, never flattened) to the destination chosen by the majority
+    # classification of its contents, e.g. Documents\Work\<FolderName> - or stays in
+    # place when the confidence is low (reported in the preview). Bounded by file count
+    # and depth; generic names, bare dates and auto-generated camera/screenshot names
+    # are never treated as collections.
+    Folders = @{
+        PreserveUserCollections = $true
+        MaxFiles          = 200    # a subtree with more files is not a collection
+        MaxDepth          = 3      # collection folders live at most this deep below a scan root
+        MinMajorityRatio  = 0.6    # below this majority the collection is left in place
+        GenericNames      = @('new folder','untitled','copy of','archive','backup','old','misc',
+                              'miscellaneous','various','stuff','things','random','temp','tmp',
+                              'downloads','desktop','documents','pictures','videos','music')
+    }
+
     Archives = @{
         Extract               = $false
         KeepMultipartTogether = $true   # .zip.001/.002, part1.rar/.r00 move as one unit

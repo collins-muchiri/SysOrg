@@ -236,6 +236,14 @@ function Import-SysOrgConfig {
         Projects = @{ Enabled=$true; Destination='Documents\Projects\Code'; Markers=@()
                       GenericNames=@('new folder','project','code','test','src','untitled','app')
                       VerifyCrossVolumeHashes=$true }
+        # v3.0.1 B2: a user-named folder inside a scan root is a signal - it moves as
+        # ONE unit (never flattened) to the destination chosen by the majority
+        # classification of its contents. Bounds keep the unit sane; generic, date and
+        # auto-generated names are never treated as collections.
+        Folders = @{ PreserveUserCollections=$true; MaxFiles=200; MaxDepth=3; MinMajorityRatio=0.6
+                     GenericNames=@('new folder','untitled','copy of','archive','backup','old','misc',
+                                    'miscellaneous','various','stuff','things','random','temp','tmp',
+                                    'downloads','desktop','documents','pictures','videos','music') }
         Archives = @{ Extract=$false; KeepMultipartTogether=$true }
         Preview  = @{ NaturalSort=$true; ShowDenied=$true; WarnOneDriveSyncOut=$true }
         Privacy  = @{ StoreFullUrlsInJournal=$true }
