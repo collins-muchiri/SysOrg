@@ -792,7 +792,7 @@ function Invoke-SysOrgSafeMove {
 .EXAMPLE
     Invoke-SysOrgSafeMove -Source C:\a.pdf -Destination D:\_Organized\Documents\2026\a.pdf -Config $cfg
 #>
-    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,$Config)
+    param([Parameter(Mandatory)][string]$Source,[Parameter(Mandatory)][string]$Destination,$Config,[string]$ExpectedHash)
     $result = [pscustomobject]@{ Status='Failed'; Source=$Source; Destination=$null; Message='' }
     try{
         if(-not (Test-Path -LiteralPath $Source)){ $result.Message='Source not found'; return $result }
@@ -826,7 +826,9 @@ function Invoke-SysOrgSafeMove {
             # One verified-copy path for all cross-volume cases (P1-10)
             Copy-Item -LiteralPath $Source -Destination $final -ErrorAction Stop
             $copyHash = Get-SysOrgFileHash -Path $final
-            $origHash = Get-SysOrgFileHash -Path $Source
+            # v2.1.1 (item 10): reuse a pre-move hash when the caller already computed one,
+            # instead of hashing the source up to three times (scan-time, pre-move, here).
+            $origHash = if($ExpectedHash){ $ExpectedHash } else { Get-SysOrgFileHash -Path $Source }
             if((-not $copyHash) -or (-not $origHash) -or ($copyHash -ne $origHash)){
                 Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
                 $result.Message='Copy verification failed; source untouched'
@@ -1173,11 +1175,16 @@ function Test-SysOrgElevated {
 <#
 .SYNOPSIS
     True when the current process runs as Administrator.
+.DESCRIPTION
+    v2.1.1: the CLI calls this at startup, so it must not throw on hosts without Windows
+    identity support (PowerShell on non-Windows) - it returns $false there.
 .EXAMPLE
     if(Test-SysOrgElevated){ Write-Host 'admin' }
 #>
-    $id=[Security.Principal.WindowsIdentity]::GetCurrent()
-    return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    try{
+        $id=[Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
 }
 
 function Test-SysOrgCloudPlaceholderAttributes {

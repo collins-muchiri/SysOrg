@@ -70,7 +70,9 @@ function New-SysOrgPlan {
     if(-not $KnownFolders -or @($KnownFolders).Count -eq 0){ $KnownFolders = @(Get-SysOrgKnownFolders) }
     if(-not $ProjectFolders){ $ProjectFolders = @() }
 
-    $planId    = 'plan-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    # v2.1.1: millisecond suffix - two plans planned within the same second no longer collide
+    $stamp = Get-Date
+    $planId = 'plan-' + $stamp.ToString('yyyyMMdd-HHmmss') + '-' + $stamp.ToString('fff')
     $root      = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
     $style     = "$(Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot')"
     $maxActions = [int](Get-SysOrgSetting $Config 'MaxPlanActions' 5000)
@@ -586,7 +588,9 @@ function New-SysOrgMigrationPlan {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Letter,$Config)
     if(-not $Config){ throw 'New-SysOrgMigrationPlan requires -Config.' }
-    $planId = 'migrate-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+    # v2.1.1: millisecond suffix (item 10) - see New-SysOrgPlan
+    $stamp = Get-Date
+    $planId = 'migrate-' + $stamp.ToString('yyyyMMdd-HHmmss') + '-' + $stamp.ToString('fff')
     $root = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
     if(-not (Test-Path -LiteralPath $root)){ throw ("Nothing to migrate: destination root '{0}' does not exist." -f $root) }
     $maxActions = [int](Get-SysOrgSetting $Config 'MaxPlanActions' 5000)
@@ -1252,7 +1256,9 @@ function Invoke-SysOrgPlan {
             if($kind -eq 'Folder'){
                 $result = Invoke-SysOrgSafeMoveFolder -Source $aSource -Destination $aDestination -Config $Config
             } else {
-                $result = Invoke-SysOrgSafeMove -Source $aSource -Destination $aDestination -Config $Config
+                # v2.1.1 (item 10): pass the pre-move hash through so cross-volume moves do
+                # not hash the source a second time.
+                $result = Invoke-SysOrgSafeMove -Source $aSource -Destination $aDestination -Config $Config -ExpectedHash "$hashBefore"
             }
 
             switch($result.Status){

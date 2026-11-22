@@ -62,6 +62,22 @@ try {
 $folders = New-SysOrgAppFolders -AppRoot $appRoot
 $logFolder = $folders.Logs
 
+# v2.1.1: running elevated is unusual for a file organizer - warn prominently.
+$script:SysOrgElevatedSession = $false
+try { $script:SysOrgElevatedSession = [bool](Test-SysOrgElevated) } catch { $script:SysOrgElevatedSession = $false }
+if($script:SysOrgElevatedSession){
+    Write-Host ''
+    Write-Host 'WARNING: SysOrg is running AS ADMINISTRATOR.' -ForegroundColor Red
+    Write-Host '  With admin rights, moves can touch folders your user account cannot normally modify.' -ForegroundColor Yellow
+    Write-Host '  Every execute or undo will additionally require typing ''yes''.' -ForegroundColor Yellow
+    Write-SysOrgLog 'Session started elevated (Administrator).' -Level WARN -LogFolder $logFolder
+}
+# v2.1.1: when elevated, any execute or undo additionally requires typing 'yes'.
+function Confirm-SysOrgElevated {
+    if(-not $script:SysOrgElevatedSession){ return $true }
+    return (Confirm-SysOrgStrict -Prompt 'ELEVATED SESSION: confirm this execute/undo with admin rights')
+}
+
 # -WritablePath extends the writable scope on any drive (design section 5.1).
 # v2.1.1: the input is resolved to a FULL CANONICAL path first - a relative path used to
 # be stored raw and never matched any absolute path at mutability-check time.
@@ -196,6 +212,11 @@ function Invoke-SysOrgScanFlow {
         Write-Host 'Plan NOT executed. Nothing was modified.' -ForegroundColor Yellow
         return
     }
+    # v2.1.1: elevated sessions must type 'yes' before any execute.
+    if(-not (Confirm-SysOrgElevated)){
+        Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
+        return
+    }
     # W8 / 6.3: targeting the REAL known folders requires a second explicit confirmation
     if("$($plan.DestinationStyle)" -eq 'KnownFolders'){
         $extra = ''
@@ -231,6 +252,11 @@ function Invoke-SysOrgMigrationFlow {
         Write-Host 'Migration NOT applied. Nothing was modified.' -ForegroundColor Yellow
         return
     }
+    # v2.1.1: elevated sessions must type 'yes' before any execute.
+    if(-not (Confirm-SysOrgElevated)){
+        Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
+        return
+    }
     $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $Config -AppRoot $appRoot
     Write-Host ''
     Write-Host ("Migration done. Moved={0}  Folders={1}  Failed={2}" -f $res.Summary.Moved, $res.Summary.FolderMoves, $res.Summary.Failed) -ForegroundColor Green
@@ -248,6 +274,10 @@ function Invoke-SysOrgPlanFile {
     }
     if(-not (Confirm-SysOrg -Prompt $prompt)){
         Write-Host 'Nothing was modified.' -ForegroundColor Yellow; return
+    }
+    # v2.1.1: elevated sessions must type 'yes' before any execute.
+    if(-not (Confirm-SysOrgElevated)){
+        Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow; return
     }
     if($plan.PSObject.Properties['DestinationStyle'] -and "$($plan.DestinationStyle)" -eq 'KnownFolders'){
         if(-not (Confirm-SysOrgStrict -Prompt 'Second confirmation: files will be filed into your real known folders (Documents/Pictures/...)')){
@@ -299,6 +329,11 @@ if($AuditDrive){
     return
 }
 if($UndoPlan){
+    # v2.1.1: elevated sessions must type 'yes' before any undo.
+    if(-not (Confirm-SysOrgElevated)){
+        Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
+        return
+    }
     $res = Undo-SysOrgPlan -PlanId $UndoPlan -AppRoot $appRoot -Config $Config
     Write-Host ("Undo complete. Restored={0}  Failed={1}  SkippedMissing={2}  SkippedChanged={3}" -f $res.Restored, $res.Failed, $res.SkippedMissing, $res.SkippedChanged)
     return
@@ -363,6 +398,11 @@ while($running){
                 }
             '6' {
                   $id = Read-Host 'Plan id (e.g. plan-20260101-093000)'
+                  # v2.1.1: elevated sessions must type 'yes' before any undo.
+                  if(-not (Confirm-SysOrgElevated)){
+                      Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
+                      continue
+                  }
                   $res = Undo-SysOrgPlan -PlanId $id -AppRoot $appRoot -Config $Config
                   Write-Host ("Restored={0}  Failed={1}  SkippedMissing={2}  SkippedChanged={3}" -f $res.Restored, $res.Failed, $res.SkippedMissing, $res.SkippedChanged)
                 }

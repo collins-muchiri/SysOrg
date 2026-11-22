@@ -683,3 +683,53 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         (@($rows2 | Where-Object { $_.Status -eq 'Done' })[0]).OriginalSource | Should -Be $src
     }
 }
+
+Describe 'Smaller hardening items (v2.1.1)' {
+    It 'plan IDs carry a millisecond suffix and match the executor regex' {
+        $inv = @([pscustomobject]@{ FullName='C:\src\note.txt'; Name='note.txt'; Stem='note'; Extension='.txt'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\src'; Category='Documents' })
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $fakeProf -DupGroups @() -Config $planCfg
+        $plan.PlanId | Should -Match '^plan-\d{8}-\d{6}-\d{3}$'
+    }
+    It 'migration plan IDs carry a millisecond suffix' {
+        $old = Join-Path $TestDrive ('ms-mig-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $old -Force | Out-Null
+        $migCfg = @{ OrganizedRoots=@{ 'T' = $old }; ReportsFolderName='_Reports'; MaxPlanActions=5000 }
+        $plan = New-SysOrgMigrationPlan -Letter T -Config $migCfg
+        $plan.PlanId | Should -Match '^migrate-\d{8}-\d{6}-\d{3}$'
+    }
+    It 'executes a plan whose millisecond PlanId indexes the journal' {
+        $src = Join-Path $TestDrive 'ms\doc.txt'
+        New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
+        Set-Content -LiteralPath $src -Value 'v'
+        # a REAL destination root (like the Rev21 fixtures) so the flow is portable
+        $msCfg = @{ AppRoot=$TestDrive; OrganizedRoots=@{ 'T' = (Join-Path $TestDrive 'ms-org') }
+                    ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true
+                    ExcludeDestinations=$true; PreserveExistingFolders=$false; DateFolders='None'
+                    Copies=@{Policy='NumberCopies';StartIndex=2}; Families=@{Enabled=$false}
+                    Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; TypeMap=@{}
+                    Move=@{ AllowCrossVolume=$true }; MaxPlanActions=5000 }
+        $plan = New-SysOrgPlan -Letter T -Inventory @([pscustomobject]@{ FullName=$src; Name='doc.txt'; Stem='doc'; Extension='.txt'
+            Length=2; LastWriteTime=(Get-Date); Directory=(Split-Path $src); Category='Documents' }) -DriveProfile $fakeProf -DupGroups @() -Config $msCfg
+        $plan.PlanId | Should -Match '^plan-\d{8}-\d{6}-\d{3}$'
+        $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder (Join-Path $TestDrive 'ms-plans')
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $msCfg -AppRoot $TestDrive
+        $res.Summary.Moved | Should -Be 1
+        Test-Path -LiteralPath $res.UndoFile | Should -BeTrue   # journal path built from the ms PlanId
+        $u = Undo-SysOrgPlan -PlanId $plan.PlanId -AppRoot $TestDrive -Config $msCfg
+        $u.Restored | Should -Be 1
+    }
+    It 'Invoke-SysOrgSafeMove accepts -ExpectedHash without changing same-volume behavior' {
+        $s = Join-Path $TestDrive 'hashreuse\src.txt'
+        New-Item -ItemType Directory -Path (Split-Path $s) -Force | Out-Null
+        Set-Content -LiteralPath $s -Value 'same-volume'
+        $d = Join-Path $TestDrive 'hashreuse\dst.txt'
+        # an ExpectedHash is NOT consulted on the same-volume rename path
+        $r = Invoke-SysOrgSafeMove -Source $s -Destination $d -Config @{ Move=@{ AllowCrossVolume=$true } } -ExpectedHash 'WRONG-HASH'
+        $r.Status | Should -Be 'Moved'
+    }
+    It 'Test-SysOrgElevated returns a boolean without throwing' {
+        $r = Test-SysOrgElevated
+        ($r -is [bool]) -or ($null -ne $r) | Should -BeTrue
+    }
+}
