@@ -124,6 +124,21 @@ function Test-SysOrgConfig {
     }
     $ratio = Get-SysOrgSetting $Config 'PreserveSingleCategoryRatio' 0.9
     if($ratio -lt 0 -or $ratio -gt 1){ $errors += 'PreserveSingleCategoryRatio must be between 0 and 1.' }
+    # v3.0: Layout caps and Score targets are integers/numbers where noted.
+    foreach($k in @('Layout.MaxFilesPerFolder','Layout.MinFilesPerFolder','Layout.MaxTopLevelFolders','Layout.MaxDepth','Layout.MaxPathChars')){
+        $v = Get-SysOrgSetting $Config $k 1
+        if(-not (($v -is [int]) -or ($v -is [long])) -or ($v -lt 1)){ $errors += "$k must be a positive integer (got '$v')." }
+    }
+    foreach($k in @('Score.Targets.OverCapShare','Score.Targets.NearEmptyShare','Score.Targets.ConfidentShare','Score.Targets.DupByteShare')){
+        $v = Get-SysOrgSetting $Config $k 0.5
+        if(($v -isnot [int]) -and ($v -isnot [long]) -and ($v -isnot [double])){ $errors += "$k must be a number between 0 and 1 (got '$v')." }
+        elseif([double]$v -lt 0 -or [double]$v -gt 1){ $errors += "$k must be a number between 0 and 1 (got '$v')." }
+    }
+    foreach($k in @('Score.Targets.MaxDepth','Score.Targets.AvgDepth')){
+        $v = Get-SysOrgSetting $Config $k 3
+        if(($v -isnot [int]) -and ($v -isnot [long]) -and ($v -isnot [double])){ $errors += "$k must be a positive number (got '$v')." }
+        elseif([double]$v -lt 0){ $errors += "$k must be a positive number (got '$v')." }
+    }
     if($errors.Count -gt 0){ throw ('Invalid configuration: ' + ($errors -join ' ')) }
 }
 
@@ -204,6 +219,13 @@ function Import-SysOrgConfig {
         Archives = @{ Extract=$false; KeepMultipartTogether=$true }
         Preview  = @{ NaturalSort=$true; ShowDenied=$true; WarnOneDriveSyncOut=$true }
         Privacy  = @{ StoreFullUrlsInJournal=$true }
+        # v3.0 Findable layout knobs (used by the Findable LayoutProfile; the legacy
+        # Windows/Compact4 profiles ignore them):
+        Layout = @{ MaxFilesPerFolder=150; MinFilesPerFolder=8; MaxTopLevelFolders=10
+                    MaxDepth=4; MaxPathChars=200 }
+        # v3.0 findability score targets (Score.Targets) - see SysOrg.Score.psm1
+        Score  = @{ Targets = @{ MaxDepth=4; AvgDepth=3.0; OverCapShare=0.05; NearEmptyShare=0.10
+                                 ConfidentShare=0.80; DupByteShare=0.10 } }
         FolderAudit = @{ Enabled=$true; MaxTopLevelDepth=2; SkipHiddenSystemDirs=$true; RespectDefenderCFA=$true; IncludeRestrictedInPlans=$false }
         Move     = @{ AllowCrossVolume = $true }
         MaxPlanActions         = 5000

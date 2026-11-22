@@ -56,6 +56,7 @@ Import-Module (Join-Path $moduleRoot 'SysOrg.Drives.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
+Import-Module (Join-Path $moduleRoot 'SysOrg.Score.psm1')       -Force
 
 if(-not $ConfigPath){ $ConfigPath = Join-Path $appRoot 'SysOrg.config.psd1' }
 # v2.1.1 fail closed: a config that exists but cannot be parsed may carry user
