@@ -14,7 +14,10 @@ BeforeAll {
     $script:fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
         KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
     $script:planCfg = @{
-        AppRoot        = $TestDrive
+        # v3.0.1: dedicated app folder - the app root is protected, and on Windows
+        # $TestDrive is an ANCESTOR of every fixture (which zeroed plans and refused
+        # moves/undos); on Unix-path hosts the same check is inert, masking this.
+        AppRoot        = (Join-Path $TestDrive 'app')
         OrganizedRoots = @{ '*' = '__AUTO__' }
         Copies         = @{ Policy='Quarantine'; QuarantineFolderName='_Duplicates'; MinFileSizeKB=0; HeaderHashKB=64 }
         Families       = @{ Enabled=$false }
@@ -46,7 +49,11 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'v1'
         $dest = Join-Path $TestDrive 'org2\Documents\2026\doc.txt'
-        $plan = [pscustomobject]@{ PlanId='plan-20260101-093002'
+        # v3.0.1: hand-built plans name their (virtual) drive so the executor's
+        # re-validation keys the profile off the plan, not the physical source
+        # drive - on Windows the fixtures live on the system drive, whose fresh
+        # profile scopes writes to the real known folders and would deny them.
+        $plan = [pscustomobject]@{ PlanId='plan-20260101-093002'; Drive='T:'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dest; Reason='Category=Documents'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'plan2.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
@@ -74,7 +81,7 @@ Describe 'Execute, re-execution guard and resume (P1-3)' {
         $dstA = Join-Path $TestDrive 'org3\Documents\2026\a.txt'
         $dstB = Join-Path $TestDrive 'org3\Documents\2026\b.txt'
         $planId = 'plan-20260101-093003'
-        $plan = [pscustomobject]@{ PlanId=$planId
+        $plan = [pscustomobject]@{ PlanId=$planId; Drive='T:'
             Actions=@(
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='Category=Documents'; SizeBytes=2 },
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcB; Destination=$dstB; Reason='Category=Documents'; SizeBytes=2 }) }
@@ -250,6 +257,7 @@ Describe 'Executor re-validation (v2.1.1)' {
         Set-Content -LiteralPath $src -Value 'v'
         $plan = [pscustomobject]@{
             PlanId = 'plan-20260101-093101'
+            Drive = 'T:'
             DestinationRoot = (Join-Path $TestDrive 'rv1-org')
             DestinationStyle = 'OrganizedRoot'
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
@@ -267,6 +275,7 @@ Describe 'Executor re-validation (v2.1.1)' {
     It 'refuses an action whose source path contains an ".." segment' {
         $plan = [pscustomobject]@{
             PlanId = 'plan-20260101-093102'
+            Drive = 'T:'
             DestinationRoot = (Join-Path $TestDrive 'rv2-org')
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'
                 Source=(Join-Path $TestDrive 'rv2\sub\..\target.txt')
@@ -296,6 +305,7 @@ Describe 'Executor re-validation (v2.1.1)' {
         Set-Content -LiteralPath $src -Value 'v1'
         $plan = [pscustomobject]@{
             PlanId = 'plan-20260101-093104'
+            Drive = 'T:'
             DestinationRoot = (Join-Path $TestDrive 'rv4-org')
             DestinationStyle = 'OrganizedRoot'
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
@@ -318,6 +328,7 @@ Describe 'Executor re-validation (v2.1.1)' {
         $fi = Get-Item -LiteralPath $src
         $plan = [pscustomobject]@{
             PlanId = 'plan-20260101-093105'
+            Drive = 'T:'
             DestinationRoot = (Join-Path $TestDrive 'rv5-org')
             DestinationStyle = 'OrganizedRoot'
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
@@ -356,6 +367,7 @@ Describe 'Executor re-validation (v2.1.1)' {
         Set-Content -LiteralPath $src -Value 'v1'
         $plan = [pscustomobject]@{
             PlanId = 'plan-20260101-093107'
+            Drive = 'T:'
             DestinationRoot = (Join-Path $TestDrive 'rv7-org')
             DestinationStyle = 'OrganizedRoot'
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src
@@ -528,7 +540,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'v'
         $planId = 'plan-20260101-094001'
-        $plan = [pscustomobject]@{ PlanId=$planId
+        $plan = [pscustomobject]@{ PlanId=$planId; Drive='T:'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=(Join-Path $TestDrive 'jr1-org\Documents\2026\doc.txt'); Reason='test'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'jr1.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
@@ -703,7 +715,7 @@ Describe 'Smaller hardening items (v2.1.1)' {
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'v'
         # a REAL destination root (like the Rev21 fixtures) so the flow is portable
-        $msCfg = @{ AppRoot=$TestDrive; OrganizedRoots=@{ 'T' = (Join-Path $TestDrive 'ms-org') }
+        $msCfg = @{ AppRoot=(Join-Path $TestDrive 'app'); OrganizedRoots=@{ 'T' = (Join-Path $TestDrive 'ms-org') }
                     ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true
                     ExcludeDestinations=$true; PreserveExistingFolders=$false; DateFolders='None'
                     Copies=@{Policy='NumberCopies';StartIndex=2}; Families=@{Enabled=$false}

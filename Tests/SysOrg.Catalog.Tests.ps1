@@ -29,7 +29,7 @@ Describe 'Catalog build and undo update (Phase 4.1)' {
         $fi.CreationTime = $stamp; $fi.LastWriteTime = $stamp
         $fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'; KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
         $cfg = @{
-            AppRoot=$work; LayoutProfile='Findable'; OrganizedRoots=@{ '*'=(Join-Path $work 'org') }
+            AppRoot=(Join-Path $work 'app'); LayoutProfile='Findable'; OrganizedRoots=@{ '*'=(Join-Path $work 'org') }   # v3.0.1: app root never an ancestor of fixtures
             Copies=@{ Policy='NumberCopies'; MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'; RenameToKeeper=$false; StartIndex=2; SuffixStyle='Parentheses' }
             Families=@{ Enabled=$false }; Downloads=@{ UseZoneIdentifier=$false }
             Move=@{ AllowCrossVolume=$true }; ExcludedPaths=@(); ExcludedFilePatterns=@()
@@ -74,7 +74,7 @@ Describe 'Catalog build and undo update (Phase 4.1)' {
         $fiU.CreationTime = $stampU; $fiU.LastWriteTime = $stampU
         $fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'; KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
         $cfg = @{
-            AppRoot=$work; LayoutProfile='Windows'; OrganizedRoots=@{ '*'=(Join-Path $work 'org') }
+            AppRoot=(Join-Path $work 'app'); LayoutProfile='Windows'; OrganizedRoots=@{ '*'=(Join-Path $work 'org') }   # v3.0.1: app root never an ancestor of fixtures
             Copies=@{ Policy='NumberCopies'; MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'; RenameToKeeper=$false; StartIndex=2; SuffixStyle='Parentheses' }
             Families=@{ Enabled=$false }; Downloads=@{ UseZoneIdentifier=$false }
             Move=@{ AllowCrossVolume=$true }; ExcludedPaths=@(); ExcludedFilePatterns=@()

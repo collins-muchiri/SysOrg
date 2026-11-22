@@ -118,9 +118,15 @@ Describe 'Property: idempotence, conservation, layout bounds' {
         $hashesAfter = Get-SysOrgHashInventory -Root $org
         $hashesAfter.Count | Should -Be (@($plan.Actions).Count)
 
-        # idempotence: re-scan the organized tree and plan it -> zero actions
-        $rootsInfo = Get-SysOrgScanRoots -Letter T -Config $cfg -Roots @($org)
-        $inv2 = @(Get-SysOrgInventory -Letter T -Config $cfg -Roots @($org) -NoCache)
+        # idempotence: re-scan the organized tree and plan it -> zero actions.
+        # v3.0.1: the organized root IS the destination root here, so the default
+        # ExcludeDestinations gate would exclude the WHOLE re-scan on Windows
+        # (the destination check is drive-qualified and only fires there); a
+        # deliberate re-organize pass opts out explicitly.
+        $cfgRescan = @{} + $cfg
+        $cfgRescan.ExcludeDestinations = $false
+        $rootsInfo = Get-SysOrgScanRoots -Letter T -Config $cfgRescan -Roots @($org)
+        $inv2 = @(Get-SysOrgInventory -Letter T -Config $cfgRescan -Roots @($org) -NoCache)
         $plan2 = New-SysOrgPlan -Letter T -Inventory $inv2 -DriveProfile $fakeProf -Config $cfg
         (@($plan2.Actions) | Where-Object { "$($_.Action)" -eq 'Move' }).Count | Should -Be 0
     }

@@ -20,7 +20,12 @@ BeforeAll {
     $script:fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
         KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
     $script:baseCfg = @{
-        AppRoot        = $TestDrive
+        # v3.0.1: AppRoot must be a DEDICATED folder, never an ancestor of the
+        # fixtures. The app root (and everything inside it) is protected by the
+        # exclusion engine; on Windows $TestDrive sits under %TEMP% and every
+        # fixture would have matched it, silently zeroing every plan. The same
+        # check is inert on Unix-path hosts, which is why this only broke on CI.
+        AppRoot        = (Join-Path $TestDrive 'app')
         LayoutProfile  = 'Findable'
         OrganizedRoots = @{ '*' = '__AUTO__' }
         Copies         = @{ Policy='Quarantine'; QuarantineFolderName='_Duplicates'; MinFileSizeKB=0; HeaderHashKB=64 }

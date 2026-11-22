@@ -20,7 +20,12 @@ BeforeAll {
     Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1')        -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Audit.psm1')       -Force
 
-    $script:letter  = if($env:OS -eq 'Windows_NT'){ (Split-Path $TestDrive -Qualifier).TrimEnd(':').ToUpper() } else { 'S' }
+    # v3.0.1: ALWAYS a virtual drive letter. On Windows the fixtures physically sit
+    # on the system drive; a real letter there made the executor's fresh-profile
+    # re-validation scope writes to the real known folders and deny every fixture
+    # ("Outside writable scope on system drive"). A virtual letter keeps the
+    # plan-time Data profile the tests were written against, on both platforms.
+    $script:letter  = 'T'
     $script:orgRoot = Join-Path $TestDrive 'org'
 
     $script:prof = [pscustomobject]@{

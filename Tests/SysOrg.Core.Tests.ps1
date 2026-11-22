@@ -412,11 +412,12 @@ Describe 'Execute and undo round trip' {
         $dest = Join-Path $TestDrive 'org\Documents\2026\report.pdf'
         $plan = [pscustomobject]@{
             PlanId  = 'plan-20260101-093000'
+            Drive   = 'T:'   # v3.0.1: virtual drive -> executor uses the plan-time Data profile
             Actions = @([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dest; Reason='Category=Documents'; SizeBytes=3 })
         }
         $planPath = Join-Path $TestDrive 'plan.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
-        $cfgRound = @{ AppRoot=$TestDrive; OrganizedRoots=@{ '*'='__AUTO__' }
+        $cfgRound = @{ AppRoot=(Join-Path $TestDrive 'app'); OrganizedRoots=@{ '*'='__AUTO__' }   # v3.0.1: app root never an ancestor of fixtures
                       Copies=@{ QuarantineFolderName='_Duplicates' }; Move=@{ AllowCrossVolume=$true } }
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $cfgRound -AppRoot $TestDrive
         $res.Summary.Moved | Should -Be 1

@@ -34,7 +34,7 @@ Describe 'Plan score delta (Phase 5)' {
         }
         $fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'; KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
         $cfg = @{
-            AppRoot=$TestDrive; LayoutProfile='Findable'; OrganizedRoots=@{ '*'='__AUTO__' }
+            AppRoot=(Join-Path $TestDrive 'app'); LayoutProfile='Findable'; OrganizedRoots=@{ '*'='__AUTO__' }   # v3.0.1: app root never an ancestor of fixtures
             Copies=@{ Policy='NumberCopies'; MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'; RenameToKeeper=$false; StartIndex=2; SuffixStyle='Parentheses' }
             Families=@{ Enabled=$false }; Downloads=@{ UseZoneIdentifier=$false }
             Move=@{ AllowCrossVolume=$true }; ExcludedPaths=@(); ExcludedFilePatterns=@()
@@ -78,7 +78,7 @@ Describe 'v2.1 -> Findable layout migration (Phase 6)' {
         New-Item -ItemType Directory -Path $idx -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $idx 'catalog.ndjson') -Value '{"keep":"me"}'
         $cfg = @{
-            AppRoot=$TestDrive; LayoutProfile='Findable'; OrganizedRoots=@{ '*'=$root }
+            AppRoot=(Join-Path $TestDrive 'app'); LayoutProfile='Findable'; OrganizedRoots=@{ '*'=$root }   # v3.0.1: app root never an ancestor of fixtures
             Copies=@{ Policy='NumberCopies'; MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'; RenameToKeeper=$false; StartIndex=2; SuffixStyle='Parentheses' }
             Families=@{ Enabled=$false }; Downloads=@{ UseZoneIdentifier=$false }
             Move=@{ AllowCrossVolume=$true }; ExcludedPaths=@(); ExcludedFilePatterns=@()
@@ -118,7 +118,7 @@ Describe 'v2.1 -> Findable layout migration (Phase 6)' {
             $fi = Get-Item -LiteralPath $p; $fi.CreationTime = $stamp; $fi.LastWriteTime = $stamp
         }
         $cfg = @{
-            AppRoot=$TestDrive; LayoutProfile='Findable'; OrganizedRoots=@{ '*'=$root }
+            AppRoot=(Join-Path $TestDrive 'app'); LayoutProfile='Findable'; OrganizedRoots=@{ '*'=$root }   # v3.0.1: app root never an ancestor of fixtures
             Copies=@{ Policy='NumberCopies'; MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'; RenameToKeeper=$false; StartIndex=2; SuffixStyle='Parentheses' }
             Families=@{ Enabled=$false }; Downloads=@{ UseZoneIdentifier=$false }
             Move=@{ AllowCrossVolume=$true }; ExcludedPaths=@(); ExcludedFilePatterns=@()
