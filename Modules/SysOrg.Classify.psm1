@@ -791,6 +791,196 @@ function Get-SysOrgDocumentCategory {
     } catch { return $null }
 }
 
+# ---------------------------------------------------------------------------
+# Stage 8b: event clustering for photos/videos (v3.0 Phase 2.7). Media files
+# are grouped by GPS cell (when EXIF GPS exists) and by capture-time gaps; a
+# cluster of at least Events.MinFiles becomes Pictures\Events\<date range>.
+# Deterministic: records are sorted by (cell, time, path) before clustering.
+# ---------------------------------------------------------------------------
+
+function Get-SysOrgEventClusters {
+<#
+.SYNOPSIS
+    Clusters media records into photo/video events by time gaps and GPS cells.
+.DESCRIPTION
+    Input records need Path, Date and optionally GpsLat/GpsLon. Records with GPS
+    are clustered within their cell (3 decimals, ~100 m) by time gap; records
+    without GPS are clustered purely by time gap (default Events.GapHours = 8).
+    A cluster with at least Events.MinFiles (default 15) members becomes an event
+    whose id is 'Events\<start> to <end>' (same-year ranges shorten the end to
+    MM-DD). Smaller clusters stay in their Camera\<date> leaves. Deterministic.
+.EXAMPLE
+    $map = Get-SysOrgEventClusters -Records $mediaRecords -Config $cfg
+    $map['C:\pics\IMG_0001.jpg']   # -> 'Events\2024-06-01 to 06-03' (or $null)
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()]$Records,$Config)
+    $gapHours = [double](Get-SysOrgSetting $Config 'Events.GapHours' 8)
+    $minFiles = [int](Get-SysOrgSetting $Config 'Events.MinFiles' 15)
+    $map = @{}
+    $clusters = New-Object System.Collections.Generic.List[object]
+    if(@($Records).Count -lt $minFiles){ return [pscustomobject]@{ Map=$map; Clusters=$clusters.ToArray() } }
+
+    # sort deterministically: GPS cell (empty last), then time, then path
+    $ordered = @($Records | Sort-Object -Property `
+        @{e={ if($_.PSObject.Properties['GpsLat'] -and $null -ne $_.GpsLat){ ('{0:F3},{1:F3}' -f $_.GpsLat, $_.GpsLon) } else { '~~~' } }}, `
+        @{e={ $_.Date.Ticks }}, @{e={ "$($_.Path)" }})
+
+    $currentCell = $null
+    $current = New-Object System.Collections.Generic.List[object]
+    foreach($r in $ordered){
+        $cell = ''
+        if($r.PSObject.Properties['GpsLat'] -and ($null -ne $r.GpsLat)){ $cell = ('{0:F3},{1:F3}' -f $r.GpsLat, $r.GpsLon) }
+        $newCluster = $false
+        if($null -ne $currentCell -and $cell -ne $currentCell){ $newCluster = $true }
+        elseif($current.Count -gt 0){
+            $last = $current[$current.Count - 1]
+            if((([datetime]$r.Date) - [datetime]$last.Date).TotalHours -gt $gapHours){ $newCluster = $true }
+        }
+        if($newCluster){
+            [void]$clusters.Add([pscustomobject]@{ Cell=$currentCell; Members=$current.ToArray() })
+            $current = New-Object System.Collections.Generic.List[object]
+        }
+        $currentCell = $cell
+        [void]$current.Add($r)
+    }
+    if($current.Count -gt 0){ [void]$clusters.Add([pscustomobject]@{ Cell=$currentCell; Members=$current.ToArray() }) }
+
+    foreach($c in $clusters){
+        $members = @($c.Members)
+        if($members.Count -lt $minFiles){ continue }
+        $start = [datetime]$members[0].Date
+        $end = [datetime]$members[$members.Count - 1].Date
+        $endLabel = if($start.Year -eq $end.Year){ $end.ToString('MM-dd') } else { $end.ToString('yyyy-MM-dd') }
+        $eventId = ('Events\{0} to {1}' -f $start.ToString('yyyy-MM-dd'), $endLabel)
+        foreach($m in $members){ $map["$($m.Path)"] = $eventId }
+    }
+    return [pscustomobject]@{ Map=$map; Clusters=$clusters.ToArray() }
+}
+
+# ---------------------------------------------------------------------------
+# Stage 8c: near-duplicate IMAGE detection (v3.0 Phase 2.8) - REPORT ONLY.
+# A small 64-bit dHash (9x8 grayscale gradient) per image, clustered by Hamming
+# distance. Uses System.Drawing, which exists on Windows; on other hosts the
+# function degrades to an empty result with a note (never throws). Near
+# duplicates are listed in the plan preview - they are NEVER moved.
+# ---------------------------------------------------------------------------
+
+function Get-SysOrgImageDHash {
+<#
+.SYNOPSIS
+    64-bit difference hash (dHash) of an image, as a 64-character bit string.
+.DESCRIPTION
+    Downscales to 9x8 grayscale and compares horizontally adjacent pixels.
+    Returns $null when imaging is unavailable (non-Windows hosts) or the file
+    cannot be read - never throws.
+.EXAMPLE
+    Get-SysOrgImageDHash -Path 'C:\pics\a.jpg'   # -> '111010...' (64 chars)
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    try{
+        if(-not ('SysOrg.ImagingProbe' -as [type])){
+            try{
+                Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+            } catch {
+                $script:SysOrgImagingAvailable = $false
+                return $null
+            }
+            $script:SysOrgImagingAvailable = $true
+        }
+        if($script:SysOrgImagingAvailable -eq $false){ return $null }
+        $bmp = $null
+        try{
+            $bmp = New-Object System.Drawing.Bitmap($Path)
+        } catch { return $null }
+        try{
+            $bits = New-Object System.Text.StringBuilder
+            for($y = 0; $y -lt 8; $y++){
+                $prev = $null
+                for($x = 0; $x -lt 9; $x++){
+                    $sx = [int]($x * $bmp.Width / 9)
+                    $sy = [int]($y * $bmp.Height / 8)
+                    $c = $bmp.GetPixel($sx, $sy)
+                    $gray = [int](0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B)
+                    if($null -ne $prev){ [void]$bits.Append($(if($gray -gt $prev){ '1' } else { '0' })) }
+                    $prev = $gray
+                }
+            }
+            return $bits.ToString()
+        } finally { $bmp.Dispose() }
+    } catch {
+        $script:SysOrgImagingAvailable = $false
+        return $null
+    }
+}
+
+function Get-SysOrgHammingDistance {
+<#
+.SYNOPSIS
+    Hamming distance between two equal-length bit strings.
+.EXAMPLE
+    Get-SysOrgHammingDistance -A '1010' -B '1000'   # -> 1
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$A,[Parameter(Mandatory)][string]$B)
+    if("$A".Length -ne "$B".Length){ return 64 }
+    $d = 0
+    for($i=0; $i -lt "$A".Length; $i++){ if("$A"[$i] -ne "$B"[$i]){ $d++ } }
+    return $d
+}
+
+function Get-SysOrgImageNearDuplicates {
+<#
+.SYNOPSIS
+    Groups near-duplicate images by dHash Hamming distance (REPORT ONLY).
+.DESCRIPTION
+    Deterministic: hashes are computed in natural path order and clusters grow
+    greedily against the first member. Groups with at least 2 members are returned
+    with their wasted bytes. On hosts without System.Drawing the result is empty
+    with a Note (near-duplicate detection is a Windows-hosted feature).
+    Nothing is ever moved or deleted based on this result.
+.EXAMPLE
+    $groups = Get-SysOrgImageNearDuplicates -ImagePaths $paths -Config $cfg
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$ImagePaths,$Config,[hashtable]$Sizes)
+    $maxDist = [int](Get-SysOrgSetting $Config 'NearDuplicates.MaxHammingDistance' 8)
+    $groups = New-Object System.Collections.Generic.List[object]
+    $note = ''
+    $paths = @($ImagePaths | Sort-Object)
+    if($paths.Count -lt 2){ return [pscustomobject]@{ Groups=$groups.ToArray(); Note='fewer than 2 images' } }
+    $hashes = @{}
+    foreach($p in $paths){
+        $h = Get-SysOrgImageDHash -Path $p
+        if($h){ $hashes[$p] = $h }
+    }
+    if($hashes.Count -lt 2){
+        return [pscustomobject]@{ Groups=$groups.ToArray(); Note='image hashing unavailable on this host (System.Drawing) or no readable images' }
+    }
+    $assigned = @{}
+    foreach($p in ($hashes.Keys | Sort-Object)){
+        if($assigned.ContainsKey($p)){ continue }
+        $members = New-Object System.Collections.Generic.List[string]
+        [void]$members.Add($p)
+        $assigned[$p] = $true
+        foreach($q in ($hashes.Keys | Sort-Object)){
+            if($assigned.ContainsKey($q)){ continue }
+            if((Get-SysOrgHammingDistance -A $hashes[$p] -B $hashes[$q]) -le $maxDist){
+                [void]$members.Add($q)
+                $assigned[$q] = $true
+            }
+        }
+        if($members.Count -ge 2){
+            $arr = @($members.ToArray())
+            $bytes = [long]0
+            if($Sizes){ foreach($m in $arr){ if($Sizes.ContainsKey($m)){ $bytes += [long]$Sizes[$m] } } }
+            [void]$groups.Add([pscustomobject]@{ Paths=$arr; Bytes=$bytes })
+        }
+    }
+    return [pscustomobject]@{ Groups=$groups.ToArray(); Note=$note }
+}
+
 function Show-SysOrgDecision {
 <#
 .SYNOPSIS

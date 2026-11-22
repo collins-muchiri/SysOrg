@@ -331,3 +331,98 @@ Describe 'Lexicon document scoring (Phase 2.6)' {
         $lex.Entries.Count | Should -BeGreaterOrEqual 5
     }
 }
+
+Describe 'Event clustering (Phase 2.7)' {
+
+    It 'a tight burst of 20 photos becomes one Events range' {
+        $recs = @()
+        $base = [datetime]::new(2024,6,1,9,0,0)
+        for($i=0; $i -lt 20; $i++){
+            $recs += [pscustomobject]@{ Path=("C:\pics\IMG_{0:D4}.jpg" -f $i); Date=$base.AddMinutes($i) }
+        }
+        $r = Get-SysOrgEventClusters -Records $recs -Config $script:cfg
+        (@($r.Map.Keys).Count) | Should -Be 20
+        $r.Map['C:\pics\IMG_0000.jpg'] | Should -Match '^Events\\2024-06-01 to 06-01$'
+    }
+
+    It 'photos spread across days stay in their date leaves (no event)' {
+        $recs = @()
+        for($i=0; $i -lt 40; $i++){
+            $recs += [pscustomobject]@{ Path=("C:\pics\IMG_{0:D4}.jpg" -f $i); Date=([datetime]::new(2024,6,1,9,0,0).AddDays($i * 2)) }
+        }
+        $r = Get-SysOrgEventClusters -Records $recs -Config $script:cfg
+        (@($r.Map.Keys).Count) | Should -Be 0
+    }
+
+    It 'different GPS cells do not merge even when times are close' {
+        $recs = @()
+        $base = [datetime]::new(2024,6,1,9,0,0)
+        for($i=0; $i -lt 10; $i++){
+            $recs += [pscustomobject]@{ Path=("C:\pics\A_{0:D2}.jpg" -f $i); Date=$base.AddMinutes($i); GpsLat=-1.286; GpsLon=36.817 }
+        }
+        for($i=0; $i -lt 10; $i++){
+            $recs += [pscustomobject]@{ Path=("C:\pics\B_{0:D2}.jpg" -f $i); Date=$base.AddMinutes($i); GpsLat=-4.043; GpsLon=39.668 }
+        }
+        $r = Get-SysOrgEventClusters -Records $recs -Config $script:cfg
+        (@($r.Map.Keys).Count) | Should -Be 0   # two cells x 10 files each: below MinFiles=15
+    }
+
+    It 'a GPS-cell burst above MinFiles becomes one event' {
+        $recs = @()
+        $base = [datetime]::new(2024,6,1,9,0,0)
+        for($i=0; $i -lt 16; $i++){
+            $recs += [pscustomobject]@{ Path=("C:\pics\A_{0:D2}.jpg" -f $i); Date=$base.AddMinutes($i); GpsLat=-1.286; GpsLon=36.817 }
+        }
+        for($i=0; $i -lt 5; $i++){
+            $recs += [pscustomobject]@{ Path=("C:\pics\B_{0:D2}.jpg" -f $i); Date=$base.AddMinutes($i); GpsLat=-4.043; GpsLon=39.668 }
+        }
+        $r = Get-SysOrgEventClusters -Records $recs -Config $script:cfg
+        (@($r.Map.Keys).Count) | Should -Be 16
+    }
+
+    It 'is deterministic for identical inputs' {
+        $recs = @()
+        $base = [datetime]::new(2024,6,1,9,0,0)
+        for($i=0; $i -lt 20; $i++){ $recs += [pscustomobject]@{ Path=("C:\pics\IMG_{0:D4}.jpg" -f $i); Date=$base.AddMinutes($i) } }
+        $arr = @($recs)
+        $r1 = Get-SysOrgEventClusters -Records $arr -Config $script:cfg
+        $r2 = Get-SysOrgEventClusters -Records $arr -Config $script:cfg
+        ($r1.Map | ConvertTo-Json -Compress) | Should -Be ($r2.Map | ConvertTo-Json -Compress)
+    }
+}
+
+Describe 'Near-duplicate image detection (Phase 2.8, report only)' {
+
+    It 'clusters identical bitmaps by dHash and never moves anything' -Skip:($env:OS -ne 'Windows_NT') {
+        $dir = Join-Path $TestDrive 'imgs'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Add-Type -AssemblyName System.Drawing
+        $paths = @()
+        foreach($n in @('a.png','b.png','c.png')){
+            $bmp = New-Object System.Drawing.Bitmap(64, 64)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.Clear([System.Drawing.Color]::Tomato)
+            $g.FillRectangle([System.Drawing.Brushes]::Navy, 0, 0, 30, 64)
+            $g.Dispose()
+            $p = Join-Path $dir $n
+            $bmp.Save($p, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            $paths += $p
+        }
+        $r = Get-SysOrgImageNearDuplicates -ImagePaths $paths -Config $script:cfg
+        (@($r.Groups).Count) | Should -BeGreaterOrEqual 1
+        (@($r.Groups[0].Paths).Count) | Should -Be 3
+    }
+
+    It 'degrades gracefully on hosts without System.Drawing' -Skip:($env:OS -eq 'Windows_NT') {
+        $r = Get-SysOrgImageNearDuplicates -ImagePaths @('C:\a.png','C:\b.png') -Config $script:cfg
+        (@($r.Groups).Count) | Should -Be 0
+        "$($r.Note)" | Should -Not -BeNullOrEmpty
+    }
+
+    It 'computes Hamming distances deterministically' {
+        (Get-SysOrgHammingDistance -A '10101010' -B '10101010') | Should -Be 0
+        (Get-SysOrgHammingDistance -A '10101010' -B '10101110') | Should -Be 1
+        (Get-SysOrgHammingDistance -A '111' -B '0000') | Should -Be 64
+    }
+}
