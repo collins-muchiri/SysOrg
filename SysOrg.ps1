@@ -230,9 +230,11 @@ function Invoke-SysOrgScanFlow {
     foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
     $null = Save-SysOrgFileStateCache -Path $cachePath -Entries $fileCache
     $sum = Show-SysOrgPlan -Plan $plan -Config $Config
-    # v3.0 Phase 5: before/after findability score in the preview
+    # v3.0 Phase 5: before/after findability score in the preview.
+    # v3.0.1 A2: the full inventory is passed so before/after are scored over the SAME
+    # population (untouched + moved) - a moved-files-only 'after' can never distort the verdict.
     $scoreDelta = $null
-    try { $scoreDelta = Get-SysOrgPlanScoreDelta -Plan $plan -Config $Config -Root $plan.DestinationRoot } catch { $scoreDelta = $null }
+    try { $scoreDelta = Get-SysOrgPlanScoreDelta -Plan $plan -Config $Config -Root $plan.DestinationRoot -Inventory $inv } catch { $scoreDelta = $null }
     if($scoreDelta){ Show-SysOrgScoreDelta -Delta $scoreDelta }
     $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $folders.Plans
     Write-Host ("Plan saved: {0}" -f $planPath) -ForegroundColor Green

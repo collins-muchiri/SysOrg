@@ -181,8 +181,17 @@
     # their extension even though Windows' routing set calls them Documents).
     # Events cluster photos/videos by capture time (Events.GapHours); near-duplicate
     # images are REPORTED, never moved. Findability score targets live in Score.
+    # v3.0.1 A2: Score.MinPopulation is the honest 'n/a' floor (an empty or tiny tree
+    # scores 'n/a', never 100); Score.MeaningfulChangeShare makes plan verdicts honest
+    # about scale - below a 5% affected share the verdict reads
+    # 'no meaningful change (X of Y files affected)', never 'worsens'.
     Events          = @{ GapHours=8; MinFiles=15 }
     NearDuplicates  = @{ Enabled=$true; MaxHammingDistance=8 }
+    Score = @{
+        Targets = @{ MaxDepth=4; AvgDepth=3.0; OverCapShare=0.05; NearEmptyShare=0.10; ConfidentShare=0.80; DupByteShare=0.10 }
+        MinPopulation         = 20     # fewer files than this -> the score reads 'n/a'
+        MeaningfulChangeShare = 0.05   # < 5% of files affected -> 'no meaningful change'
+    }
 
     Preview = @{
         NaturalSort         = $true    # StrCmpLogicalW: file (2) before file (10), like Explorer

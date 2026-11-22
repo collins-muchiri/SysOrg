@@ -66,6 +66,9 @@ function Get-SysOrgFindabilityScore {
     measured by the duplicate pipeline; -TotalBytes defaults to the sum of file sizes
     when -FileSizes is supplied. Deterministic: folders are aggregated in one pass and
     percentiles use the nearest-rank rule.
+    v3.0.1 A2: -MinFilesForScore (caller-supplied; the CLI uses 20) makes the composite
+    score an honest 'n/a' (-1) on tiny trees instead of a meaningless 100. All raw
+    metrics are still computed, so callers can inspect them.
 .EXAMPLE
     $s = Get-SysOrgFindabilityScore -Root 'C:\_Organized' -FilePaths $paths -FileSizes $sizes
     $s.Score   # -> 0..100
@@ -78,7 +81,8 @@ function Get-SysOrgFindabilityScore {
         [hashtable]$Confidences,
         [long]$DuplicateBytes = 0,
         [int]$Cap = 150,
-        [int]$MinPerFolder = 8
+        [int]$MinPerFolder = 8,
+        [int]$MinFilesForScore = 0
     )
     $rootN = ("$Root").Replace('/','\').TrimEnd('\')
     if([string]::IsNullOrWhiteSpace($rootN)){ $rootN = '\' }
@@ -177,6 +181,8 @@ function Get-SysOrgFindabilityScore {
     if($maxDepth -gt 4){ $score -= [Math]::Min(20.0, 5.0 * ($maxDepth - 4)) }
     if($score -lt 0){ $score = 0.0 }
     if($score -gt 100){ $score = 100.0 }
+    # v3.0.1 A2: an honest 'n/a' on a tiny population - 4 files can never mean 100.
+    if($MinFilesForScore -gt 0 -and $totalFiles -lt $MinFilesForScore){ $score = -1.0 }
 
     return [pscustomobject]@{
         Root            = $rootN
@@ -194,6 +200,7 @@ function Get-SysOrgFindabilityScore {
         LowConfShare    = $(if($withConf -gt 0){ [Math]::Round($lowConf / $withConf, 4) } else { -1.0 })
         DuplicateByteShare = $dupShare        # -1 when total bytes unknown
         Score           = [Math]::Round($score, 1)
+        MinFilesForScore= $MinFilesForScore   # the threshold that made Score -1 (n/a), if any
     }
 }
 
@@ -225,10 +232,19 @@ function Show-SysOrgFindabilityScore {
 <#
 .SYNOPSIS
     Prints a findability score result (and optionally the target table).
+.DESCRIPTION
+    v3.0.1 A2: an empty tree (or one below the population floor) prints an honest
+    'n/a', never a fake 100.
 .EXAMPLE
     Show-SysOrgFindabilityScore -Score $s -Config $cfg -Label 'After plan'
 #>
     param([Parameter(Mandatory)]$Score,[string]$Label,$Config,[switch]$WithTargets)
+    if($Score.Score -lt 0){
+        if($Label){ Write-Host ('Findability score - {0}: n/a' -f $Label) -ForegroundColor Gray }
+        else { Write-Host 'Findability score: n/a' -ForegroundColor Gray }
+        Write-Host ('  {0} file(s) in this tree - fewer than {1}; there is nothing meaningful to score yet.' -f $Score.Files, $Score.MinFilesForScore) -ForegroundColor Gray
+        return
+    }
     if($Label){ Write-Host '' ; Write-Host ("Findability score - {0}: {1}/100" -f $Label, $Score.Score) -ForegroundColor White }
     else { Write-Host ("Findability score: {0}/100" -f $Score.Score) -ForegroundColor White }
     Write-Host ("  files={0} folders={1}  depth avg={2} max={3}  browse-distance(avg folder opens)={4}" -f $Score.Files, $Score.Folders, $Score.AvgDepth, $Score.MaxDepth, $Score.AvgDepth)
@@ -251,22 +267,117 @@ function Show-SysOrgFindabilityScore {
 function Get-SysOrgPlanScoreDelta {
 <#
 .SYNOPSIS
-    Before/after findability scores for a plan (v3.0 Phase 5).
+    Before/after findability scores for a plan (v3.0 Phase 5; corrected in v3.0.1 A2).
 .DESCRIPTION
-    BEFORE scores the files at their CURRENT locations (every planned source plus
-    every needs-a-decision file, which stays put). AFTER scores the planned
-    destinations (needs-a-decision files keep their current path). Confidence shares
-    come from the actions' Decision confidence. The verdict states plainly whether
-    the plan improves or worsens the score, and why. Deterministic.
+    v3.0.1 A2 - the BEFORE and AFTER trees are scored over the SAME population:
+    EVERY file in scope (the untouched files plus the planned moves) appears on both
+    sides, at its before and after location. The old code compared a moved-files-only
+    'after' against it, which could make an 11-file plan over 9,579 files read as
+    'worsens'. Pass -Inventory (the scan records) to include the untouched files;
+    without it the population falls back to the plan's own actions + needs-a-decision
+    files (still the same population on both sides).
+    Population below Score.MinPopulation (default 20) or an empty tree returns the
+    honest Verdict 'n/a' - never a fake 100.
+    Verdict wording is honest about scale: when fewer than
+    Score.MeaningfulChangeShare (default 5%) of the population is affected, the
+    verdict is 'no meaningful change' - never 'improves'/'worsens'.
+    Deterministic.
 .EXAMPLE
-    $delta = Get-SysOrgPlanScoreDelta -Plan $plan -Config $cfg -Root $root
-    $delta.Verdict   # -> 'improves' | 'worsens' | 'unchanged'
+    $delta = Get-SysOrgPlanScoreDelta -Plan $plan -Config $cfg -Root $root -Inventory $inv
+    $delta.Verdict   # -> 'improves' | 'worsens' | 'unchanged' | 'no meaningful change' | 'n/a'
 #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Plan,[Parameter(Mandatory)]$Config,[Parameter(Mandatory)][string]$Root)
+    param([Parameter(Mandatory)]$Plan,[Parameter(Mandatory)]$Config,[Parameter(Mandatory)][string]$Root,
+          [AllowEmptyCollection()]$Inventory)
     $cap = [int](Get-SysOrgSetting $Config 'Layout.MaxFilesPerFolder' 150)
     $min = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
+    $minPopulation = [int](Get-SysOrgSetting $Config 'Score.MinPopulation' 20)
+    $meaningfulShare = [double](Get-SysOrgSetting $Config 'Score.MeaningfulChangeShare' 0.05)
     $rootN = ("$Root").Replace('/','\').TrimEnd('\')
+
+    # ---- build the population: same set of files, before AND after locations ----
+    $plannedDestBySrc = @{}
+    $plannedSizeBySrc = @{}
+    $plannedConfBySrc = @{}
+    foreach($a in @($Plan.Actions)){
+        if("$($a.Action)" -ne 'Move'){ continue }
+        if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }   # folder units are not scored per-file
+        $src = "$($a.Source)"
+        $dst = "$($a.Destination)"
+        $sz = [long]0
+        if($a.PSObject.Properties['SizeBytes'] -and $a.SizeBytes){ $sz = [long]$a.SizeBytes }
+        $plannedDestBySrc[$src] = $dst
+        $plannedSizeBySrc[$src] = $sz
+        if($a.PSObject.Properties['Confidence'] -and ($null -ne $a.Confidence)){ $plannedConfBySrc[$src] = [double]$a.Confidence }
+    }
+
+    $population = New-Object System.Collections.Generic.List[object]
+    $inventorySet = @{}
+    if($Inventory -and @($Inventory).Count -gt 0){
+        foreach($f in @($Inventory)){
+            $src = "$($f.FullName)"
+            if([string]::IsNullOrWhiteSpace($src)){ continue }
+            if("$($f.Category)" -eq 'SkippedLongPath'){ continue }   # recorded, never planned
+            $inventorySet[$src] = $true
+            $after = $src
+            if($plannedDestBySrc.ContainsKey($src)){ $after = [string]$plannedDestBySrc[$src] }
+            $sz = [long]0
+            if($f.PSObject.Properties['Length'] -and $f.Length){ $sz = [long]$f.Length }
+            elseif($plannedSizeBySrc.ContainsKey($src)){ $sz = [long]$plannedSizeBySrc[$src] }
+            $conf = $null
+            if($plannedConfBySrc.ContainsKey($src)){ $conf = $plannedConfBySrc[$src] }
+            [void]$population.Add([pscustomobject]@{ Before=$src; After=$after; Size=$sz; Conf=$conf })
+        }
+        # plan actions whose source is not in the inventory (folder members, cross-scope copies)
+        foreach($a in @($Plan.Actions)){
+            if("$($a.Action)" -ne 'Move'){ continue }
+            if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
+            $src = "$($a.Source)"
+            if($inventorySet.ContainsKey($src)){ continue }
+            $sz = [long]0
+            if($a.PSObject.Properties['SizeBytes'] -and $a.SizeBytes){ $sz = [long]$a.SizeBytes }
+            $conf = $null
+            if($a.PSObject.Properties['Confidence'] -and ($null -ne $a.Confidence)){ $conf = [double]$a.Confidence }
+            [void]$population.Add([pscustomobject]@{ Before=$src; After="$($a.Destination)"; Size=$sz; Conf=$conf })
+        }
+    }
+    else {
+        # no inventory supplied: the plan's own files (moves + needs-a-decision) form the
+        # population - the SAME set on both sides
+        foreach($a in @($Plan.Actions)){
+            if("$($a.Action)" -ne 'Move'){ continue }
+            if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
+            $src = "$($a.Source)"
+            $sz = [long]0
+            if($a.PSObject.Properties['SizeBytes'] -and $a.SizeBytes){ $sz = [long]$a.SizeBytes }
+            $conf = $null
+            if($a.PSObject.Properties['Confidence'] -and ($null -ne $a.Confidence)){ $conf = [double]$a.Confidence }
+            [void]$population.Add([pscustomobject]@{ Before=$src; After="$($a.Destination)"; Size=$sz; Conf=$conf })
+        }
+        if($Plan.PSObject.Properties['NeedsDecision']){
+            $seenBefore = @{}
+            foreach($p in $population){ $seenBefore["$($p.Before)"] = $true }
+            foreach($nd in @($Plan.NeedsDecision)){
+                $src = "$($nd.Source)"
+                if([string]::IsNullOrWhiteSpace($src)){ continue }
+                if($seenBefore.ContainsKey($src)){ continue }
+                $seenBefore[$src] = $true
+                [void]$population.Add([pscustomobject]@{ Before=$src; After=$src; Size=[long]0; Conf=$null })
+            }
+        }
+    }
+
+    $total = $population.Count
+    $affected = 0
+    foreach($p in $population){ if("$($p.Before)" -ine "$($p.After)"){ $affected++ } }
+
+    if($total -lt $minPopulation){
+        return [pscustomobject]@{
+            Before=$null; After=$null; Verdict='n/a'
+            Why=('population too small to score honestly ({0} file(s) in scope; {1} required)' -f $total, $minPopulation)
+            Moved=$affected; Affected=$affected; Population=$total; CommonRoot=$rootN; Measured=$false
+        }
+    }
 
     $beforePaths = New-Object System.Collections.Generic.List[string]
     $beforeSizes = @{}
@@ -274,36 +385,17 @@ function Get-SysOrgPlanScoreDelta {
     $afterPaths = New-Object System.Collections.Generic.List[string]
     $afterSizes = @{}
     $afterConf = @{}
-    $moved = 0
-    foreach($a in @($Plan.Actions)){
-        if("$($a.Action)" -ne 'Move'){ continue }
-        if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
-        $src = "$($a.Source)"
-        $dst = "$($a.Destination)"
-        $sz = 0
-        if($a.PSObject.Properties['SizeBytes'] -and $a.SizeBytes){ $sz = [long]$a.SizeBytes }
-        [void]$beforePaths.Add($src)
-        $beforeSizes[$src] = $sz
-        $conf = $null
-        if($a.PSObject.Properties['Confidence']){ $conf = $a.Confidence }
-        if($null -ne $conf){ $beforeConf[$src] = [double]$conf }
-        [void]$afterPaths.Add($dst)
-        $afterSizes[$dst] = $sz
-        if($null -ne $conf){ $afterConf[$dst] = [double]$conf }
-        if($src -ine $dst){ $moved++ }
-    }
-    if($Plan.PSObject.Properties['NeedsDecision']){
-        foreach($nd in @($Plan.NeedsDecision)){
-            $src = "$($nd.Source)"
-            if($beforeSizes.ContainsKey($src)){ continue }
-            [void]$beforePaths.Add($src)
-            [void]$afterPaths.Add($src)
-        }
+    foreach($p in $population){
+        [void]$beforePaths.Add([string]$p.Before)
+        [void]$afterPaths.Add([string]$p.After)
+        $beforeSizes[[string]$p.Before] = [long]$p.Size
+        $afterSizes[[string]$p.After] = [long]$p.Size
+        if($null -ne $p.Conf){ $beforeConf[[string]$p.Before] = [double]$p.Conf; $afterConf[[string]$p.After] = [double]$p.Conf }
     }
     # The BEFORE tree must be measured on its own structure: sources live OUTSIDE the
     # destination root (and possibly on another drive), so each tree is scored relative
     # to its own deepest common ancestor - that keeps depth/fan-out comparable between
-    # the current layout and the planned one.
+    # the current layout and the planned one. SAME population on both sides.
     function Get-SysOrgCommonAncestor {
         param([AllowEmptyCollection()][string[]]$Paths)
         $root2 = $null
@@ -328,13 +420,19 @@ function Get-SysOrgPlanScoreDelta {
     $before = Get-SysOrgFindabilityScore -Root $beforeRoot -FilePaths $beforePaths.ToArray() -FileSizes $beforeSizes -Confidences $beforeConf -Cap $cap -MinPerFolder $min
     $after  = Get-SysOrgFindabilityScore -Root $afterRoot  -FilePaths $afterPaths.ToArray()  -FileSizes $afterSizes  -Confidences $afterConf  -Cap $cap -MinPerFolder $min
     $verdict = 'unchanged'
-    $why = ''
     if($after.Score -gt $before.Score){ $verdict = 'improves' }
     elseif($after.Score -lt $before.Score){ $verdict = 'worsens' }
-    $why = ('depth {0} -> {1}; over-cap {2}% -> {3}%{4}' -f $before.AvgDepth, $after.AvgDepth, [Math]::Round($before.OverCapShare*100), [Math]::Round($after.OverCapShare*100),
+    # v3.0.1 A2: honest scale. An 11-file plan over 9,579 files is noise, not a verdict.
+    $affectedPct = [Math]::Round(100.0 * $affected / $total, 1)
+    if(($affected / $total) -lt $meaningfulShare){ $verdict = 'no meaningful change' }
+    $why = ('{0} of {1} files affected ({2}%); depth {3} -> {4}; over-cap {5}% -> {6}%{7}' -f `
+        $affected, ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:N0}', $total)), $affectedPct, $before.AvgDepth, $after.AvgDepth,
+        [Math]::Round($before.OverCapShare*100), [Math]::Round($after.OverCapShare*100),
         $(if($before.ConfidentShare -ge 0){ ('; confident {0}% -> {1}%' -f [Math]::Round($before.ConfidentShare*100), [Math]::Round($after.ConfidentShare*100)) } else { '' }))
     return [pscustomobject]@{
-        Before=$before; After=$after; Verdict=$verdict; Why=$why; Moved=$moved; CommonRoot=$beforeRoot
+        Before=$before; After=$after; Verdict=$verdict; Why=$why
+        Moved=$affected; Affected=$affected; Population=$total; CommonRoot=$beforeRoot
+        Measured=$true
     }
 }
 
@@ -342,10 +440,27 @@ function Show-SysOrgScoreDelta {
 <#
 .SYNOPSIS
     Prints the before/after score and the plain-language verdict.
+.DESCRIPTION
+    v3.0.1 A2: verdict wording is honest about scale - a tiny affected share reads
+    'no meaningful change (X of Y files affected)' and can never read 'worsens';
+    a too-small population reads 'n/a'.
 .EXAMPLE
     Show-SysOrgScoreDelta -Delta $delta
 #>
     param([Parameter(Mandatory)]$Delta)
+    if("$($Delta.Verdict)" -eq 'n/a'){
+        Write-Host ''
+        Write-Host ('Findability score: n/a  ({0})' -f $Delta.Why) -ForegroundColor Gray
+        return
+    }
+    if("$($Delta.Verdict)" -eq 'no meaningful change'){
+        Write-Host ''
+        Write-Host ('Findability score: {0} -> {1}  (no meaningful change: {2} of {3} files affected)' -f `
+            $Delta.Before.Score, $Delta.After.Score, $Delta.Affected,
+            ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0:N0}', $Delta.Population))) -ForegroundColor Gray
+        Write-Host ('  ' + $Delta.Why) -ForegroundColor Gray
+        return
+    }
     $color = 'Gray'
     if($Delta.Verdict -eq 'improves'){ $color = 'Green' }
     elseif($Delta.Verdict -eq 'worsens'){ $color = 'Yellow' }
@@ -359,6 +474,10 @@ function Get-SysOrgTreeScore {
 <#
 .SYNOPSIS
     Scores an existing tree live (the -Score CLI path).
+.DESCRIPTION
+    v3.0.1 A2: the composite score is 'n/a' (-1) for a tree with fewer than
+    Score.MinPopulation (default 20) files - an empty or near-empty tree never
+    prints a fake 100.
 .EXAMPLE
     Get-SysOrgTreeScore -Root 'C:\_Organized' -Config $cfg
 #>
@@ -366,6 +485,7 @@ function Get-SysOrgTreeScore {
     param([Parameter(Mandatory)][string]$Root,$Config)
     $cap = [int](Get-SysOrgSetting $Config 'Layout.MaxFilesPerFolder' 150)
     $min = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
+    $minPop = [int](Get-SysOrgSetting $Config 'Score.MinPopulation' 20)
     $paths = New-Object System.Collections.Generic.List[string]
     $sizes = @{}
     try{
@@ -374,7 +494,7 @@ function Get-SysOrgTreeScore {
             try { $sizes[[string]$f] = (Get-Item -LiteralPath $f -Force).Length } catch { }
         }
     } catch { }
-    return (Get-SysOrgFindabilityScore -Root $Root -FilePaths $paths.ToArray() -FileSizes $sizes -Cap $cap -MinPerFolder $min)
+    return (Get-SysOrgFindabilityScore -Root $Root -FilePaths $paths.ToArray() -FileSizes $sizes -Cap $cap -MinPerFolder $min -MinFilesForScore $minPop)
 }
 
 Export-ModuleMember -Function *-SysOrg*

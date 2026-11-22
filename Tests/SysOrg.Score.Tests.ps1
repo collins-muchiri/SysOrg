@@ -112,3 +112,103 @@ Describe 'Score targets' {
         ($rows | Where-Object { $_.Metric -eq 'MaxDepth' }).Pass | Should -BeFalse
     }
 }
+
+Describe 'Plan score delta honesty (v3.0.1 A2)' {
+
+    BeforeAll {
+        Import-Module (Join-Path $repo 'Modules\SysOrg.Score.psm1') -Force
+        $script:a2Cfg = @{
+            Layout = @{ MaxFilesPerFolder=150; MinFilesPerFolder=8 }
+            Score  = @{ MinPopulation=20; MeaningfulChangeShare=0.05 }
+        }
+        # The regression fixture from the real run: an 11-file plan over a ~9.5k
+        # population. Invented equivalents, no real filenames.
+        function New-SysOrgA2Fixture {
+            $inv = New-Object System.Collections.Generic.List[object]
+            for($i=0; $i -lt 9489; $i++){
+                $y = 2020 + ($i % 6)
+                $inv.Add([pscustomobject]@{ FullName=('C:\Users\t\Documents\Work\{0}\doc{1:D5}.txt' -f $y, $i)
+                                            Name=('doc{0:D5}.txt' -f $i); Length=[long]100; Category='Documents' })
+            }
+            for($i=0; $i -lt 11; $i++){
+                $inv.Add([pscustomobject]@{ FullName=('C:\Users\t\Downloads\file{0}.pdf' -f $i)
+                                            Name=('file{0}.pdf' -f $i); Length=[long]200; Category='Documents' })
+            }
+            $actions = @()
+            for($i=0; $i -lt 11; $i++){
+                $actions += [pscustomobject]@{ Action='Move'; Kind='File'
+                    Source=('C:\Users\t\Downloads\file{0}.pdf' -f $i)
+                    Destination=('C:\Organized\Documents\Work\2026\file{0}.pdf' -f $i)
+                    SizeBytes=[long]200; Confidence=0.8; DifferentContent=$false }
+            }
+            $plan = [pscustomobject]@{ PlanId='plan-a2-fixture'; Actions=$actions; NeedsDecision=@(); DestinationRoot='C:\Organized' }
+            return @{ Inv=@($inv.ToArray()); Plan=$plan }
+        }
+    }
+
+    It 'an 11-file plan over a 9.5k population NEVER reads "worsens"' {
+        $fx = New-SysOrgA2Fixture
+        $d = Get-SysOrgPlanScoreDelta -Plan $fx.Plan -Config $script:a2Cfg -Root 'C:\Organized' -Inventory $fx.Inv
+        $d.Verdict | Should -Be 'no meaningful change'
+        $d.Verdict | Should -Not -Be 'worsens'
+        $d.Affected  | Should -Be 11
+        $d.Population| Should -Be 9500
+        $d.Why | Should -Match '^11 of 9,500 files affected'
+    }
+
+    It 'scores before and after over the SAME population (untouched + moved, both sides)' {
+        $fx = New-SysOrgA2Fixture
+        $d = Get-SysOrgPlanScoreDelta -Plan $fx.Plan -Config $script:a2Cfg -Root 'C:\Organized' -Inventory $fx.Inv
+        $d.Before.Files | Should -Be 9500
+        $d.After.Files  | Should -Be 9500
+    }
+
+    It 'a population below Score.MinPopulation reads n/a, never a number' {
+        $actions = @(1..5 | ForEach-Object {
+            [pscustomobject]@{ Action='Move'; Kind='File'
+                Source=("C:\Users\t\Downloads\f$_.pdf"); Destination=("C:\Organized\Documents\2026\f$_.pdf")
+                SizeBytes=[long]10; Confidence=0.8 } })
+        $plan = [pscustomobject]@{ PlanId='plan-small'; Actions=$actions; NeedsDecision=@(); DestinationRoot='C:\Organized' }
+        $d = Get-SysOrgPlanScoreDelta -Plan $plan -Config $script:a2Cfg -Root 'C:\Organized'
+        $d.Verdict | Should -Be 'n/a'
+        $d.Measured | Should -BeFalse
+        $d.Before | Should -BeNullOrEmpty
+    }
+
+    It 'an empty or tiny tree scores n/a (-1), never 100' {
+        $s0 = Get-SysOrgFindabilityScore -Root 'C:\Org' -FilePaths @() -MinFilesForScore 20
+        $s0.Score | Should -Be -1
+        $s0.Files | Should -Be 0
+        $paths = @(1..19 | ForEach-Object { 'C:\Org\Documents\2026\f{0}.txt' -f $_ })
+        $s19 = Get-SysOrgFindabilityScore -Root 'C:\Org' -FilePaths $paths -MinFilesForScore 20
+        $s19.Score | Should -Be -1
+        $paths20 = @(1..20 | ForEach-Object { 'C:\Org\Documents\2026\f{0}.txt' -f $_ })
+        $s20 = Get-SysOrgFindabilityScore -Root 'C:\Org' -FilePaths $paths20 -MinFilesForScore 20
+        $s20.Score | Should -BeGreaterOrEqual 0
+    }
+
+    It 'the -Score path (Get-SysOrgTreeScore) returns n/a on an empty folder' {
+        $empty = Join-Path $TestDrive ('empty-tree-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Path $empty -Force | Out-Null
+        $s = Get-SysOrgTreeScore -Root $empty -Config $script:a2Cfg
+        $s.Score | Should -Be -1
+    }
+
+    It 'a plan that affects MOST of the population still gets a real verdict' {
+        $inv = New-Object System.Collections.Generic.List[object]
+        for($i=0; $i -lt 500; $i++){
+            $inv.Add([pscustomobject]@{ FullName=('C:\Users\t\Desktop\f{0:D3}.txt' -f $i); Name=('f{0:D3}.txt' -f $i); Length=[long]10; Category='Documents' })
+        }
+        $actions = @()
+        for($i=0; $i -lt 400; $i++){
+            $actions += [pscustomobject]@{ Action='Move'; Kind='File'
+                Source=('C:\Users\t\Desktop\f{0:D3}.txt' -f $i)
+                Destination=('C:\Organized\Documents\Work\2026\f{0:D3}.txt' -f $i)
+                SizeBytes=[long]10; Confidence=0.9 }
+        }
+        $plan = [pscustomobject]@{ PlanId='plan-big'; Actions=$actions; NeedsDecision=@(); DestinationRoot='C:\Organized' }
+        $d = Get-SysOrgPlanScoreDelta -Plan $plan -Config $script:a2Cfg -Root 'C:\Organized' -Inventory @($inv.ToArray())
+        @('improves','worsens','unchanged') | Should -Contain $d.Verdict
+        $d.Affected | Should -Be 400
+    }
+}

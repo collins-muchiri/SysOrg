@@ -243,9 +243,13 @@ function Import-SysOrgConfig {
         # Windows/Compact4 profiles ignore them):
         Layout = @{ MaxFilesPerFolder=150; MinFilesPerFolder=8; MaxTopLevelFolders=10
                     MaxDepth=4; MaxPathChars=200 }
-        # v3.0 findability score targets (Score.Targets) - see SysOrg.Score.psm1
+        # v3.0 findability score targets (Score.Targets) - see SysOrg.Score.psm1.
+        # v3.0.1 A2: MinPopulation = the honest 'n/a' floor for composite scores;
+        # MeaningfulChangeShare = below this affected share a plan verdict reads
+        # 'no meaningful change', never 'improves'/'worsens'.
         Score  = @{ Targets = @{ MaxDepth=4; AvgDepth=3.0; OverCapShare=0.05; NearEmptyShare=0.10
-                                 ConfidentShare=0.80; DupByteShare=0.10 } }
+                                 ConfidentShare=0.80; DupByteShare=0.10 }
+                    MinPopulation=20; MeaningfulChangeShare=0.05 }
         # v3.0: files the classifier cannot place with at least Classify.MinConfidence
         # are NEVER dumped into a junk folder. Mode='Report' lists them in the plan's
         # "needs a decision" section and leaves them in place; Mode='Move' files them
