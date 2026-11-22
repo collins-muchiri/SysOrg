@@ -56,6 +56,7 @@ Import-Module (Join-Path $moduleRoot 'SysOrg.Drives.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Layout.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Metadata.psm1')    -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Classify.psm1')    -Force
+Import-Module (Join-Path $moduleRoot 'SysOrg.Cache.psm1')       -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
@@ -210,11 +211,22 @@ function Invoke-SysOrgScanFlow {
     }
     Write-Host ''
     Write-SysOrgLog 'Detecting duplicates (hashes candidate files; can take a while)...' -LogFolder $logFolder
-    $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config)
+    # v3.0 Phase 3.1/3.4/3.5: the persistent file-state cache + parallel hashing
+    $cachePath = Join-Path $folders.Cache 'filestate.ndjson'
+    $cacheLoad = Read-SysOrgFileStateCache -Path $cachePath
+    $fileCache = $cacheLoad.Entries
+    if($cacheLoad.Corrupted){ Write-Warning 'The file-state cache was corrupted - falling back to a full rescan (nothing was harmed).' }
+    $newCacheEntries = @{}
+    $par = Get-SysOrgParallelism -Config $Config -DriveProfile $prof
+    if($Parallelism -gt 0){ $par = $Parallelism }
+    $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config -FileCache $fileCache -NewEntries $newCacheEntries -Parallelism $par)
     Write-Host ("Duplicate groups found: {0}" -f @($dups).Count)
     $projects = @(Get-SysOrgProjectFolders -Roots @($rootsInfo.Initial) -Config $Config -DriveProfile $prof -KnownFolders @($prof.KnownFolders))
     if(@($projects).Count -gt 0){ Write-Host ("Code project folders detected: {0} (moved whole, .git intact)" -f @($projects).Count) }
-    $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects
+    $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -FileCache $fileCache -NewCacheEntries $newCacheEntries
+    # persist the updated file-state cache (best effort - it is a performance cache)
+    foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
+    $null = Save-SysOrgFileStateCache -Path $cachePath -Entries $fileCache
     $sum = Show-SysOrgPlan -Plan $plan -Config $Config
     $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $folders.Plans
     Write-Host ("Plan saved: {0}" -f $planPath) -ForegroundColor Green
@@ -365,11 +377,19 @@ function Invoke-SysOrgBenchmarkFlow {
     $null = Get-SysOrgInventory -Letter 'C' -Config $benchCfg -Roots @($Corpus) -CacheFolder $benchApp\Cache
     $results.Add((Measure-SysOrgBenchStep -Name 'warm-scan' -Step { $script:BenchInv2 = @(Get-SysOrgInventory -Letter 'C' -Config $benchCfg -Roots @($Corpus) -CacheFolder $benchApp\Cache) }))
     $dups = @()
-    $results.Add((Measure-SysOrgBenchStep -Name 'duplicate-detect' -Step { $script:BenchDups = @(Find-SysOrgDuplicates -Inventory $inv -Config $benchCfg) }))
+    # v3.0: the file-state cache lives with the benchmark app folder
+    $benchCachePath = Join-Path (Join-Path $benchApp 'Cache') 'filestate.ndjson'
+    $cacheLoad = Read-SysOrgFileStateCache -Path $benchCachePath
+    $fileCache = $cacheLoad.Entries
+    $newCacheEntries = @{}
+    $par = Get-SysOrgParallelism -Config $benchCfg -DriveProfile $prof
+    $results.Add((Measure-SysOrgBenchStep -Name 'duplicate-detect' -Step { $script:BenchDups = @(Find-SysOrgDuplicates -Inventory $inv -Config $benchCfg -FileCache $fileCache -NewEntries $newCacheEntries -Parallelism $par) }))
     $dups = $script:BenchDups
     $plan = $null
-    $results.Add((Measure-SysOrgBenchStep -Name 'plan-build' -Step { $script:BenchPlan = New-SysOrgPlan -Letter 'C' -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $benchCfg }))
+    $results.Add((Measure-SysOrgBenchStep -Name 'plan-build' -Step { $script:BenchPlan = New-SysOrgPlan -Letter 'C' -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $benchCfg -FileCache $fileCache -NewCacheEntries $newCacheEntries }))
     $plan = $script:BenchPlan
+    foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
+    $null = Save-SysOrgFileStateCache -Path $benchCachePath -Entries $fileCache
     $res = $null
     $results.Add((Measure-SysOrgBenchStep -Name 'execute-plan' -Step {
         $script:BenchPlanPath = Save-SysOrgPlan -Plan $plan -PlansFolder (Join-Path $benchApp 'Plans')

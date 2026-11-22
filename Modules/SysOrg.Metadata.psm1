@@ -451,6 +451,19 @@ $script:SysOrgExtractorRegistry = @{
     text   = @{ Extensions=@('.txt','.md','.csv','.tsv','.log'); Fn={ param($Path) Get-SysOrgTextSnippet -Path $Path } }
 }
 
+# The built-in extractor registry is declared ABOVE (family -> extensions + scriptblock).
+
+function Get-SysOrgExtractorRegistry {
+<#
+.SYNOPSIS
+    Exposes the built-in extractor registry (family -> extensions + scriptblock)
+    for the cache bridge and tests. Read-only access.
+.EXAMPLE
+    (Get-SysOrgExtractorRegistry)['id3'].Extensions   # -> @('.mp3')
+#>
+    return $script:SysOrgExtractorRegistry
+}
+
 function Get-SysOrgFileMetadata {
 <#
 .SYNOPSIS

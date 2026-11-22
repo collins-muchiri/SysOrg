@@ -258,6 +258,9 @@ function Import-SysOrgConfig {
         # v3.0 rules: UserRules are validated fail-closed at startup; learned rules are
         # NEVER applied unless ApplyLearned=$true (and they are flagged in the preview).
         Rules = @{ UserRulesPath=''; LexiconPath=''; LearnedRulesPath=''; ApplyLearned=$false }
+        # v3.0 speed: worker count for hashing/metadata. 0 = auto (min(4, cores-1);
+        # an HDD spindle throttles to 1 automatically).
+        Run = @{ Parallelism = 0 }
         FolderAudit = @{ Enabled=$true; MaxTopLevelDepth=2; SkipHiddenSystemDirs=$true; RespectDefenderCFA=$true; IncludeRestrictedInPlans=$false }
         Move     = @{ AllowCrossVolume = $true }
         MaxPlanActions         = 5000
@@ -469,6 +472,146 @@ function Get-SysOrgFileHash {
     } catch { return $null }
 }
 
+function Get-SysOrgParallelism {
+<#
+.SYNOPSIS
+    Resolves the worker count for hashing/metadata (v3.0 Phase 3.4).
+.DESCRIPTION
+    Run.Parallelism config overrides everything. Otherwise min(4, cores-1); a drive
+    profile whose MediaType reports HDD (spindle) throttles to 1 - parallel random
+    reads on one spindle make the seek pattern worse, not better.
+.EXAMPLE
+    Get-SysOrgParallelism -Config $cfg -DriveProfile $prof   # -> 3
+#>
+    [CmdletBinding()]
+    param($Config,$DriveProfile)
+    $cores = 2
+    try { $cores = [Math]::Max(1, [Environment]::ProcessorCount) } catch { $cores = 2 }
+    $auto = [Math]::Max(1, [Math]::Min(4, $cores - 1))
+    $cfg = [int](Get-SysOrgSetting $Config 'Run.Parallelism' 0)
+    if($cfg -gt 0){ return $cfg }
+    try{
+        if($DriveProfile -and $DriveProfile.Drive -and ("$($DriveProfile.Drive.MediaType)" -ieq 'HDD')){ return 1 }
+    } catch { }
+    return $auto
+}
+
+function Get-SysOrgFileHashHeadTail {
+<#
+.SYNOPSIS
+    SHA256 over the head 64 KB + tail 64 KB (the fast duplicate pre-filter, v3.0 Phase 3.5).
+.DESCRIPTION
+    One SHA256 transform over both buffers, so identical files always produce the
+    same value and different-size files at the same size bucket separate on their
+    tails (MP3s with shared headers, appended logs, etc.). Fail soft: $null on
+    unreadable files.
+.EXAMPLE
+    Get-SysOrgFileHashHeadTail -Path 'C:\big.zip' -HeaderKB 64 -TailKB 64
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[int]$HeaderKB=64,[int]$TailKB=64)
+    try{
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try{
+            $stream = [System.IO.File]::Open($Path,'Open','Read','ReadWrite')
+            try{
+                $headLen = [int][Math]::Min(($HeaderKB * 1KB), $stream.Length)
+                $tailLen = [int][Math]::Min(($TailKB * 1KB), [Math]::Max(0, ($stream.Length - $headLen)))
+                if(($headLen -le 0) -and ($tailLen -le 0)){ return 'EMPTY' }
+                if($headLen -gt 0){
+                    $head = New-Object byte[] $headLen
+                    $read = 0
+                    while($read -lt $headLen){
+                        $n = $stream.Read($head, $read, $headLen - $read)
+                        if($n -le 0){ break }
+                        $read += $n
+                    }
+                    $sha.TransformBlock($head, 0, $read, $null, 0) | Out-Null
+                }
+                if($tailLen -gt 0){
+                    $stream.Seek(-$tailLen, 'End') | Out-Null
+                    $tail = New-Object byte[] $tailLen
+                    $read = 0
+                    while($read -lt $tailLen){
+                        $n = $stream.Read($tail, $read, $tailLen - $read)
+                        if($n -le 0){ break }
+                        $read += $n
+                    }
+                    $sha.TransformBlock($tail, 0, $read, $null, 0) | Out-Null
+                }
+                $sha.TransformFinalBlock([byte[]]@(), 0, 0) | Out-Null
+                return ([System.BitConverter]::ToString($sha.Hash)).Replace('-','')
+            } finally { $stream.Dispose() }
+        } finally { $sha.Dispose() }
+    } catch { return $null }
+}
+
+function Invoke-SysOrgParallelHash {
+<#
+.SYNOPSIS
+    Full SHA256 over a list of files with a RunspacePool (v3.0 Phase 3.4).
+.DESCRIPTION
+    PS 5.1-compatible RunspacePool bounded to -Parallelism workers; results are
+    collected INTO THE INPUT ORDER (indexed), so output stays deterministic no
+    matter which worker finishes first. Any pool failure falls back to sequential
+    hashing. Locked/unreadable files yield $null entries (same as Get-SysOrgFileHash).
+.EXAMPLE
+    $hashes = Invoke-SysOrgParallelHash -Paths @('C:\a.zip','C:\b.zip') -Parallelism 3
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Paths,[int]$Parallelism=2)
+    $paths = @($Paths)
+    $results = New-Object 'object[]' $paths.Length
+    if($paths.Count -eq 0){ return $results }
+    $usePool = $Parallelism -gt 1
+    $pool = $null
+    if($usePool){
+        try{
+            $iss = [initialsessionstate]::CreateDefault()
+            $pool = [runspacefactory]::CreateRunspacePool(1, $Parallelism, $iss, $Host)
+            $pool.Open()
+        } catch { $pool = $null; $usePool = $false }
+    }
+    $script = {
+        param([string]$P)
+        try{
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try{
+                $stream = [System.IO.File]::Open($P,'Open','Read','ReadWrite')
+                try{
+                    $h = $sha.ComputeHash($stream)
+                    return ([System.BitConverter]::ToString($h)).Replace('-','')
+                } finally { $stream.Dispose() }
+            } finally { $sha.Dispose() }
+        } catch { return $null }
+    }
+    try{
+        if($usePool -and $pool){
+            $jobs = @()
+            for($i=0; $i -lt $paths.Count; $i++){
+                $ps = [powershell]::Create()
+                $ps.RunspacePool = $pool
+                [void]$ps.AddScript($script).AddArgument($paths[$i])
+                $jobs += [pscustomobject]@{ Index=$i; PS=$ps; Handle=$ps.BeginInvoke() }
+            }
+            foreach($j in $jobs){
+                try{
+                    $out = $j.PS.EndInvoke($j.Handle)
+                    $results[$j.Index] = $(if($out -and $out.Count -gt 0){ $out[0] } else { $null })
+                } catch { $results[$j.Index] = $null }
+            }
+        } else {
+            for($i=0; $i -lt $paths.Count; $i++){
+                $results[$i] = & $script $paths[$i]
+            }
+        }
+    } finally {
+        foreach($j in $jobs){ try { $j.PS.Dispose() } catch { } }
+        if($pool){ try { $pool.Close(); $pool.Dispose() } catch { } }
+    }
+    return $results
+}
+
 # ---------------------------------------------------------------------------
 # W7: natural sort, exactly like Explorer (StrCmpLogicalW), with a portable
 # fallback for non-Windows hosts so tests behave identically everywhere.
@@ -596,6 +739,86 @@ function Test-SysOrgExcludedPath {
     if($appRoot){
         $ap = $appRoot.TrimEnd('\')
         if($p -ieq $ap -or $p.StartsWith($ap + '\',[StringComparison]::OrdinalIgnoreCase)){ return $true }
+    }
+    return $false
+}
+
+function New-SysOrgExclusionMatcher {
+<#
+.SYNOPSIS
+    Builds ONE precompiled matcher for the exclusion rules (v3.0 Phase 3.3).
+.DESCRIPTION
+    Instead of looping every pattern for every path, the matcher splits the rules
+    once per run into: a case-insensitive HashSet of absolute prefixes, a single
+    compiled alternation regex for wildcard patterns, a HashSet of root-less
+    segment names, and the app root. Test-SysOrgExcludedPathFast then answers in a
+    few lookups. Semantics are IDENTICAL to Test-SysOrgExcludedPath (documented
+    behaviour must not change with the speed work).
+.EXAMPLE
+    $m = New-SysOrgExclusionMatcher -Config $cfg
+    Test-SysOrgExcludedPathFast -Path 'D:\$Recycle.Bin\x' -Matcher $m   # -> True
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config)
+    $exact = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $wildcards = New-Object System.Collections.Generic.List[string]
+    $segments = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach($pat in @($Config.ExcludedPaths)){
+        if([string]::IsNullOrWhiteSpace("$pat")){ continue }
+        $p = ("$pat").TrimEnd('\')
+        if($p.Contains('*') -or $p.Contains('?')){
+            # -like semantics: '*' matches ANY run of characters INCLUDING separators,
+            # '?' matches one character; the match is anchored over the whole path and
+            # a trailing (\\|$) covers "anything inside this folder".
+            $escaped = [regex]::Escape($p).Replace('\*','.*').Replace('\?','.')
+            [void]$wildcards.Add($escaped)
+        }
+        elseif(($p -notmatch '^[A-Za-z]:') -and ($p -notmatch '\\')){
+            [void]$segments.Add($p)
+        }
+        else {
+            [void]$exact.Add($p)
+        }
+    }
+    $wildRegex = $null
+    if($wildcards.Count -gt 0){
+        try { $wildRegex = [regex]::new(('^(' + ($wildcards -join '|') + ')(\\|$)'), 'IgnoreCase') } catch { $wildRegex = $null }
+    }
+    $appRoot = Get-SysOrgSetting $Config 'AppRoot' $null
+    return [pscustomobject]@{
+        Exact=$exact; WildRegex=$wildRegex; Segments=$segments
+        AppRoot=$(if($appRoot){ ("$appRoot").TrimEnd('\') } else { $null })
+    }
+}
+
+function Test-SysOrgExcludedPathFast {
+<#
+.SYNOPSIS
+    Fast path-exclusion check against a precompiled matcher (v3.0 Phase 3.3).
+.DESCRIPTION
+    Identical semantics to Test-SysOrgExcludedPath: wildcard rules match the path
+    itself AND anything inside it, root-less names match ANY path segment, the app
+    root is always protected. O(1) hash lookups plus one regex over the whole path.
+.EXAMPLE
+    Test-SysOrgExcludedPathFast -Path 'C:\Windows\notepad.exe' -Matcher $m   # -> True
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Matcher)
+    $p = ("$Path").Replace('/','\').TrimEnd('\')
+    if([string]::IsNullOrWhiteSpace($p)){ return $false }
+    if($Matcher.AppRoot -and ($p -ieq $Matcher.AppRoot -or $p.StartsWith($Matcher.AppRoot + '\',[StringComparison]::OrdinalIgnoreCase))){ return $true }
+    # exact absolute rules match the path itself AND any ancestor (prefix semantics):
+    # a handful of case-insensitive hash lookups, depth-bounded
+    $cur = $p
+    while($cur -and ($cur.Length -gt 3)){
+        if($Matcher.Exact.Contains($cur)){ return $true }
+        $idx = $cur.LastIndexOf('\')
+        if($idx -le 0){ break }
+        $cur = $cur.Substring(0, $idx)
+    }
+    if($Matcher.WildRegex){ if($Matcher.WildRegex.IsMatch($p)){ return $true } }
+    if($Matcher.Segments.Count -gt 0){
+        foreach($seg in ($p.Split('\'))){ if($Matcher.Segments.Contains($seg)){ return $true } }
     }
     return $false
 }

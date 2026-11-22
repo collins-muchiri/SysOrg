@@ -62,7 +62,9 @@ function New-SysOrgPlan {
           $DupGroups,
           $Config,
           $KnownFolders,
-          $ProjectFolders)
+          $ProjectFolders,
+          $FileCache,
+          [hashtable]$NewCacheEntries)
 
     if(-not $Config){ throw 'New-SysOrgPlan requires -Config.' }
     if(-not $DriveProfile){ throw 'No drive profile was provided. A plan cannot be built without one (run -ProfileDrives first).' }
@@ -105,6 +107,19 @@ function New-SysOrgPlan {
             try { $learnedPath = ((Get-SysOrgDestinationRoot -Letter $Letter -Config $Config) + '\_Index\LearnedRules.psd1') } catch { $learnedPath = '' }
         }
         $learnedRules = @(Get-SysOrgLearnedRules -Config $Config -Path $learnedPath)
+    }
+    # v3.0 Phase 3.1: metadata through the persistent file-state cache - a fresh hit
+    # returns the stored EXIF/ID3/MP4/Office/PDF/text result WITHOUT re-reading the file
+    $cachedExtractors = $null
+    if($FileCache){
+        $cachedExtractors = @{
+            exif   = { param($Path) Get-SysOrgCachedMetadata -Path $Path -Family 'exif'   -FileCache $FileCache -NewEntries $NewCacheEntries }
+            id3    = { param($Path) Get-SysOrgCachedMetadata -Path $Path -Family 'id3'    -FileCache $FileCache -NewEntries $NewCacheEntries }
+            mp4    = { param($Path) Get-SysOrgCachedMetadata -Path $Path -Family 'mp4'    -FileCache $FileCache -NewEntries $NewCacheEntries }
+            office = { param($Path) Get-SysOrgCachedMetadata -Path $Path -Family 'office' -FileCache $FileCache -NewEntries $NewCacheEntries }
+            pdf    = { param($Path) Get-SysOrgCachedMetadata -Path $Path -Family 'pdf'    -FileCache $FileCache -NewEntries $NewCacheEntries }
+            text   = { param($Path) Get-SysOrgCachedMetadata -Path $Path -Family 'text'   -FileCache $FileCache -NewEntries $NewCacheEntries }
+        }
     }
 
     $copiesPolicy = "$(Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies')"
@@ -272,7 +287,8 @@ function New-SysOrgPlan {
             if($findable){
                 $dec = Invoke-SysOrgClassifyPipeline -Path $src -Extension "$($f.Extension)" -Category "$category" `
                     -Config $Config -DriveProfile $DriveProfile -UrlBucket "$bucket" `
-                    -IncludeMetadata -UserRules $userRules -LearnedRules $learnedRules -AppRoot "$planAppRoot"
+                    -IncludeMetadata -UserRules $userRules -LearnedRules $learnedRules -AppRoot "$planAppRoot" `
+                    -Extractors $cachedExtractors
                 $decOf[$src] = $dec
                 $inReviewMove = $false
                 if($dec.NeedsDecision){
@@ -502,6 +518,13 @@ function New-SysOrgPlan {
         }
     }
 
+    # v3.0 Phase 3.6: ONE directory listing per destination folder, cached in memory.
+    # Copy-numbering consults these name sets instead of Test-Path per candidate.
+    # NOTE: the sets are built and stored INLINE - an empty HashSet returned through a
+    # function's output stream unwraps to $null (pipeline enumeration), so the pattern
+    # 'build -> store in the hashtable -> read it back' is used instead of a helper.
+    $destDirNames = @{}
+
     # pass 2: exact copies (W6)
     $copiesAudit = @{ Policy=$copiesPolicy; Numbered=0; Quarantined=0; Reported=0; Groups=@() }
     $groupsAudit = New-Object System.Collections.Generic.List[object]
@@ -566,9 +589,14 @@ function New-SysOrgPlan {
                             $n++
                             $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $n -Style $suffixStyle
                             $i = $n
-                            # 9.5: plan-time assignment checks the destination for existing files
-                            while($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or
-                                  (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate))){
+                            if(-not $destDirNames.ContainsKey($folderKey)){
+                                $set2 = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                                try { foreach($n2 in [System.IO.Directory]::GetFiles([string]$keeperFolder)){ [void]$set2.Add([System.IO.Path]::GetFileName($n2)) } } catch { }
+                                $destDirNames[$folderKey] = $set2
+                            }
+                            $nameSet = $destDirNames[$folderKey]
+                            # v3.0 Phase 3.6: the in-memory name set replaces per-candidate Test-Path
+                            while($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or $nameSet.Contains($candidate)){
                                 $i++
                                 if($i -gt 999){ $candidate = ([guid]::NewGuid().ToString('N').Substring(0,8)) + $ext; break }
                                 $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $i -Style $suffixStyle
@@ -581,15 +609,19 @@ function New-SysOrgPlan {
                             $ext = "$($m.Extension)"
                             $candidate = ($stem + $ext)
                             $copyIndex = $null
-                            if($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or
-                               (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate))){
+                            if(-not $destDirNames.ContainsKey($folderKey)){
+                                $set3 = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                                try { foreach($n3 in [System.IO.Directory]::GetFiles([string]$keeperFolder)){ [void]$set3.Add([System.IO.Path]::GetFileName($n3)) } } catch { }
+                                $destDirNames[$folderKey] = $set3
+                            }
+                            $nameSet = $destDirNames[$folderKey]
+                            if($usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant()) -or $nameSet.Contains($candidate)){
                                 $i = $startIndex - 1
                                 while($true){
                                     $i++
                                     if($i -gt 999){ $candidate = ([guid]::NewGuid().ToString('N').Substring(0,8)) + $ext; $copyIndex = $i; break }
                                     $candidate = Get-SysOrgCopyName -Stem $stem -Extension $ext -Index $i -Style $suffixStyle
-                                    if((-not $usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant())) -and
-                                       (-not (Test-Path -LiteralPath ($keeperFolder + '\' + $candidate)))){
+                                    if((-not $usedNames.ContainsKey($folderKey + '|' + $candidate.ToLowerInvariant())) -and (-not $nameSet.Contains($candidate))){
                                         $copyIndex = $i
                                         break
                                     }
@@ -1351,15 +1383,51 @@ function Invoke-SysOrgPlan {
         $allActions = @($plan.Actions)
         $i = 0; $total = $allActions.Count
 
+        # v3.0 Phase 3.7: batched directory creation - every destination parent is
+        # created ONCE up front (tracked set), so per-move Test-Path/New-Item storms go
+        # away. The per-move primitive still verifies before writing (never overwrites).
+        $createdDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach($a in $allActions){
+            $pd = $null
+            try { $pd = Split-Path ([string]$a.Destination) -Parent } catch { $pd = $null }
+            if([string]::IsNullOrWhiteSpace("$pd")){ continue }
+            $pdKey = ("$pd").TrimEnd('\')
+            if($createdDirs.Contains($pdKey)){ continue }
+            $createdDirs.Add($pdKey)
+            if(-not (Test-Path -LiteralPath $pdKey)){
+                try { New-Item -ItemType Directory -Path $pdKey -Force | Out-Null } catch { }
+            }
+        }
+
+        # v3.0 Phase 3.7: buffered file logging + throttled progress. The undo journal
+        # STAYS flushed-per-row (crash safety is untouched); only the human log and the
+        # console are batched, since losing a few log lines in a crash is acceptable.
+        $logBuffer = New-Object System.Collections.Generic.List[string]
+        function Add-SysOrgRunLog {
+            param([string]$Message,[string]$Level='INFO')
+            $logBuffer.Add(('{0} [{1,-6}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message))
+            if($logBuffer.Count -ge 64){ Flush-SysOrgRunLog }
+        }
+        function Flush-SysOrgRunLog {
+            if($logBuffer.Count -eq 0){ return }
+            try {
+                Add-Content -LiteralPath (Join-Path $logFolder ('sysorg-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) `
+                    -Value ($logBuffer.ToArray() -join "`r`n") -Encoding UTF8
+            } catch { }
+            $logBuffer.Clear()
+        }
+
         foreach($a in $allActions){
             $i++
-            Write-Progress -Activity 'Executing plan' `
-                -Status "$i / $total : $(Split-Path $a.Source -Leaf)" `
-                -PercentComplete $(if($total -gt 0){ [int](100 * $i / $total) } else { 0 })
+            if(($i -eq 1) -or ($i -eq $total) -or (($i % 25) -eq 0)){
+                Write-Progress -Activity 'Executing plan' `
+                    -Status "$i / $total : $(Split-Path $a.Source -Leaf)" `
+                    -PercentComplete $(if($total -gt 0){ [int](100 * $i / $total) } else { 0 })
+            }
 
             if($alreadyDone.ContainsKey($a.Source)){
                 $summary.Resumed++
-                Write-SysOrgLog "Resume: skipping already-journaled source: $($a.Source)" -LogFolder $logFolder
+                Add-SysOrgRunLog "Resume: skipping already-journaled source: $($a.Source)"
                 continue
             }
 
@@ -1404,7 +1472,7 @@ function Invoke-SysOrgPlan {
                 $fiNow = Get-Item -LiteralPath $canonSrc.Path -Force
                 if($a.PSObject.Properties['PlannedLength'] -and ($null -ne $a.PlannedLength) -and ([int64]$fiNow.Length -ne [int64]$a.PlannedLength)){
                     $summary.Skipped++
-                    Write-SysOrgLog "Skipped (changed since plan - size differs): $($a.Source)" -Level WARN -LogFolder $logFolder
+                    Add-SysOrgRunLog "Skipped (changed since plan - size differs): $($a.Source)" -Level WARN
                     continue
                 }
                 if($a.PSObject.Properties['PlannedLastWriteTimeUtc'] -and "$($a.PlannedLastWriteTimeUtc)"){
@@ -1418,7 +1486,7 @@ function Invoke-SysOrgPlan {
                         $deltaSec = [Math]::Abs(($fiNow.LastWriteTimeUtc - $plannedUtc).TotalSeconds)
                         if($deltaSec -gt 2){
                             $summary.Skipped++
-                            Write-SysOrgLog "Skipped (changed since plan - last write time differs): $($a.Source)" -Level WARN -LogFolder $logFolder
+                            Add-SysOrgRunLog "Skipped (changed since plan - last write time differs): $($a.Source)" -Level WARN
                             continue
                         }
                     } catch { Write-Verbose "Drift check parse failed for '$($a.PlannedLastWriteTimeUtc)': $($_.Exception.Message)" }
@@ -1426,7 +1494,7 @@ function Invoke-SysOrgPlan {
             }
             if($refuse){
                 $summary.Failed++
-                Write-SysOrgLog ("REFUSED ({0}): {1} -> {2}" -f $refuse, $a.Source, $a.Destination) -Level ERROR -LogFolder $logFolder
+                Add-SysOrgRunLog ("REFUSED ({0}): {1} -> {2}" -f $refuse, $a.Source, $a.Destination) -Level ERROR
                 continue
             }
             # validation passed: use the CANONICAL paths for the move, the logs and the journal
@@ -1463,16 +1531,16 @@ function Invoke-SysOrgPlan {
                 'Moved' {
                     if("$($a.Action)" -eq 'Quarantine'){
                         $summary.Quarantined++
-                        Write-SysOrgLog "Quarantined duplicate: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
+                        Add-SysOrgRunLog "Quarantined duplicate: $($a.Source) -> $($result.Destination)" -Level ACTION
                     } else {
                         if($kind -eq 'Folder'){
                             $summary.FolderMoves++
-                            Write-SysOrgLog "Moved folder: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
+                            Add-SysOrgRunLog "Moved folder: $($a.Source) -> $($result.Destination)" -Level ACTION
                         } else {
                             $summary.Moved++
                             if($a.PSObject.Properties['CopyIndex'] -and $a.CopyIndex){ $summary.Numbered++ }
                             $summary.BytesMoved += [int64]$a.SizeBytes
-                            Write-SysOrgLog "Moved: $($a.Source) -> $($result.Destination)" -Level ACTION -LogFolder $logFolder
+                            Add-SysOrgRunLog "Moved: $($a.Source) -> $($result.Destination)" -Level ACTION
                         }
                     }
                     # P0-fix note: the row is built by the journal helper, then flushed to
@@ -1485,7 +1553,7 @@ function Invoke-SysOrgPlan {
                     if($kind -eq 'Folder'){ $summary.FolderMoves++ } else { $summary.Copied++ }
                     Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
                         -CurrentLocation "$($result.Destination)" -Hash "$hashBefore" -Status 'Done'
-                    Write-SysOrgLog "Copied+verified: $($a.Source) -> $($result.Destination) ($($result.Message))" -Level WARN -LogFolder $logFolder
+                    Add-SysOrgRunLog "Copied+verified: $($a.Source) -> $($result.Destination) ($($result.Message))" -Level WARN
                 }
                 'CollisionDuplicate' {
                     $summary.CollisionDuplicate++
@@ -1502,15 +1570,15 @@ function Invoke-SysOrgPlan {
                         # Source -> quarantine location.
                         Add-SysOrgJournalRow -Kind $kind -Action "$($a.Action)" -OriginalSource $aSource `
                             -CurrentLocation "$($r2.Destination)" -Hash "$hashBefore" -Status 'Done'
-                        Write-SysOrgLog "Collision duplicate quarantined: $($a.Source) -> $($r2.Destination)" -Level ACTION -LogFolder $logFolder
+                        Add-SysOrgRunLog "Collision duplicate quarantined: $($a.Source) -> $($r2.Destination)" -Level ACTION
                     } else {
                         $summary.Failed++
-                        Write-SysOrgLog "FAILED (collision quarantine): $($a.Source): $($r2.Message)" -Level ERROR -LogFolder $logFolder
+                        Add-SysOrgRunLog "FAILED (collision quarantine): $($a.Source): $($r2.Message)" -Level ERROR
                     }
                 }
                 default {
                     $summary.Failed++
-                    Write-SysOrgLog "FAILED: $($a.Source): $($result.Message)" -Level ERROR -LogFolder $logFolder
+                    Add-SysOrgRunLog "FAILED: $($a.Source): $($result.Message)" -Level ERROR
                     # v2.1.1: nothing moved - neutralize the Pending row so it is not
                     # treated as an orphan on the next resume.
                     if($journalHasStatus){
@@ -1522,8 +1590,10 @@ function Invoke-SysOrgPlan {
         }
     } finally {
         $writer.Dispose()
+        try { Flush-SysOrgRunLog } catch { }
     }
 
+    Flush-SysOrgRunLog
     Write-Progress -Activity 'Executing plan' -Completed
     Write-SysOrgLog ("Plan {0} finished. Moved={1} Copied={2} Folders={3} Numbered={4} Quarantined={5} Resumed={6} Failed={7} Skipped={8}" -f `
         $plan.PlanId, $summary.Moved, $summary.Copied, $summary.FolderMoves, $summary.Numbered, $summary.Quarantined, $summary.Resumed, $summary.Failed, $summary.Skipped) -LogFolder $logFolder

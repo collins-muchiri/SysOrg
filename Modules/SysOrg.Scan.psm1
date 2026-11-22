@@ -283,6 +283,9 @@ function Get-SysOrgInventory {
     $stack = New-Object System.Collections.Stack
     foreach($startDir in $initial){ [void]$stack.Push([string]$startDir) }
     $count = 0
+    # v3.0 Phase 3.3: ONE precompiled exclusion matcher for the whole scan
+    $exMatcher = $null
+    try { $exMatcher = New-SysOrgExclusionMatcher -Config $Config } catch { $exMatcher = $null }
 
     while($stack.Count -gt 0){
         $dir = [string]$stack.Pop()
@@ -292,7 +295,11 @@ function Get-SysOrgInventory {
             Write-Verbose "Marker .sysorg-ignore found; skipping tree: $dir"
             continue
         }
-        if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
+        if($exMatcher){
+            if(Test-SysOrgExcludedPathFast -Path $dir -Matcher $exMatcher){ continue }
+        } else {
+            if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
+        }
         if((Get-SysOrgSetting $Config 'ExcludeDestinations' $true) -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
 
         # v1.1 folder safety gates: protected (cannot alter) vs restricted (read-only) vs organizable
@@ -865,16 +872,23 @@ function Get-SysOrgSourceBucket {
 function Find-SysOrgDuplicates {
 <#
 .SYNOPSIS
-    Exact duplicate detection: group by size -> 64 KB header hash -> full SHA256.
+    Exact duplicate detection: size -> 64 KB header hash -> head+tail hash -> full SHA256.
 .DESCRIPTION
     Rev 2.1 keeper rule (W6): the keeper is the OLDEST LastWriteTime, then natural name
     order - the original is the one the user created first. WastedBytes reports the
     reclaimable size per group. Only hashes candidate files; cloud placeholders never
     reach this stage.
+    v3.0 speed work (Phase 3.1/3.4/3.5): every hash is looked up in the persistent
+    file-state cache FIRST (key = path|size|mtime, so unchanged files are never
+    re-read); the pre-filter adds a head+tail hash before the full SHA256; and the
+    full-hash stage runs through a RunspacePool (results stay in input order -
+    deterministic). -FileCache/-NewEntries/-CachePath are optional: without them the
+    behaviour is identical to v2.1.1.
 .EXAMPLE
-    $dups = Find-SysOrgDuplicates -Inventory $inv -Config $cfg
+    $dups = Find-SysOrgDuplicates -Inventory $inv -Config $cfg -FileCache $c -NewEntries $n -Parallelism 3
 #>
-    param($Inventory,$Config)
+    [CmdletBinding()]
+    param($Inventory,$Config,$FileCache,[hashtable]$NewEntries,[int]$Parallelism=1,[long]$BytesHashed=[long]0)
     $groups = New-Object System.Collections.Generic.List[object]
     $minKB    = Get-SysOrgSetting $Config 'Copies.MinFileSizeKB' 256
     $headerKB = Get-SysOrgSetting $Config 'Copies.HeaderHashKB' 64
@@ -882,6 +896,8 @@ function Find-SysOrgDuplicates {
 
     $sizeCandidates = @($Inventory | Where-Object { $_.Category -ne 'SkippedLongPath' -and $_.Length -ge $minBytes } | Group-Object -Property Length | Where-Object { $_.Count -gt 1 })
     $total = $sizeCandidates.Count; $done = 0
+    $fullCandidates = New-Object System.Collections.Generic.List[object]      # records needing a full hash
+    $headTailMap = @{}                                                        # path -> head+tail hash
 
     foreach($sizeGroup in $sizeCandidates){
         $done++
@@ -890,46 +906,123 @@ function Find-SysOrgDuplicates {
             -PercentComplete $(if($total -gt 0){ [int](100 * $done / $total) } else { 0 })
         $headerMap = @{}
         foreach($f in $sizeGroup.Group){
-            $h = Get-SysOrgFileHash -Path $f.FullName -HeaderOnly -HeaderKB $headerKB
-            if($h){
-                if(-not $headerMap.ContainsKey($h)){ $headerMap[$h] = New-Object System.Collections.Generic.List[object] }
-                [void]$headerMap[$h].Add($f)
+            $hh = $null
+            # v3.0: header hash through the cache first
+            if($FileCache){
+                try{
+                    $fi = Get-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                    $k = Get-SysOrgFileCacheKey -Path $f.FullName -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+                    if($FileCache.ContainsKey($k)){
+                        $e = $FileCache[$k]
+                        if($e.PSObject.Properties['HeaderHash'] -and "$($e.HeaderHash)"){ $hh = "$($e.HeaderHash)" }
+                    }
+                } catch { $hh = $null }
+            }
+            if(-not $hh){
+                $hh = Get-SysOrgFileHash -Path $f.FullName -HeaderOnly -HeaderKB $headerKB
+                if(($hh) -and $FileCache){
+                    try{
+                        $fi = Get-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                        $k = Get-SysOrgFileCacheKey -Path $f.FullName -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+                        $e = $FileCache[$k]
+                        if($e){ $e.HeaderHash = $hh } else { $FileCache[$k] = [pscustomobject]@{ Hash=''; HeaderHash=$hh; HeadTailHash=''; Meta=$null } }
+                    } catch { }
+                }
+            }
+            if($hh){
+                if(-not $headerMap.ContainsKey($hh)){ $headerMap[$hh] = New-Object System.Collections.Generic.List[object] }
+                [void]$headerMap[$hh].Add($f)
             }
         }
         foreach($h in $headerMap.Keys){
             $candidates = $headerMap[$h]
             if($candidates.Count -lt 2){ continue }
-            $fullMap = @{}
+            # v3.0 Phase 3.5: head+tail hash separates files with identical headers
             foreach($f in $candidates){
-                $fh = Get-SysOrgFileHash -Path $f.FullName
-                if($fh){
-                    if(-not $fullMap.ContainsKey($fh)){ $fullMap[$fh] = New-Object System.Collections.Generic.List[object] }
-                    [void]$fullMap[$fh].Add($f)
+                $ht = $null
+                if($FileCache){
+                    try{
+                        $fi = Get-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                        $k = Get-SysOrgFileCacheKey -Path $f.FullName -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+                        if($FileCache.ContainsKey($k)){
+                            $e = $FileCache[$k]
+                            if($e.PSObject.Properties['HeadTailHash'] -and "$($e.HeadTailHash)"){ $ht = "$($e.HeadTailHash)" }
+                        }
+                    } catch { $ht = $null }
                 }
+                if(-not $ht){
+                    $ht = Get-SysOrgFileHashHeadTail -Path $f.FullName -HeaderKB $headerKB -TailKB $headerKB
+                    if(($ht) -and $FileCache){
+                        try{
+                            $fi = Get-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                            $k = Get-SysOrgFileCacheKey -Path $f.FullName -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+                            $e = $FileCache[$k]
+                            if($e){ $e.HeadTailHash = $ht } else { $FileCache[$k] = [pscustomobject]@{ Hash=''; HeaderHash=$h; HeadTailHash=$ht; Meta=$null } }
+                        } catch { }
+                    }
+                }
+                $headTailMap[$f.FullName] = $ht
             }
-            foreach($fh in $fullMap.Keys){
-                $dupes = $fullMap[$fh]
-                if($dupes.Count -lt 2){ continue }
-                # W6: keeper = oldest LastWriteTime, then natural name order (W7 key)
-                $withKeys = @()
-                foreach($d in $dupes){
-                    $withKeys += [pscustomobject]@{ Rec=$d; Key=(Get-SysOrgNaturalKey -Name "$($d.FullName)") }
-                }
-                $sorted = @($withKeys | Sort-Object -Property @{e={$_.Rec.LastWriteTime.Ticks}}, @{e={$_.Key}})
-                $keep   = $sorted[0].Rec
-                $others = @($sorted | Select-Object -Skip 1 | ForEach-Object { $_.Rec })
-                $wasted = [int64]0
-                if($others.Count -gt 0){ $wasted = [int64]($others | Measure-Object -Property Length -Sum).Sum }
-                $groups.Add([pscustomobject]@{
-                    Hash=$fh; KeepPath=$keep.FullName; KeepName=$keep.Name
-                    KeepReason='Oldest LastWriteTime, then natural name order (the original the user created first)'
-                    Duplicates=@($others | ForEach-Object { "$($_.FullName)" })
-                    WastedBytes=$wasted
-                })
+            $htGroups = @($candidates | Group-Object -Property { $headTailMap[$_.FullName] } | Where-Object { $_.Count -gt 1 })
+            foreach($htg in $htGroups){
+                foreach($f in @($htg.Group)){ [void]$fullCandidates.Add($f) }
             }
         }
     }
     Write-Progress -Activity 'Duplicate detection' -Completed
+
+    # v3.0 Phase 3.4: ONE parallel full-hash pass over the survivors (deduped),
+    # results in input order, then group by size + head/tail + full hash.
+    $uniqueFull = @(@($fullCandidates.ToArray()) | Sort-Object -Property FullName -Unique)
+    $fullMap = @{}
+    if($uniqueFull.Count -gt 0){
+        $paths = @($uniqueFull | ForEach-Object { "$($_.FullName)" })
+        $hashes = Invoke-SysOrgParallelHash -Paths $paths -Parallelism $Parallelism
+        for($i=0; $i -lt $paths.Count; $i++){
+            if($hashes[$i]){
+                # store into the cache (the full hash is the expensive one)
+                if($FileCache){
+                    try{
+                        $fi = Get-Item -LiteralPath $paths[$i] -Force -ErrorAction Stop
+                        $k = Get-SysOrgFileCacheKey -Path $paths[$i] -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+                        $e = $FileCache[$k]
+                        if($e){ $e.Hash = $hashes[$i] } else { $FileCache[$k] = [pscustomobject]@{ Hash=$hashes[$i]; HeaderHash=''; HeadTailHash=''; Meta=$null } }
+                    } catch { }
+                }
+                $fullMap[$paths[$i]] = $hashes[$i]
+            }
+        }
+    }
+
+    # group survivors: same size + same head/tail + same full hash
+    $byKey = @{}
+    foreach($f in $fullCandidates.ToArray()){
+        $fh = $fullMap["$($f.FullName)"]
+        if(-not $fh){ continue }
+        $key = ('{0}|{1}|{2}' -f $f.Length, $headTailMap[$f.FullName], $fh)
+        if(-not $byKey.ContainsKey($key)){ $byKey[$key] = New-Object System.Collections.Generic.List[object] }
+        [void]$byKey[$key].Add($f)
+    }
+    foreach($key in ($byKey.Keys | Sort-Object)){
+        $dupes = $byKey[$key].ToArray()
+        if($dupes.Count -lt 2){ continue }
+        # W6: keeper = oldest LastWriteTime, then natural name order (W7 key)
+        $withKeys = New-Object System.Collections.Generic.List[object]
+        foreach($d in $dupes){
+            [void]$withKeys.Add([pscustomobject]@{ Rec=$d; Key=(Get-SysOrgNaturalKey -Name "$($d.FullName)") })
+        }
+        $sorted = @($withKeys | Sort-Object -Property @{e={$_.Rec.LastWriteTime.Ticks}}, @{e={$_.Key}})
+        $keep   = $sorted[0].Rec
+        $others = @($sorted | Select-Object -Skip 1 | ForEach-Object { $_.Rec })
+        $wasted = [int64]0
+        if($others.Count -gt 0){ $wasted = [int64]($others | Measure-Object -Property Length -Sum).Sum }
+        $groups.Add([pscustomobject]@{
+            Hash=$key.Substring($key.LastIndexOf('|') + 1); KeepPath=$keep.FullName; KeepName=$keep.Name
+            KeepReason='Oldest LastWriteTime, then natural name order (the original the user created first)'
+            Duplicates=@($others | ForEach-Object { "$($_.FullName)" })
+            WastedBytes=$wasted
+        })
+    }
     # Stream groups (see Get-SysOrgInventory for why 'return ,$array' is wrong):
     # callers collect with @(); an empty result emits nothing.
     return $groups.ToArray()
