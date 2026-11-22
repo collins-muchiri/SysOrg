@@ -4,6 +4,13 @@ Preview-first, zero-dependency file organizer for Windows 10/11, built entirely 
 Windows PowerShell 5.1+. Nothing is installed and nothing runs in the background.
 Licensed under the MIT license (see `LICENSE`).
 
+**Version 3.0.0** is the current release: a chooseable layout profile (`Windows` |
+`Compact4` | `Findable`), a scored classification pipeline for ALL file types
+(Decisions with confidence, signals and explainability), a persistent file-state
+cache with parallel hashing for large drives, and a searchable offline catalog —
+see the `v3.0 in one page` section below and the measured numbers (including the
+honest misses) in `BENCHMARKS.md`.
+
 **Revision 2.1** organizes the way Windows itself sorts: type-first into known-folder
 names, name families within each type, numbered copies instead of quarantine, and an
 explicit mutability engine that makes the C-drive guarantee provable. See
@@ -138,7 +145,7 @@ additionally requires typing `yes`.
 
 ## Quick start
 
-1. Download `SysOrg-2.1.1.zip` from the [Releases page](../../releases/latest) and verify the
+1. Download `SysOrg-3.0.0.zip` from the [Releases page](../../releases/latest) and verify the
    published `SHA256SUMS` entry before extracting.
 2. Right-click the ZIP → Properties → **Unblock** → extract.
 3. In the extracted folder run in PowerShell:
@@ -200,6 +207,13 @@ scope with the same artifact and extension protections.
 .\SysOrg.ps1 -UndoPlan plan-YYYYMMDD-HHMMSS-mmm
 .\SysOrg.ps1 -Migrate C               # previewable plan mapping old trees to the Windows naming
 .\SysOrg.ps1 -ScheduledReport         # report-only; used by Task Scheduler
+
+# v3.0
+.\SysOrg.ps1 -Find '*invoice*'        # search _Index\catalog.ndjson (instant, offline)
+.\SysOrg.ps1 -Explain 'D:\stuff\x.pdf'  # print the full Decision for one file; moves nothing
+.\SysOrg.ps1 -Score                   # score the organized tree against Score.Targets
+.\SysOrg.ps1 -MigrateProfile Findable # migrate a v2.1 tree to the Findable layout (preview first)
+.\SysOrg.ps1 -Benchmark -BenchmarkFiles 20000 -BenchmarkSeed 42  # reproduce BENCHMARKS.md
 ```
 
 ## Destination layout (Windows preset)
