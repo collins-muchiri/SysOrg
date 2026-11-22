@@ -836,6 +836,53 @@ function Test-SysOrgExcludedFile {
     return $false
 }
 
+function ConvertTo-SysOrgPath {
+<#
+.SYNOPSIS
+    Normalizes one path to a full backslash form and REJECTS drive-relative forms (v3.0.1 A1).
+.DESCRIPTION
+    'C:file' and 'C:' resolve against the CURRENT DIRECTORY of drive C in .NET and
+    Win32 - two runs can silently touch two different folders. The helper accepts
+    full drive paths ('C:\', 'C:\a\b'), UNC paths ('\\server\share\...') and the
+    \\?\ namespace, converts '/' separators, and THROWS on drive-relative input
+    (^[A-Za-z]:(?![\\])), empty input and '.'/'..' segments.
+.EXAMPLE
+    ConvertTo-SysOrgPath -Path 'C:\a\b'   # -> 'C:\a\b'
+.EXAMPLE
+    ConvertTo-SysOrgPath -Path 'C:file'   # throws (drive-relative)
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $p = ("$Path").Replace('/','\').Trim()
+    if([string]::IsNullOrWhiteSpace($p)){ throw 'Path is empty.' }
+    if($p -match '^[A-Za-z]:(?![\\])'){
+        throw ("Drive-relative path '{0}' is ambiguous: it resolves against the drive's CURRENT directory. Use the full form 'X:\...'." -f $p)
+    }
+    if($p -match '(^|\\)\.{1,2}(\\|$)'){
+        throw ("Path '{0}' contains a '.' or '..' segment." -f $p)
+    }
+    return $p
+}
+
+function Get-SysOrgDriveRootPath {
+<#
+.SYNOPSIS
+    The enumeration/probe path for a drive root: 'X:\' - NEVER the drive-relative 'X:' (v3.0.1 A1).
+.DESCRIPTION
+    'X:' (slash stripped) is a drive-relative path: .NET and Win32 resolve it against
+    the drive's CURRENT directory, so a scan or audit started from a subfolder would
+    enumerate that subfolder instead of the drive root. Every enumeration and every
+    probe must use the full 'X:\' form; the slash is stripped only for DISPLAY.
+.EXAMPLE
+    Get-SysOrgDriveRootPath -Letter x   # -> 'X:\'
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter)
+    $l = ("$Letter").Trim().TrimEnd(':').TrimEnd('\').ToUpper()
+    if($l -notmatch '^[A-Z]$'){ throw ("'{0}' is not a drive letter." -f $Letter) }
+    return ('{0}:\' -f $l)
+}
+
 function Get-SysOrgDestinationRoot {
 <#
 .SYNOPSIS

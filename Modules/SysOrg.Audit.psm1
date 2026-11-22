@@ -185,33 +185,40 @@ function Get-SysOrgFolderAudit {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Letter,$Config,[int]$MaxDepth=2)
 
-    $root = ('{0}:\' -f $Letter)
+    # v3.0.1 A1: the root MUST stay 'X:\' for enumeration and probes. The old code
+    # pushed $root.TrimEnd('\') - i.e. the DRIVE-RELATIVE form 'X:' - which .NET
+    # resolves against the drive's CURRENT directory: an audit started from a
+    # subfolder enumerated the app folder and reported error 2 for every child
+    # ('C:.github', 'C:Cache', ...). The slash is stripped only for display.
+    $root = Get-SysOrgDriveRootPath -Letter $Letter
     if(-not (Test-Path -LiteralPath $root)){ throw "Drive $root not found." }
     $cfa = Get-SysOrgDefenderProtectedFolders -Config $Config
     Initialize-SysOrgDirProbe
 
     $folders = New-Object System.Collections.Generic.List[object]
     $stack = New-Object System.Collections.Stack
-    [void]$stack.Push(@{ Path=$root.TrimEnd('\'); Depth=0 })
+    [void]$stack.Push(@{ Path=$root; Depth=0 })   # keep 'X:\' - never 'X:'
 
     while($stack.Count -gt 0){
         $item = $stack.Pop()
-        $dir = [string]$item.Path; $depth = [int]$item.Depth
+        try { $dir = ConvertTo-SysOrgPath -Path ([string]$item.Path) } catch { Write-Verbose "Audit skipped unsafe path '$($item.Path)': $($_.Exception.Message)"; continue }
+        $depth = [int]$item.Depth
+        $display = $dir.TrimEnd('\')   # display form only; $dir keeps 'X:\' for probes/enumeration
 
         $reason = Get-SysOrgFolderProtectionReason -Path $dir -Config $Config -CfaFolders $cfa
         if($reason){
-            $folders.Add([pscustomobject]@{ Path=$dir; Depth=$depth; Status='Protected'; Reason=$reason })
+            $folders.Add([pscustomobject]@{ Path=$display; Depth=$depth; Status='Protected'; Reason=$reason })
             continue
         }
         $acc = Test-SysOrgDirAccess -Path $dir
         if(-not $acc.Readable){
-            $folders.Add([pscustomobject]@{ Path=$dir; Depth=$depth; Status='Protected'; Reason=('Access denied reading folder (error {0})' -f $acc.ReadError) })
+            $folders.Add([pscustomobject]@{ Path=$display; Depth=$depth; Status='Protected'; Reason=('Access denied reading folder (error {0})' -f $acc.ReadError) })
             continue
         }
         if($acc.Writable){
-            $folders.Add([pscustomobject]@{ Path=$dir; Depth=$depth; Status='Organizable'; Reason='Readable and writable' })
+            $folders.Add([pscustomobject]@{ Path=$display; Depth=$depth; Status='Organizable'; Reason='Readable and writable' })
         } else {
-            $folders.Add([pscustomobject]@{ Path=$dir; Depth=$depth; Status='Restricted'; Reason=('Readable, not writable (error {0}) - left in place' -f $acc.WriteError) })
+            $folders.Add([pscustomobject]@{ Path=$display; Depth=$depth; Status='Restricted'; Reason=('Readable, not writable (error {0}) - left in place' -f $acc.WriteError) })
         }
         if($depth -lt $MaxDepth){
             try { $kids = [System.IO.Directory]::GetDirectories($dir) } catch { Write-Verbose "Could not list children of $dir - $($_.Exception.Message)"; $kids = @() }
