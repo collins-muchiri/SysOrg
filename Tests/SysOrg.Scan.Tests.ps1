@@ -300,3 +300,49 @@ Describe 'Get-SysOrgSourceBucket hardening (v2.1.1)' {
         Get-SysOrgSourceBucket -HostUrl 'https://cdn.example.org/file.zip' | Should -Be 'Example'
     }
 }
+
+Describe 'Extension map hardening (v2.1.1)' {
+    It 'no extension appears in more than one category' {
+        $map = & (Get-Module SysOrg.Scan) { $script:CategoryMap }
+        $seen = @{}
+        $dups = @()
+        foreach($cat in $map.Keys){
+            foreach($e in $map[$cat]){
+                if($seen.ContainsKey($e)){ $dups += ("{0} in {1} and {2}" -f $e, $seen[$e], $cat) }
+                else { $seen[$e] = $cat }
+            }
+        }
+        $dups | Should -BeNullOrEmpty
+    }
+    It "'.ts' routes the same way (Code) in 20 repeated calls" {
+        $results = @(1..20 | ForEach-Object { Get-SysOrgCategory -Extension '.ts' -Config @{} })
+        @($results | Select-Object -Unique).Count | Should -Be 1
+        $results[0] | Should -Be 'Code'
+    }
+    It 'a real MPEG transport stream routes to Videos via content sniffing' {
+        $root = Join-Path $TestDrive ('tsniff-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $bytes = New-Object byte[] 372   # two 188-byte packets + slack
+        $bytes[0] = 0x47; $bytes[188] = 0x47
+        [System.IO.File]::WriteAllBytes((Join-Path $root 'stream.ts'), $bytes)
+        Set-Content -LiteralPath (Join-Path $root 'script.ts') -Value 'const x = 1'   # TypeScript -> Code
+        $inv = @(Get-SysOrgInventory -Letter $letter -Config $scanCfg -Roots $root)
+        $map = @{}
+        foreach($r in $inv){ $map[$r.Name] = $r.Category }
+        $map['stream.ts'] | Should -Be 'Videos'
+        $map['script.ts'] | Should -Be 'Code'
+    }
+    It 'Test-SysOrgMpegTransportStream rejects short, empty and wrong-content files' {
+        $root = Join-Path $TestDrive ('tsneg-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $short = Join-Path $root 'short.ts'
+        [System.IO.File]::WriteAllBytes($short, ([byte[]]@(0x47,1,2)))
+        Test-SysOrgMpegTransportStream -Path $short | Should -BeFalse
+        $wrong = Join-Path $root 'wrong.ts'
+        $bytes = New-Object byte[] 372
+        $bytes[0] = 0x41; $bytes[188] = 0x47
+        [System.IO.File]::WriteAllBytes($wrong, $bytes)
+        Test-SysOrgMpegTransportStream -Path $wrong | Should -BeFalse
+        Test-SysOrgMpegTransportStream -Path (Join-Path $root 'missing.ts') | Should -BeFalse
+    }
+}

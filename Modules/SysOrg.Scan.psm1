@@ -13,7 +13,7 @@ $script:CategoryMap = @{
     Spreadsheets  = @('.xls','.xlsx','.csv','.ods','.tsv')
     Presentations = @('.ppt','.pptx','.odp','.key')
     Images        = @('.jpg','.jpeg','.png','.gif','.bmp','.tif','.tiff','.webp','.svg','.heic','.raw','.cr2','.nef','.arw','.dng','.psd','.ai','.xcf','.ico')
-    Videos        = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp','.ts')
+    Videos        = @('.mp4','.mkv','.avi','.mov','.wmv','.flv','.webm','.m4v','.mpg','.mpeg','.3gp')
     Audio         = @('.mp3','.wav','.flac','.aac','.ogg','.m4a','.wma','.mid','.opus')
     Archives      = @('.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.iso','.cab')
     Code          = @('.py','.js','.ts','.html','.css','.java','.c','.cpp','.cs','.go','.rs','.php','.rb','.sh','.ps1','.psm1','.bat','.cmd','.sql','.json','.xml','.yml','.yaml','.ini','.toml')
@@ -21,8 +21,13 @@ $script:CategoryMap = @{
     Fonts         = @('.ttf','.otf','.woff','.woff2','.fon')
     Databases     = @('.db','.sqlite','.mdb','.accdb','.bak')
 }
+# NOTE (v2.1.1): '.ts' is intentionally mapped ONLY as Code (TypeScript). MPEG transport
+# streams are detected at scan time by content sniffing (Test-SysOrgMpegTransportStream)
+# and routed to Videos there - no extension may appear in two categories, and the map is
+# built deterministically (Keys | Sort-Object) because hashtable enumeration order is
+# not defined in Windows PowerShell 5.1.
 $script:ExtToCategory = @{}
-foreach($cat in $script:CategoryMap.Keys){
+foreach($cat in ($script:CategoryMap.Keys | Sort-Object)){
     foreach($e in $script:CategoryMap[$cat]){ $script:ExtToCategory[$e] = $cat }
 }
 $script:CategoryToRoute = @{
@@ -97,6 +102,37 @@ function Get-SysOrgCategory {
 
 # NOTE: Test-SysOrgCloudPlaceholderAttributes moved to SysOrg.Core.psm1 in v2.1.1 so the
 # plan executor can re-check placeholders without importing the Scan module.
+
+function Test-SysOrgMpegTransportStream {
+<#
+.SYNOPSIS
+    Content sniff for MPEG transport streams (v2.1.1): 0x47 sync bytes at offsets 0 and 188.
+.DESCRIPTION
+    Used to route real .ts transport streams to Videos even though the '.ts' extension maps
+    to Code (TypeScript) - the extension itself must stay single-valued. Reads only the
+    first 189 bytes, is read-only, and returns $false for anything unreadable, empty or
+    shorter than one packet. Callers must have already skipped cloud placeholders (opening
+    one would hydrate it).
+.EXAMPLE
+    Test-SysOrgMpegTransportStream -Path 'C:\dl\video.ts'   # -> True
+#>
+    param([Parameter(Mandatory)][string]$Path)
+    try{
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try{
+            if($fs.Length -lt 189){ return $false }
+            $buf = New-Object byte[] 189
+            $read = 0
+            while($read -lt 189){
+                $n = $fs.Read($buf, $read, 189 - $read)
+                if($n -le 0){ break }
+                $read += $n
+            }
+            if($read -lt 189){ return $false }
+            return (($buf[0] -eq 0x47) -and ($buf[188] -eq 0x47))
+        } finally { $fs.Dispose() }
+    } catch { return $false }
+}
 
 function Get-SysOrgScanRoots {
 <#
@@ -312,6 +348,13 @@ function Get-SysOrgInventory {
                     continue
                 }
                 $ext = $fi.Extension.ToLowerInvariant()
+                $category = Get-SysOrgCategory -Extension $ext -Config $Config
+                # v2.1.1: '.ts' maps to Code (TypeScript), but a real MPEG transport stream
+                # (sync bytes 0x47 at 0 and 188) routes to Videos. Sniffed only here, after
+                # the placeholder/reparse gates, so cloud files are never opened.
+                if(($ext -eq '.ts') -and (Test-SysOrgMpegTransportStream -Path $fi.FullName)){
+                    $category = 'Videos'
+                }
                 $records.Add([pscustomobject]@{
                     FullName      = $fi.FullName
                     Name          = $fi.Name
@@ -320,7 +363,7 @@ function Get-SysOrgInventory {
                     Length        = [int64]$fi.Length
                     LastWriteTime = $fi.LastWriteTime
                     Directory     = $fi.DirectoryName
-                    Category      = Get-SysOrgCategory -Extension $ext -Config $Config
+                    Category      = $category
                 })
                 $count++
                 if($count % 200 -eq 0){ Write-Progress -Activity "Scanning $root" -Status "$count files (in: $dir)" }
