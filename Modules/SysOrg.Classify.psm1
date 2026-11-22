@@ -214,7 +214,7 @@ function Invoke-SysOrgClassifyPipeline {
             $d.DateSource = $resolved.Source
             [void]$d.Signals.Add(('Date: ' + $resolved.Source + ' -> ' + $resolved.Date.ToString('yyyy-MM-dd')))
         } catch { [void]$d.Signals.Add(('Date: failed soft (' + $_.Exception.Message + ')')) }
-        if($cat -in @('Documents','Other','Spreadsheets','Databases')){
+        if($cat -in @('Documents','Other','Spreadsheets','Databases') -and (Get-Command Get-SysOrgDocumentCategory -ErrorAction SilentlyContinue)){
             try {
                 $lex = Get-SysOrgDocumentCategory -Path $Path -Name $name -Metadata $meta -Config $Config
                 if($lex -and ($lex.Confidence -gt 0)){

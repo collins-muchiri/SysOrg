@@ -114,7 +114,7 @@ function New-ExifJpegBytes {
     $dt = Get-TiffAsciiValue $DateTimeOriginal      # 19 chars + NUL = 20
     $ifd0Off = 8
     $exifIfdOff = $ifd0Off + 42                     # IFD0: count(2)+3 entries(36)+next(4)
-    $makeOff  = $exifIfdOff + 22                    # Exif IFD: count(2)+1 entry(12)+next(4)
+    $makeOff  = $exifIfdOff + 18                    # Exif IFD: count(2)+1 entry(12)+next(4)
     $modelOff = $makeOff + $mk.Count
     $dtOff    = $modelOff + $md.Count
     $ms = New-Object System.IO.MemoryStream
@@ -209,7 +209,9 @@ function New-Mp4MvhdBytes {
         foreach($b in $Payload){ [void]$Out.Add($b) }
     }
     $moov = New-Object System.Collections.Generic.List[byte]
-    foreach($b in [byte[]]@(0x00,0x00,0x00,0x00)){ [void]$moov.Add($b) }
+    # the mvhd BOX header: size = 8 + body, then the 'mvhd' type, then the body
+    $mvhdBoxSize = 8 + $mvhd.Count
+    foreach($b in (ConvertTo-Be4 ([uint32]$mvhdBoxSize))){ [void]$moov.Add($b) }
     foreach($b in [System.Text.Encoding]::ASCII.GetBytes('mvhd')){ [void]$moov.Add($b) }
     foreach($b in $mvhd){ [void]$moov.Add($b) }
     $moovPayload = $moov.ToArray()

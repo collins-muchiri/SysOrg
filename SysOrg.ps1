@@ -54,6 +54,7 @@ Import-Module (Join-Path $moduleRoot 'SysOrg.Core.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.KnownFolders.psm1') -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Drives.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Layout.psm1')      -Force
+Import-Module (Join-Path $moduleRoot 'SysOrg.Metadata.psm1')    -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
