@@ -971,12 +971,28 @@ function Find-SysOrgDuplicates {
     }
     Write-Progress -Activity 'Duplicate detection' -Completed
 
-    # v3.0 Phase 3.4: ONE parallel full-hash pass over the survivors (deduped),
-    # results in input order, then group by size + head/tail + full hash.
+    # v3.0 Phase 3.4: full hashes come from the cache when fresh; ONLY the misses go
+    # through the RunspacePool (results in input order, deterministic), then group by
+    # size + head/tail + full hash.
     $uniqueFull = @(@($fullCandidates.ToArray()) | Sort-Object -Property FullName -Unique)
     $fullMap = @{}
-    if($uniqueFull.Count -gt 0){
-        $paths = @($uniqueFull | ForEach-Object { "$($_.FullName)" })
+    $toHash = New-Object System.Collections.Generic.List[string]
+    foreach($rec in $uniqueFull){
+        $p2 = "$($rec.FullName)"
+        if($FileCache){
+            try{
+                $fi = Get-Item -LiteralPath $p2 -Force -ErrorAction Stop
+                $k2 = Get-SysOrgFileCacheKey -Path $p2 -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+                if($FileCache.ContainsKey($k2)){
+                    $e2 = $FileCache[$k2]
+                    if($e2.PSObject.Properties['Hash'] -and "$($e2.Hash)"){ $fullMap[$p2] = "$($e2.Hash)"; continue }
+                }
+            } catch { }
+        }
+        $toHash.Add($p2)
+    }
+    if($toHash.Count -gt 0){
+        $paths = @($toHash.ToArray())
         $hashes = Invoke-SysOrgParallelHash -Paths $paths -Parallelism $Parallelism
         for($i=0; $i -lt $paths.Count; $i++){
             if($hashes[$i]){

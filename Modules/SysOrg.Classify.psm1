@@ -26,6 +26,9 @@
 #
 # Determinism: identical inputs produce identical decisions; no randomness.
 
+# compiled-token regex cache (Phase 3.8: lexicon hotspot) - token -> [regex]
+$script:SysOrgTokenRegexCache = @{}
+
 function New-SysOrgDecision {
 <#
 .SYNOPSIS
@@ -715,7 +718,9 @@ function Get-SysOrgTokenMatches {
 .DESCRIPTION
     Multi-word tokens match as substrings; single-word tokens match on word
     boundaries so 'tax' does not match 'taxi'. Returns the number of DISTINCT
-    tokens found (each token counts once per source).
+    tokens found (each token counts once per source). The compiled regex per token
+    is cached in the module scope (v3.0 Phase 3.8 hotspot: building ~60 regexes per
+    file dominated plan-build on large corpora).
 .EXAMPLE
     Get-SysOrgTokenMatches -Text 'Invoice number 42, payment due' -Tokens @('invoice','payment due')   # -> 2
 #>
@@ -730,7 +735,13 @@ function Get-SysOrgTokenMatches {
         if($tok.Contains(' ')){
             if($lower.Contains($tok)){ $hits++ }
         } else {
-            if("$lower" -match ('(^|[^a-z0-9])' + [regex]::Escape($tok) + '([^a-z0-9]|$)')){ $hits++ }
+            $rx = $null
+            if($script:SysOrgTokenRegexCache.ContainsKey($tok)){ $rx = $script:SysOrgTokenRegexCache[$tok] }
+            else {
+                try { $rx = [regex]::new(('(^|[^a-z0-9])' + [regex]::Escape($tok) + '([^a-z0-9]|$)'), 'IgnoreCase') } catch { $rx = $null }
+                $script:SysOrgTokenRegexCache[$tok] = $rx
+            }
+            if($rx -and $rx.IsMatch("$lower")){ $hits++ }
         }
     }
     return $hits

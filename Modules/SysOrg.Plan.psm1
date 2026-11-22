@@ -1411,8 +1411,9 @@ function Invoke-SysOrgPlan {
         function Flush-SysOrgRunLog {
             if($logBuffer.Count -eq 0){ return }
             try {
-                Add-Content -LiteralPath (Join-Path $logFolder ('sysorg-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))) `
-                    -Value ($logBuffer.ToArray() -join "`r`n") -Encoding UTF8
+                $logFile = Join-Path $logFolder ('sysorg-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+                if(-not (Test-Path -LiteralPath $logFolder)){ New-Item -ItemType Directory -Path $logFolder -Force | Out-Null }
+                Add-Content -LiteralPath $logFile -Value ($logBuffer.ToArray() -join "`r`n") -Encoding UTF8
             } catch { }
             $logBuffer.Clear()
         }
