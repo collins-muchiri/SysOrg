@@ -6,5 +6,6 @@
         'PSAvoidUsingWriteHost'
         'PSUseSingularNouns'
     )
-    Severity = @('Error')
+    # v2.1.1: Warnings are reported too (CI prints them but only Errors fail the build).
+    Severity = @('Error','Warning')
 }

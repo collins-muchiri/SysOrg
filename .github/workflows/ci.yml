@@ -1,10 +1,19 @@
 name: CI
+
+# v2.1.1: least privilege - the workflow only needs to read the repository.
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      # v2.1.1: pinned to a commit SHA (v4.2.2) instead of a mutable tag
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Parse all PowerShell files
         shell: pwsh
@@ -21,21 +30,42 @@ jobs:
           }
           if($failed){ exit 1 }
 
-      - name: PSScriptAnalyzer (errors fail the build)
+      # v2.1.1: Pester and PSScriptAnalyzer are pinned to explicit versions so a
+      # gallery-side update can never change what CI validates.
+      - name: PSScriptAnalyzer (errors fail the build, warnings are printed)
         shell: pwsh
         run: |
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error -Settings .\PSScriptAnalyzerSettings.psd1
-          if($r){ $r | Format-Table -AutoSize; exit 1 }
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          $errors = @($r | Where-Object Severity -eq 'Error')
+          $warnings = @($r | Where-Object Severity -eq 'Warning')
+          if($warnings.Count -gt 0){
+            Write-Host "PSScriptAnalyzer warnings ($($warnings.Count)) - informational, the build continues:"
+            $warnings | Format-Table -AutoSize | Out-Host
+          }
+          if($errors.Count -gt 0){
+            Write-Host "PSScriptAnalyzer errors ($($errors.Count)):"
+            $errors | Format-Table -AutoSize | Out-Host
+            exit 1
+          }
 
       - name: Pester tests on Windows PowerShell 5.1 (the supported runtime)
         shell: powershell
         run: |
           Install-PackageProvider NuGet -Force -Scope CurrentUser | Out-Null
           Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck -MinimumVersion 5.0
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
           $cfg = New-PesterConfiguration
           $cfg.Run.Path = '.\Tests'
           $cfg.Run.Exit = $true
           $cfg.TestResult.Enabled = $true
+          Invoke-Pester -Configuration $cfg
+
+      - name: Pester tests on PowerShell 7 (cross-version check)
+        shell: pwsh
+        run: |
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = '.\Tests'
+          $cfg.Run.Exit = $true
           Invoke-Pester -Configuration $cfg

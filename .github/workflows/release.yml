@@ -1,0 +1,125 @@
+name: Release
+
+# v2.1.1: runs the same checks as CI on a version tag, then builds SysOrg-<version>.zip
+# from the TRACKED files only (git ls-files) and publishes it together with a SHA256SUMS
+# file. The optional Authenticode step is skipped unless a certificate secret exists.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # required to create the GitHub release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Parse all PowerShell files
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Include *.ps1,*.psm1,*.psd1 | ForEach-Object {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$null,[ref]$errs) | Out-Null
+            if($errs){
+              $failed = $true
+              Write-Host "PARSE FAIL: $($_.FullName)"
+              $errs | ForEach-Object { Write-Host "  $($_.Message)" }
+            }
+          }
+          if($failed){ exit 1 }
+
+      - name: PSScriptAnalyzer (errors fail the build)
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
+          $r = Invoke-ScriptAnalyzer -Path . -Recurse -Settings .\PSScriptAnalyzerSettings.psd1
+          $errors = @($r | Where-Object Severity -eq 'Error')
+          if($errors.Count -gt 0){ $errors | Format-Table -AutoSize; exit 1 }
+
+      - name: Pester tests on Windows PowerShell 5.1 (the supported runtime)
+        shell: powershell
+        run: |
+          Install-PackageProvider NuGet -Force -Scope CurrentUser | Out-Null
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = '.\Tests'
+          $cfg.Run.Exit = $true
+          Invoke-Pester -Configuration $cfg
+
+      - name: OPTIONAL Authenticode signing (skipped when no certificate secret exists)
+        shell: powershell
+        env:
+          SYSORG_SIGNING_CERT_PFX: ${{ secrets.SYSORG_SIGNING_CERT_PFX }}
+          SYSORG_SIGNING_CERT_PASSWORD: ${{ secrets.SYSORG_SIGNING_CERT_PASSWORD }}
+        run: |
+          # ------------------------------------------------------------------
+          # OPTIONAL: Authenticode signing of the PowerShell entry points.
+          # Configure the repository secrets SYSORG_SIGNING_CERT_PFX (base64 of a
+          # code-signing .pfx) and SYSORG_SIGNING_CERT_PASSWORD to enable it.
+          # Without the secrets this step is a documented NO-OP and the release
+          # ships unsigned.
+          # ------------------------------------------------------------------
+          if(-not $env:SYSORG_SIGNING_CERT_PFX){
+            Write-Host 'No signing certificate secret configured - the release ships UNSIGNED.'
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'sysorg-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfxPath, [System.Convert]::FromBase64String($env:SYSORG_SIGNING_CERT_PFX))
+          try {
+            $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+              $pfxPath, $env:SYSORG_SIGNING_CERT_PASSWORD,
+              [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+            foreach($f in @('SysOrg.ps1','Install-SysOrg.ps1','Uninstall-SysOrg.ps1')){
+              $p = Join-Path (Get-Location) $f
+              if(Test-Path -LiteralPath $p){
+                Set-AuthenticodeSignature -FilePath $p -Certificate $cert -TimestampServer 'http://timestamp.digicert.com' | Out-Null
+                Write-Host "Signed: $f"
+              }
+            }
+          } finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Build SysOrg-<version>.zip from tracked files only
+        shell: pwsh
+        run: |
+          $version = (Import-PowerShellDataFile -Path .\SysOrg.config.psd1).Version
+          $zipName = "SysOrg-$version.zip"
+          $stage = Join-Path $env:RUNNER_TEMP "sysorg-$version"
+          if(Test-Path -LiteralPath $stage){ Remove-Item -LiteralPath $stage -Recurse -Force }
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          # tracked files only: untracked build leftovers can never leak into the release
+          $files = @(git ls-files)
+          foreach($f in $files){
+            $src = Join-Path (Get-Location) $f
+            $dst = Join-Path $stage $f
+            $dstDir = Split-Path $dst -Parent
+            if(-not (Test-Path -LiteralPath $dstDir)){ New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+            Copy-Item -LiteralPath $src -Destination $dst -Force
+          }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath ".\$zipName" -Force
+          Write-Host "Built $zipName ($($files.Count) tracked files)."
+
+      - name: SHA256SUMS
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Filter 'SysOrg-*.zip' | Select-Object -First 1
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($zip.Name)" | Set-Content -LiteralPath 'SHA256SUMS' -Encoding ascii
+          Get-Content -LiteralPath 'SHA256SUMS'
+
+      - name: Publish the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $zip = (Get-ChildItem -Filter 'SysOrg-*.zip' | Select-Object -First 1).Name
+          gh release create $tag --title $tag --generate-notes "$zip" SHA256SUMS
