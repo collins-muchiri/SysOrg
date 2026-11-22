@@ -267,9 +267,10 @@ function Invoke-SysOrgClassifyPipeline {
         [void]$d.Signals.Add(('Confidence ' + $d.Confidence + ' below ' + $revConf + ' -> planned with a review flag'))
     }
 
-    # destination leaf from the Findable routing table
+    # destination leaf from the Findable routing table (v3.0.1 B1: -Config is passed so
+    # the Findable profile routes download files by CONTENT - provenance is metadata)
     try {
-        $rb = Get-SysOrgFindableRelBase -Category $d.Category -Subtype $d.Subtype -Source "$($ctx.Source)" -Name $name -InDownloads:$ctx.InDownloads -TypeLeaf (Get-SysOrgFindableTypeLeaf -Category $d.Category)
+        $rb = Get-SysOrgFindableRelBase -Category $d.Category -Subtype $d.Subtype -Source "$($ctx.Source)" -Name $name -InDownloads:$ctx.InDownloads -TypeLeaf (Get-SysOrgFindableTypeLeaf -Category $d.Category) -Config $Config
         if($meta -and ($d.Subtype -eq 'UntaggedMusic') -and $meta.Artist){
             $rb = Get-SysOrgFindableRelBase -Category 'Music' -Subtype 'TaggedMusic' -Artist "$($meta.Artist)" -Album "$($meta.Album)" -Name $name
             $d.Category = 'Music'

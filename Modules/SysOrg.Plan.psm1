@@ -338,6 +338,10 @@ function New-SysOrgPlan {
                     if([string]::IsNullOrWhiteSpace($pk)){ $pk = "$($folderMap['Other'])" }
                 }
                 $relBaseOf[$src] = $pk
+                # v3.0.1 B1: families must cluster inside the CONTENT leaf too - a file
+                # downloaded from Z-AI belongs to Documents\Work\<...> like every other
+                # document, not to a Downloads\<Source> partition.
+                $partitionLookup[$src] = $pk
             }
             $context[$src] = @{ Rel=$pk; Category=$category; Source=$sourceName; InDownloads=$inDownloads }
             $partitionLookup[$src] = $pk

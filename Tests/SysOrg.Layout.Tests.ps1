@@ -15,6 +15,8 @@ BeforeAll {
     Import-Module (Join-Path $repo 'Modules\SysOrg.Scan.psm1')        -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Audit.psm1')       -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Layout.psm1')      -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Metadata.psm1')    -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Classify.psm1')    -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1')        -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Score.psm1')       -Force
     $script:fakeProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
@@ -281,7 +283,7 @@ Describe 'Findable plan integration' {
         @($dests | Where-Object { $_ -like 'Documents\General\2024\*' }).Count | Should -Be 3
     }
 
-    It 'installers inside download roots use the Downloads provenance branch' {
+    It 'installers inside download roots route by CONTENT under Findable - provenance is metadata (v3.0.1 B1)' {
         $work = Join-Path $TestDrive ('findable-dl-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path (Join-Path $work 'src') -Force | Out-Null
         $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
@@ -296,7 +298,11 @@ Describe 'Findable plan integration' {
         $fiExe.CreationTime = $stampExe; $fiExe.LastWriteTime = $stampExe
         $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $prof -Config $script:baseCfg
         (@($plan.Actions).Count) | Should -Be 1
-        "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*Downloads\_NoSource\Software\2024\setup-vlc-3.0.exe'
+        # v3.0.1 B1: content routing - Software\Installers\<App>, NOT Downloads\<Source>\...
+        "$(@($plan.Actions)[0].Destination)" | Should -BeLike '*\Software\Installers\Vlc\setup-vlc-3.0.exe'
+        "$(@($plan.Actions)[0].Destination)" | Should -Not -BeLike '*Downloads*'
+        # provenance still rides along for the catalog and Explain
+        "$(@($plan.Actions)[0].SourceBucket)" | Should -Be '_NoSource'
     }
 
     It 'the legacy Windows profile plans exactly like v2.1 (no Findable tree)' {
@@ -463,5 +469,50 @@ Describe 'Findable plan: full pipeline integration (Phase 2.9)' {
         $inv = @([pscustomobject]@{ FullName=$p; Name='note.txt'; Stem='note'
             Extension='.txt'; Length=2; LastWriteTime=(Get-Date '2024-06-15'); Directory=$dir; Category='Documents' })
         { New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $script:fakeProf -Config $cfg2 } | Should -Throw '*NameRegex*'
+    }
+}
+
+Describe 'Provenance is metadata, not taxonomy (v3.0.1 B1)' {
+
+    It 'under Findable, a Downloads file routes by CONTENT - never into Downloads\<Source>' {
+        $fCfg = @{ LayoutProfile='Findable' }
+        (Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'Work' -Source 'Z-AI' -InDownloads:$true -Config $fCfg).RelBase | Should -Be 'Documents\Work'
+        (Get-SysOrgFindableRelBase -Category 'Installers' -Subtype 'InstallerApp' -Name 'VLC media player setup.exe' -Source 'GitHub' -InDownloads:$true -Config $fCfg).RelBase | Should -Be 'Software\Installers\Vlc'
+        (Get-SysOrgFindableRelBase -Category 'Pictures' -Subtype 'Camera' -Source 'Chrome' -InDownloads:$true -Config $fCfg).RelBase | Should -Be 'Pictures\Camera'
+    }
+
+    It 'under Findable there is no _NoSource folder: unknown provenance still routes by content' {
+        $fCfg = @{ LayoutProfile='Findable' }
+        $rb = Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'General' -Source '' -InDownloads:$true -Config $fCfg
+        $rb.RelBase | Should -Be 'Documents\General'
+        $rb.RelBase | Should -Not -Match '_NoSource'
+        $rb.RelBase | Should -Not -Match '^Downloads'
+    }
+
+    It 'messaging sources and Screenshots keep their folder level under Findable' {
+        $fCfg = @{ LayoutProfile='Findable' }
+        (Get-SysOrgFindableRelBase -Category 'Pictures' -Subtype 'Messaging' -Source 'WhatsApp' -InDownloads:$true -Config $fCfg).RelBase | Should -Be 'Pictures\Messaging\WhatsApp'
+        (Get-SysOrgFindableRelBase -Category 'Pictures' -Subtype 'Screenshots' -Source 'Chrome' -InDownloads:$true -Config $fCfg).RelBase | Should -Be 'Pictures\Screenshots'
+    }
+
+    It 'the legacy Windows profile keeps the Downloads\<Source>\<Type> provenance branch' {
+        $wCfg = @{ LayoutProfile='Windows' }
+        (Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'Work' -Source 'GitHub' -InDownloads:$true -TypeLeaf 'Documents' -Config $wCfg).RelBase | Should -Be 'Downloads\GitHub\Documents'
+        # no config at all = legacy behaviour (back-compat for direct callers)
+        (Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'Work' -Source 'GitHub' -InDownloads:$true -TypeLeaf 'Documents').RelBase | Should -Be 'Downloads\GitHub\Documents'
+        (Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'Work' -Source '' -InDownloads:$true -TypeLeaf 'Documents' -Config $wCfg).RelBase | Should -Be 'Downloads\_NoSource\Documents'
+    }
+
+    It 'the Decision pipeline routes a download-root document by content; the source rides in Explain' {
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Classify.psm1') -Force
+        $fCfg = @{ LayoutProfile='Findable'; Classify=@{ MinConfidence=0.40; ReviewConfidence=0.70 } }
+        $prof = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@('C:\Users\t\Downloads'); Artifacts=@(); TopLevelDirs=@() }
+        $p = 'C:\Users\t\Downloads\monthly narrative report.docx'
+        $dec = Invoke-SysOrgClassifyPipeline -Path $p -Extension '.docx' -Category 'Documents' -Config $fCfg -DriveProfile $prof -UrlBucket 'Z-AI'
+        $dec.Destination | Should -Be 'Documents\Work'
+        $dec.Destination | Should -Not -Match '^Downloads'
+        $dec.Destination | Should -Not -Match '_NoSource'
+        (@($dec.Signals) | Where-Object { $_ -match 'source bucket Z-AI' }).Count | Should -BeGreaterOrEqual 1
     }
 }

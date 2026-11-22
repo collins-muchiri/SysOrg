@@ -151,22 +151,43 @@ function Get-SysOrgFindableRelBase {
     Maps one routed file to its Findable leaf folder (WITHOUT the date segment).
 .DESCRIPTION
     Returns @{ RelBase=<string>; TakesDate=<bool> } where RelBase is relative to
-    the destination root. Messaging and Downloads branches include the source
-    bucket; music carries artist/album when metadata exists (Subtype='TaggedMusic').
+    the destination root. Music carries artist/album when metadata exists
+    (Subtype='TaggedMusic').
+    v3.0.1 B1: in the Findable layout, provenance is METADATA, not taxonomy. When
+    -Config is supplied and the active LayoutProfile is 'Findable', a file from a
+    Downloads root is routed by its CONTENT category like every other file
+    (Documents\Work\<Year>, Pictures\..., Software\Installers\<App>); the source
+    bucket lives in the catalog's Source field and the -Explain output, and becomes
+    a folder level ONLY for messaging sources (WhatsApp/Telegram/Signal via the
+    Messaging subtype) and Screenshots. There is no Downloads branch and no
+    _NoSource folder in the Findable tree.
+    The legacy provenance branch (Downloads\<Source>\<Type>) remains for the
+    Windows and Compact4 layout profiles (pass no -Config, or LayoutProfile
+    Windows/Compact4) - nothing changes for them.
 .EXAMPLE
     Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'Finance\Invoices'   # -> Documents\Finance\Invoices
 #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Category,[Parameter(Mandatory)][string]$Subtype,
           [string]$Source,[string]$Artist,[string]$Album,[string]$Name,
-          [bool]$InDownloads,[string]$TypeLeaf)
+          [bool]$InDownloads,[string]$TypeLeaf,[object]$Config)
     if($InDownloads){
-        # existing provenance branch: Downloads\<Source>\<Type>
-        $src = $Source
-        if([string]::IsNullOrWhiteSpace($src)){ $src = '_NoSource' }
-        $leaf = $TypeLeaf
-        if([string]::IsNullOrWhiteSpace($leaf)){ $leaf = 'Files' }
-        return @{ RelBase=('Downloads\{0}\{1}' -f (Get-SysOrgSafeFolderName -Name $src -MaxLength 40), $leaf); TakesDate=$true }
+        # v3.0.1 B1: provenance-as-metadata under the Findable layout profile.
+        $useProvenanceFolders = $true
+        if($Config){
+            try { if((Get-SysOrgLayoutProfile -Config $Config) -eq 'Findable'){ $useProvenanceFolders = $false } } catch { }
+        }
+        if($useProvenanceFolders){
+            # legacy provenance branch: Downloads\<Source>\<Type>
+            $src = $Source
+            if([string]::IsNullOrWhiteSpace($src)){ $src = '_NoSource' }
+            $leaf = $TypeLeaf
+            if([string]::IsNullOrWhiteSpace($leaf)){ $leaf = 'Files' }
+            return @{ RelBase=('Downloads\{0}\{1}' -f (Get-SysOrgSafeFolderName -Name $src -MaxLength 40), $leaf); TakesDate=$true }
+        }
+        # Findable: fall through to CONTENT routing - the source bucket stays in the
+        # catalog (Source) and Explain output; messaging and screenshots keep their
+        # own subtype leaves below.
     }
     if($Subtype -eq 'TaggedMusic'){
         $a = Get-SysOrgSafeFolderName -Name "$Artist" -MaxLength 60
