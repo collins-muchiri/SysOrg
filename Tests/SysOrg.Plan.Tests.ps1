@@ -561,7 +561,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         Set-Content -LiteralPath $srcA -Value 'aa'; Set-Content -LiteralPath $srcB -Value 'bb'
         $dstA = Join-Path $TestDrive 'jr2-org\Documents\2026\a.txt'
         $dstB = Join-Path $TestDrive 'jr2-org\Documents\2026\b.txt'
-        $plan = [pscustomobject]@{ PlanId=$planId
+        $plan = [pscustomobject]@{ PlanId=$planId; Drive='T:'
             Actions=@(
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='test'; SizeBytes=2 },
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcB; Destination=$dstB; Reason='test'; SizeBytes=2 }) }
@@ -590,7 +590,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'aa'
         $dst = Join-Path $TestDrive 'jr3-org\Documents\2026\a.txt'
-        $plan = [pscustomobject]@{ PlanId=$planId
+        $plan = [pscustomobject]@{ PlanId=$planId; Drive='T:'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=$dst; Reason='test'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'jr3.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
@@ -615,7 +615,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         Set-Content -LiteralPath $srcA -Value 'aa'; Set-Content -LiteralPath $srcB -Value 'bb'
         $dstA = Join-Path $TestDrive 'jr4-org\Documents\2026\a.txt'
         $dstB = Join-Path $TestDrive 'jr4-org\Documents\2026\b.txt'
-        $plan = [pscustomobject]@{ PlanId=$planId
+        $plan = [pscustomobject]@{ PlanId=$planId; Drive='T:'
             Actions=@(
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcA; Destination=$dstA; Reason='test'; SizeBytes=2 },
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$srcB; Destination=$dstB; Reason='test'; SizeBytes=2 }) }
@@ -643,7 +643,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         $src = Join-Path $TestDrive 'jr5\doc.txt'
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'v'
-        $plan = [pscustomobject]@{ PlanId=$planId
+        $plan = [pscustomobject]@{ PlanId=$planId; Drive='T:'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=(Join-Path $TestDrive 'jr5-org\Documents\2026\doc.txt'); Reason='test'; SizeBytes=2 }) }
         $planPath = Join-Path $TestDrive 'jr5.json'
         $plan | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath
@@ -659,7 +659,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         Set-Content -LiteralPath $s1 -Value '1'; Set-Content -LiteralPath $s2 -Value '2'
         $d1 = Join-Path $TestDrive 'jr6-org\Documents\2026\one.txt'
         $d2 = Join-Path $TestDrive 'jr6-org\Documents\2026\two.txt'
-        $plan2 = [pscustomobject]@{ PlanId=$planId2
+        $plan2 = [pscustomobject]@{ PlanId=$planId2; Drive='T:'
             Actions=@(
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$s1; Destination=$d1; Reason='test'; SizeBytes=1 },
                 [pscustomobject]@{ Action='Move'; Kind='File'; Source=$s2; Destination=$d2; Reason='test'; SizeBytes=1 }) }
@@ -673,7 +673,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
     }
     It 'journal and provenance rows are properly CSV-escaped (commas and quotes survive)' {
         # provenance sidecar: URLs can contain quotes and commas
-        $plan = [pscustomobject]@{ PlanId='plan-20260101-094007'; DestinationRoot='X:\org'
+        $plan = [pscustomobject]@{ PlanId='plan-20260101-094007'; Drive='T:'; DestinationRoot='X:\org'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source='X:\a.txt'; Destination='X:\org\a.txt'; Reason='r'; SizeBytes=1 })
             Provenance=@([pscustomobject]@{ Source='X:\a.txt'; SourceBucket='Test'; HostUrl='https://x.test/a,"b,c";d'; ReferrerUrl='' }) }
         $plansFolder = Join-Path $TestDrive 'jr7-plans'
@@ -686,7 +686,7 @@ Describe 'Journal durability and undo lifecycle (v2.1.1)' {
         $src = Join-Path $TestDrive 'jr8\a,b.txt'
         New-Item -ItemType Directory -Path (Split-Path $src) -Force | Out-Null
         Set-Content -LiteralPath $src -Value 'v'
-        $plan2 = [pscustomobject]@{ PlanId='plan-20260101-094008'
+        $plan2 = [pscustomobject]@{ PlanId='plan-20260101-094008'; Drive='T:'
             Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source=$src; Destination=(Join-Path $TestDrive 'jr8-org\Documents\2026\a,b.txt'); Reason='test'; SizeBytes=2 }) }
         $planPath2 = Join-Path $TestDrive 'jr8.json'
         $plan2 | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $planPath2

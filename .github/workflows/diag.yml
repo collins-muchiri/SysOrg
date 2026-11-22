@@ -18,49 +18,10 @@ jobs:
       - name: Trace project-folder detection and catalog read on PS 5.1
         shell: powershell
         run: |
-          Write-Host "PSVersion: $($PSVersionTable.PSVersion)"
-          Import-Module .\Modules\SysOrg.Core.psm1 -Force
-          Import-Module .\Modules\SysOrg.Scan.psm1 -Force
-          Import-Module .\Modules\SysOrg.Catalog.psm1 -Force
-
-          Write-Host '=== A. project-folder detection trace ==='
-          $root = Join-Path $env:TEMP ('two-m-' + [guid]::NewGuid().ToString('N').Substring(0,6))
-          New-Item -ItemType Directory -Path (Join-Path $root 'lone') -Force | Out-Null
-          Set-Content -LiteralPath (Join-Path $root 'lone\.gitignore') -Value ''
-          New-Item -ItemType Directory -Path (Join-Path $root 'real') -Force | Out-Null
-          Set-Content -LiteralPath (Join-Path $root 'real\Makefile') -Value 'all:'
-          Set-Content -LiteralPath (Join-Path $root 'real\CMakeLists.txt') -Value 'proj()'
-          $projCfg = @{ Projects=@{ Enabled=$true; Markers=@() }; ExcludedPaths=@(); ExcludedFilePatterns=@() }
-          Write-Host ("root              : " + $root)
-          Write-Host ("ExcludedPath(root): " + (Test-SysOrgExcludedPath -Path $root -Config $projCfg))
-          Write-Host ("DestPath(root)    : " + (Test-SysOrgDestinationPath -Path $root -Config $projCfg))
-          $di = New-Object System.IO.DirectoryInfo($root)
-          Write-Host ("attributes        : " + $di.Attributes)
-          $real = Join-Path $root 'real'
-          $diReal = New-Object System.IO.DirectoryInfo($real)
-          Write-Host ("real attributes   : " + $diReal.Attributes)
-          $entries = @([System.IO.Directory]::GetFileSystemEntries($real) | ForEach-Object { Split-Path $_ -Leaf })
-          Write-Host ("real entries      : " + ($entries -join ', '))
-          $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; KnownFolders=@(); DownloadRoots=@() }
-          $found = @(Get-SysOrgProjectFolders -Roots @($root) -Config $projCfg -DriveProfile $prof)
-          Write-Host ("projects found    : " + @($found).Count)
-          foreach($f in @($found)){ Write-Host ("  found: " + $f.Path) }
-          Write-Host ("USERPROFILE       : " + $env:USERPROFILE)
-
-          Write-Host '=== B. catalog write + read round trip ==='
-          $catDir = Join-Path $env:TEMP ('find-' + [guid]::NewGuid().ToString('N').Substring(0,6))
-          New-Item -ItemType Directory -Path (Join-Path $catDir '_Index') -Force | Out-Null
-          $catPath = Join-Path $catDir '_Index\catalog.ndjson'
-          $lines = @()
-          $lines += ('{{"CurrentPath":"{0}\\Documents\\Finance\\Invoices\\2024\\inv1.pdf","OriginalPath":"C:\\dl\\inv1.pdf","Type":"File","Category":"Documents\\Finance\\Invoices","Date":"2024-03-01T10:00:00","DateSource":"plan","SourceBucket":"GitHub","Family":"inv","Hash":"AAA","SizeBytes":12000,"Confidence":0.9,"RuleId":"lexicon","PlanId":"plan-1"}}' -f $catDir)
-          $lines += ('{{"CurrentPath":"{0}\\Pictures\\Camera\\2024\\img1.jpg","OriginalPath":"C:\\pics\\img1.jpg","Type":"File","Category":"Pictures\\Camera","Date":"2024-05-05T11:00:00","DateSource":"exif","SourceBucket":"","Family":"","Hash":"BBB","SizeBytes":900000,"Confidence":0.8,"RuleId":"default","PlanId":"plan-1"}}' -f $catDir)
-          [System.IO.File]::WriteAllLines($catPath, $lines)
-          Write-Host ("catalog path      : " + $catPath)
-          Write-Host ("Test-Path         : " + (Test-Path -LiteralPath $catPath))
-          Write-Host ("GetSysOrgCatPath  : " + (Get-SysOrgCatalogPath -Root $catDir))
-          Write-Host ("paths equal       : " + ((Get-SysOrgCatalogPath -Root $catDir) -eq $catPath))
-          $entries2 = @(Read-SysOrgCatalog -Path $catPath)
-          Write-Host ("read entries      : " + @($entries2).Count)
-          $r1 = @(Find-SysOrgFile -Root $catDir -Name '*inv*')
-          Write-Host ("find *inv*        : " + @($r1).Count)
-          foreach($e in @($entries2)){ Write-Host ("  entry: " + $e.CurrentPath) }
+          Import-Module Pester -RequiredVersion 5.7.1 -Force -ErrorAction SilentlyContinue
+          if(-not (Get-Module Pester)){ Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck }
+          Import-Module Pester -RequiredVersion 5.7.1
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = '.\Tools\Diag.Tests.ps1'
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
