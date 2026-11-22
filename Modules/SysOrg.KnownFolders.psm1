@@ -104,8 +104,6 @@ function Get-SysOrgKnownFolders {
             }
         }
     }
-    $oneDrive = $env:OneDrive
-    if($oneDrive){ $oneDrive = $oneDrive.TrimEnd('\') }
     $profilePrefix = $null
     if($userProfile){ $profilePrefix = $userProfile.TrimEnd('\') + '\' }
     $result = @()
@@ -121,10 +119,8 @@ function Get-SysOrgKnownFolders {
         $redirected = $false
         $underOD = $false
         if($profilePrefix){ $redirected = -not $path.StartsWith($profilePrefix,[StringComparison]::OrdinalIgnoreCase) }
-        if($oneDrive){
-            # (replaced by Test-SysOrgUnderOneDrive in the v2.1.1 OneDrive item)
-            $underOD = $path.StartsWith($oneDrive + '\',[StringComparison]::OrdinalIgnoreCase) -or ($path -ieq $oneDrive)
-        }
+        # v2.1.1: central OneDrive check (env vars + per-account registry) instead of $env:OneDrive only
+        $underOD = Test-SysOrgUnderOneDrive -Path $path
         $result += [pscustomobject]@{
             Name = $k; Path = $path
             IsRedirected  = $redirected

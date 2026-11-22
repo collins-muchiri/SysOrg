@@ -485,3 +485,43 @@ Describe 'Folder-move safety (v2.1.1)' {
         }
     }
 }
+
+Describe 'OneDrive root detection (v2.1.1)' {
+    It 'a Business account path (OneDriveCommercial) is recognized' {
+        $old = @{ OneDrive=$env:OneDrive; OneDriveCommercial=$env:OneDriveCommercial; OneDriveConsumer=$env:OneDriveConsumer }
+        try{
+            $env:OneDrive = $null
+            $env:OneDriveConsumer = $null
+            $env:OneDriveCommercial = (Join-Path $TestDrive 'od-biz')
+            Test-SysOrgUnderOneDrive -Path (Join-Path $env:OneDriveCommercial 'Documents\a.docx') | Should -BeTrue
+            Test-SysOrgUnderOneDrive -Path (Join-Path $TestDrive 'elsewhere\a.docx') | Should -BeFalse
+            @(Get-SysOrgOneDriveRoots)[0] | Should -Be ((Join-Path $TestDrive 'od-biz').Replace('/','\'))
+        } finally {
+            $env:OneDrive = $old.OneDrive; $env:OneDriveCommercial = $old.OneDriveCommercial; $env:OneDriveConsumer = $old.OneDriveConsumer
+        }
+    }
+    It 'multiple accounts: any configured root matches' {
+        $old = @{ OneDrive=$env:OneDrive; OneDriveCommercial=$env:OneDriveCommercial; OneDriveConsumer=$env:OneDriveConsumer }
+        try{
+            $env:OneDrive = (Join-Path $TestDrive 'od1')
+            $env:OneDriveCommercial = (Join-Path $TestDrive 'od2')
+            $env:OneDriveConsumer = $null
+            Test-SysOrgUnderOneDrive -Path (Join-Path $env:OneDrive 'x') | Should -BeTrue
+            Test-SysOrgUnderOneDrive -Path (Join-Path $env:OneDriveCommercial 'y') | Should -BeTrue
+            Test-SysOrgUnderOneDrive -Path (Join-Path $TestDrive 'od3\z') | Should -BeFalse
+        } finally {
+            $env:OneDrive = $old.OneDrive; $env:OneDriveCommercial = $old.OneDriveCommercial; $env:OneDriveConsumer = $old.OneDriveConsumer
+        }
+    }
+    It 'a path that merely shares a prefix is NOT inside OneDrive' {
+        $old = @{ OneDrive=$env:OneDrive; OneDriveCommercial=$env:OneDriveCommercial; OneDriveConsumer=$env:OneDriveConsumer }
+        try{
+            $env:OneDrive = (Join-Path $TestDrive 'od')
+            Test-SysOrgUnderOneDrive -Path ((Join-Path $TestDrive 'od') + 'yssey\x.txt') | Should -BeFalse
+            Test-SysOrgUnderOneDrive -Path (Join-Path $TestDrive 'od') | Should -BeTrue   # the root itself counts
+            Test-SysOrgUnderOneDrive -Path '' | Should -BeFalse
+        } finally {
+            $env:OneDrive = $old.OneDrive; $env:OneDriveCommercial = $old.OneDriveCommercial; $env:OneDriveConsumer = $old.OneDriveConsumer
+        }
+    }
+}

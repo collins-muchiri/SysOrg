@@ -1095,6 +1095,65 @@ function New-SysOrgAppFolders {
     return ,$map
 }
 
+function Get-SysOrgOneDriveRoots {
+<#
+.SYNOPSIS
+    Returns every configured OneDrive sync root (v2.1.1): env vars + per-account registry.
+.DESCRIPTION
+    Considers $env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer and the
+    HKCU:\Software\Microsoft\OneDrive\Accounts\<account>\UserFolder registry values
+    (a Business account often appears ONLY there). Separators are normalized and
+    trailing separators trimmed; the registry read is wrapped so non-Windows test hosts
+    contribute nothing. Duplicates are removed case-insensitively.
+.EXAMPLE
+    Get-SysOrgOneDriveRoots   # e.g. @('C:\Users\t\OneDrive', 'C:\Users\t\OneDrive - Contoso')
+#>
+    $roots = New-Object System.Collections.Generic.List[string]
+    foreach($envName in @('OneDrive','OneDriveCommercial','OneDriveConsumer')){
+        $v = [Environment]::GetEnvironmentVariable($envName)
+        if(-not [string]::IsNullOrWhiteSpace("$v")){
+            $n = ("$v").Replace('/','\').TrimEnd('\')
+            if($n -and (-not ($roots -contains $n))){ [void]$roots.Add($n) }
+        }
+    }
+    try{
+        $accountsRoot = 'HKCU:\Software\Microsoft\OneDrive\Accounts'
+        if(Test-Path -LiteralPath $accountsRoot){
+            foreach($acct in @(Get-ChildItem -LiteralPath $accountsRoot -ErrorAction SilentlyContinue)){
+                $uf = $null
+                try { $uf = (Get-ItemProperty -LiteralPath $acct.PSPath -Name 'UserFolder' -ErrorAction Stop).UserFolder } catch { }
+                if(-not [string]::IsNullOrWhiteSpace("$uf")){
+                    $n = ("$uf").Replace('/','\').TrimEnd('\')
+                    if($n -and (-not ($roots -contains $n))){ [void]$roots.Add($n) }
+                }
+            }
+        }
+    } catch { Write-Verbose "OneDrive account registry unavailable: $($_.Exception.Message)" }
+    return ,$roots.ToArray()
+}
+
+function Test-SysOrgUnderOneDrive {
+<#
+.SYNOPSIS
+    True when a path lives inside (or is) a OneDrive sync root (v2.1.1).
+.DESCRIPTION
+    Replaces the five duplicated inline checks (four in New-SysOrgPlan, one in
+    Get-SysOrgKnownFolders): considers $env:OneDrive, $env:OneDriveCommercial,
+    $env:OneDriveConsumer and the per-account UserFolder registry values. Prefix
+    matching is case-insensitive and SEGMENT-SAFE: 'C:\Users\t\Od' is a root, but
+    'C:\Users\t\Odyssey' merely shares a prefix and does not match.
+.EXAMPLE
+    Test-SysOrgUnderOneDrive -Path 'C:\Users\t\OneDrive - Contoso\Docs\a.docx'   # -> True
+#>
+    param([AllowEmptyString()][string]$Path)
+    if([string]::IsNullOrWhiteSpace($Path)){ return $false }
+    $p = ("$Path").Replace('/','\').TrimEnd('\')
+    foreach($r in (Get-SysOrgOneDriveRoots)){
+        if($p -ieq $r -or $p.StartsWith($r + '\',[StringComparison]::OrdinalIgnoreCase)){ return $true }
+    }
+    return $false
+}
+
 function ConvertTo-SysOrgCsvField {
 <#
 .SYNOPSIS

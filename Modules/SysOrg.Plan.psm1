@@ -91,8 +91,8 @@ function New-SysOrgPlan {
     $categoryNames = Get-SysOrgCategoryNames -KnownFolders $KnownFolders
     $kfPathSet = @{}
     foreach($k in @($KnownFolders)){ if($k.Path){ $kfPathSet[(("$($k.Path)").Replace('/','\').TrimEnd('\')).ToLowerInvariant()] = $true } }
-    $oneDriveRoot = $env:OneDrive
-    if($oneDriveRoot){ $oneDriveRoot = $oneDriveRoot.TrimEnd('\') }
+    # v2.1.1: OneDrive roots come from the central helper (env vars + registry accounts)
+    # instead of $env:OneDrive only.
 
     # project-folder coverage: files under a detected project move as one unit
     $projectDirSet = @{}
@@ -310,12 +310,10 @@ function New-SysOrgPlan {
             $usedNames[$nameKey] = $true
 
             $syncOut = $false; $intoCloud = $false
-            if($oneDriveRoot){
-                $odNorm = (($oneDriveRoot.Replace('/','\')).TrimEnd('\'))
-                $srcUnder = (($src.Replace('/','\')).StartsWith($odNorm + '\',[StringComparison]::OrdinalIgnoreCase)) -or ($src -ieq $oneDriveRoot)
-                $dstUnder = (($dest.Replace('/','\')).StartsWith($odNorm + '\',[StringComparison]::OrdinalIgnoreCase))
-                if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add($src) }
-                if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+            if(Test-SysOrgUnderOneDrive -Path $src){
+                if(-not (Test-SysOrgUnderOneDrive -Path $dest)){ $syncOut = $true; [void]$odSyncOut.Add($src) }
+            } elseif(Test-SysOrgUnderOneDrive -Path $dest){
+                $intoCloud = $true; [void]$odIntoCloud.Add($dest)
             }
             # v2.1.1: capture plan-time metadata so the executor can detect a source that
             # changed between planning and execution. Stored as a round-trip-safe UTC string.
@@ -358,12 +356,10 @@ function New-SysOrgPlan {
                     $qDir = ($root + '\' + $qFolder + '\' + $planId)
                     $dest = ($qDir + '\' + $qName)
                     $syncOut = $false; $intoCloud = $false
-                    if($oneDriveRoot){
-                        $odNormQ = (($oneDriveRoot.Replace('/','\')).TrimEnd('\'))
-                        $srcUnder = (("$($m.FullName)".Replace('/','\')).StartsWith($odNormQ + '\',[StringComparison]::OrdinalIgnoreCase))
-                        $dstUnder = ($dest.Replace('/','\')).StartsWith($odNormQ + '\',[StringComparison]::OrdinalIgnoreCase)
-                        if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
-                        if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+                    if(Test-SysOrgUnderOneDrive -Path "$($m.FullName)"){
+                        if(-not (Test-SysOrgUnderOneDrive -Path $dest)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
+                    } elseif(Test-SysOrgUnderOneDrive -Path $dest){
+                        $intoCloud = $true; [void]$odIntoCloud.Add($dest)
                     }
                     $actions.Add([pscustomobject]@{
                         Action='Quarantine'; Kind='File'; Source="$($m.FullName)"; Destination=$dest; DestRoot=$root
@@ -434,12 +430,10 @@ function New-SysOrgPlan {
                         $keeperFam = $null
                         if($fam.Lookup.ContainsKey($keeperPath)){ $keeperFam = [string]$fam.Lookup[$keeperPath].Name }
                         $syncOut = $false; $intoCloud = $false
-                        if($oneDriveRoot){
-                            $odNorm2 = (($oneDriveRoot.Replace('/','\')).TrimEnd('\'))
-                            $srcUnder = (("$($m.FullName)".Replace('/','\')).StartsWith($odNorm2 + '\',[StringComparison]::OrdinalIgnoreCase))
-                            $dstUnder = ($dest.Replace('/','\')).StartsWith($odNorm2 + '\',[StringComparison]::OrdinalIgnoreCase)
-                            if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
-                            if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+                        if(Test-SysOrgUnderOneDrive -Path "$($m.FullName)"){
+                            if(-not (Test-SysOrgUnderOneDrive -Path $dest)){ $syncOut = $true; [void]$odSyncOut.Add("$($m.FullName)") }
+                        } elseif(Test-SysOrgUnderOneDrive -Path $dest){
+                            $intoCloud = $true; [void]$odIntoCloud.Add($dest)
                         }
                         $reason = if($renameToKeeper){
                             ('Exact copy {0} of {1}; content verified by SHA256' -f $copyIndex, ($orderedMembers.Count + 1))
@@ -496,11 +490,10 @@ function New-SysOrgPlan {
             # (surfaced in the preview; the folder still moves).
             $stats = Get-SysOrgFolderMoveStats -Path "$($pf.Path)" -Config $Config -DriveProfile $DriveProfile
             $syncOut = $false; $intoCloud = $false
-            if($oneDriveRoot){
-                $srcUnder = "$($pf.Path)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
-                $dstUnder = $dest.StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
-                if($srcUnder -and (-not $dstUnder)){ $syncOut = $true; [void]$odSyncOut.Add("$($pf.Path)") }
-                if((-not $srcUnder) -and $dstUnder){ $intoCloud = $true; [void]$odIntoCloud.Add($dest) }
+            if(Test-SysOrgUnderOneDrive -Path "$($pf.Path)"){
+                if(-not (Test-SysOrgUnderOneDrive -Path $dest)){ $syncOut = $true; [void]$odSyncOut.Add("$($pf.Path)") }
+            } elseif(Test-SysOrgUnderOneDrive -Path $dest){
+                $intoCloud = $true; [void]$odIntoCloud.Add($dest)
             }
             $actions.Add([pscustomobject]@{
                 Action='Move'; Kind='Folder'; Source="$($pf.Path)"; Destination=$dest; DestRoot=$db.DisplayRoot
