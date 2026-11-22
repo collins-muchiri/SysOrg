@@ -9,6 +9,12 @@ names, name families within each type, numbered copies instead of quarantine, an
 explicit mutability engine that makes the C-drive guarantee provable. See
 `ORGANIZATION-DESIGN.md` (the full design) and `IMPROVEMENTS.md` (the review tracker).
 
+**Revision 2.1.1** hardens the security posture from a full audit: plans and undo journals
+are re-validated at execution time (canonical paths, exclusions, destination containment,
+integrity hash), a broken config fails closed instead of moving files on dropped
+exclusions, protection lists have a non-overridable floor, copies keep their own names,
+and the undo journal survives a power cut (WriteThrough + Pending/Done rows).
+
 ## Features
 
 - **Drive hierarchy profiler (v2.1)** — `-ProfileDrives` / menu `[1]` shows, per volume: role
@@ -21,8 +27,10 @@ explicit mutability engine that makes the C-drive guarantee provable. See
 - **Type-first families (v2.1)** — files are organized by type FIRST; related files share one
   named family folder within their type (`Documents\Report\`), and related files across types
   get the same family name in each root (`Pictures\holiday\` + `Videos\holiday\`).
-- **Numbered copies (v2.1)** — exact copies are kept and numbered beside the original
-  (`Report.docx`, `Report (2).docx`); the keeper is the oldest file. Quarantine to `_Duplicates`
+- **Numbered copies (v2.1.1)** — exact copies are kept beside the original WITH THEIR OWN
+  name (`Report - Copy.docx` stays `Report - Copy.docx`); a copy is numbered only when the
+  name collides in the destination folder. The v2.1.0 keeper-stem numbering is available as
+  `Copies.RenameToKeeper=$true`. The keeper is the oldest file. Quarantine to `_Duplicates`
   remains opt-in; nothing is ever deleted.
 - **Windows-native classification (v2.1)** — Windows known-folder names (Documents, Pictures,
   Videos, Music, Downloads), `PerceivedType` registry fallback for unmapped types, Explorer
@@ -41,11 +49,28 @@ explicit mutability engine that makes the C-drive guarantee provable. See
   library. Moves OUT of OneDrive are listed and counted in the confirmation prompt (v2.1)
 - **Crash-safe undo (v1.2)** — the journal is flushed after every action; interrupted runs resume
   with `-Force`; undo re-checks content hashes and restores numbered copies to their original names
-- **Report-only scheduled scans** — the weekly Task Scheduler job writes reports and can never move files
+- **Report-only scheduled scans** — the weekly Task Scheduler job writes reports to
+  `<AppRoot>\Reports\` (never to drive roots), covers fixed non-removable drives only, and
+  can never move files
+
+## Hardened plan execution (v2.1.1)
+
+A plan file and its undo journal are treated as **untrusted input**. Before anything moves,
+the executor re-validates every action: canonical path forms (no `..` segments, no 8.3
+short names, no `\\?\` namespace), exclusion and mutability re-checks against a fresh drive
+profile, reparse-point and cloud-placeholder refusals, plan-time size/timestamp drift
+checks, destination containment inside the plan root (or the resolved known folders), and
+a SHA256 integrity hash over the action list — a hand-edited plan is refused unless
+`-Force` is passed with a loud warning. The undo journal gets the same treatment per row,
+so a tampered journal cannot move arbitrary files.
+
+When SysOrg runs **as Administrator** it warns prominently, and every execute or undo
+additionally requires typing `yes`.
 
 ## Quick start
 
-1. Download `SysOrg-2.1.0.zip` from the [Releases page](../../releases/latest).
+1. Download `SysOrg-2.1.1.zip` from the [Releases page](../../releases/latest) and verify the
+   published `SHA256SUMS` entry before extracting.
 2. Right-click the ZIP → Properties → **Unblock** → extract.
 3. In the extracted folder run in PowerShell:
 
@@ -101,9 +126,9 @@ scope with the same artifact and extension protections.
 .\SysOrg.ps1 -ScanDrive C -NoCache    # ignore the cached inventory
 .\SysOrg.ps1 -ScanDrive D -ReportOnly
 .\SysOrg.ps1 -ScanDrive C -WritablePath 'C:\Work\Exports'
-.\SysOrg.ps1 -ExecutePlan .\Plans\plan-YYYYMMDD-HHMMSS.json
+.\SysOrg.ps1 -ExecutePlan .\Plans\plan-YYYYMMDD-HHMMSS-mmm.json
 .\SysOrg.ps1 -ExecutePlan .\Plans\plan.json -Force   # resume after a crash
-.\SysOrg.ps1 -UndoPlan plan-YYYYMMDD-HHMMSS
+.\SysOrg.ps1 -UndoPlan plan-YYYYMMDD-HHMMSS-mmm
 .\SysOrg.ps1 -Migrate C               # previewable plan mapping old trees to the Windows naming
 .\SysOrg.ps1 -ScheduledReport         # report-only; used by Task Scheduler
 ```
@@ -114,7 +139,7 @@ scope with the same artifact and extension protections.
 <Root>\                              (C:\Organized, or <Drive>:\_Organized)
 ├── Documents\
 │   ├── 2025\                        single documents by year (DateFolders)
-│   ├── Report\                      family: Report.docx, Report (2).docx, Report final v2.docx
+│   ├── Report\                      family: Report.docx, Report - Copy.docx, Report final v2.docx
 │   ├── Projects\Code\<name>\        whole code project folders, .git intact
 │   └── Archives\2025\
 ├── Pictures\{2025, holiday, ...}
@@ -142,15 +167,21 @@ All preferences live in `SysOrg.config.psd1` (v2.1 keys documented inline):
 | `Policy.SystemDrive` | `Scope` (KnownFolders/ExplicitPaths), `WritablePaths`, `BlockedExtensions` |
 | `Policy.ProtectedArtifacts` | Auto-protected at EVERY drive root (WindowsApps, XboxGames, ...) |
 | `Families` | MinFiles, noise tokens, `KeepDates`, `WithinTypeOnly`, `CrossTypeLink` |
-| `Copies` | `Policy` (NumberCopies/Quarantine/ReportOnly), `SuffixStyle`, `StartIndex` |
+| `Copies` | `Policy` (NumberCopies/Quarantine/ReportOnly), `SuffixStyle`, `StartIndex`, `RenameToKeeper` (opt-in keeper-stem numbering) |
 | `Downloads` | provenance `Roots`, `GroupBy` (SourceFirst/TypeFirst), `UnknownSourceFolder` |
-| `Projects` | code project folder detection and destination |
+| `Projects` | code project folder detection and destination (v2.1.1: a VCS marker or two distinct markers required) |
 | `TypeMap` | extension → routing-category overrides (legacy `Categories` still loads) |
 | `ScanRoots` | Default scan scope per drive; whole-drive scans need `-FullDrive` |
 | `Move.AllowCrossVolume` | `$true` = copy → SHA256-verify → remove source; `$false` = verified **copy-only** |
+| `ScheduledDrives` | drives in scheduled reports; `*` = every fixed (internal) drive |
 
 Deprecated v1.x keys (`Duplicates`, `Categories`, `ProjectDetection`) are mapped on load with a
-warning, so old configs keep working.
+warning, so old configs keep working. **v2.1.1: a config file that cannot be parsed makes
+SysOrg fail closed** (interactive sessions stop; `-ScheduledReport` continues with safe
+defaults after a loud warning), `Policy.ProtectedArtifacts` and the `BlockedExtensions`
+lists merge additively (built-ins cannot be removed), and a non-overridable protection
+floor (`SystemRoot`, `Program Files`, `Program Files (x86)`, `ProgramData`, `$Recycle.Bin`
+and `System Volume Information` at every fixed drive root) is always applied.
 
 ## Safety model
 
@@ -162,12 +193,24 @@ warning, so old configs keep working.
 - Protected on every drive: Windows, Program Files, ProgramData, WindowsApps, XboxGames, Boot,
   MSOCache, PerfLogs, `$Recycle.Bin`, System Volume Information, Recovery, hidden/system files,
   reparse points (junctions/symlinks), cloud placeholders, destination roots, `ExcludedPaths`,
-  and anything marked with a `.sysorg-ignore` marker
+  and anything marked with a `.sysorg-ignore` marker — plus the non-overridable v2.1.1
+  protection floor
+- Every plan action and undo-journal row is re-validated at execution time (v2.1.1):
+  canonical paths, exclusions, destination containment, reparse/placeholder refusals and a
+  plan integrity hash; failures are recorded per action, never abort the batch silently
+- Folders containing junctions or symlinks are never moved; cross-volume folder moves are
+  verified by per-file SHA256 and the source is deleted only after full verification
 - The mutability preview shows denials grouped by reason — outside the writable scope on C is
   provably untouched
-- The undo journal is written per action (crash-safe); undo verifies content hashes, restores
-  numbered copies to their original names, and skips changed files (`SkippedChanged`)
+- The undo journal is written per action and flushed to disk (`WriteThrough` + `Flush($true)`,
+  Pending row before / Done row after each move); interrupted runs resume with `-Force` and
+  orphaned `Pending` rows are resolved against the actual filesystem state; undo verifies
+  content hashes, restores copies to their original names, skips changed files
+  (`SkippedChanged`), and archives a fully-successful journal to `undo-<PlanId>.undone.csv`
+  (the plan can then be re-executed deliberately)
 - Executing a plan twice is refused; `-Force` resumes and skips journaled sources
+- Elevated sessions (running as Administrator) warn prominently and require typing `yes`
+  before any execute or undo
 - Per-file failures are logged and skipped; one bad file never aborts the batch
 
 ## Known limitations

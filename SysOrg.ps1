@@ -397,7 +397,7 @@ while($running){
                   Invoke-SysOrgPlanFile -Path $p
                 }
             '6' {
-                  $id = Read-Host 'Plan id (e.g. plan-20260101-093000)'
+                  $id = Read-Host 'Plan id (e.g. plan-20260101-093000-123)'
                   # v2.1.1: elevated sessions must type 'yes' before any undo.
                   if(-not (Confirm-SysOrgElevated)){
                       Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow

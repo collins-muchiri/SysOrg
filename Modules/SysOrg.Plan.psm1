@@ -1349,7 +1349,7 @@ function Undo-SysOrgPlan {
     and re-checked (exclusion, reparse point, cloud placeholder) BEFORE anything moves,
     so a tampered journal cannot move arbitrary files.
 .EXAMPLE
-    Undo-SysOrgPlan -PlanId plan-20260101-093000 -AppRoot C:\SysOrg -Config $cfg
+    Undo-SysOrgPlan -PlanId plan-20260101-093000-123 -AppRoot C:\SysOrg -Config $cfg
 #>
     param([Parameter(Mandatory)][string]$PlanId,[Parameter(Mandatory)][string]$AppRoot,$Config)
     if("$PlanId" -notmatch $script:PlanIdPattern){

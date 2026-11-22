@@ -1,5 +1,5 @@
 @{
-    Version = '2.1.0'
+    Version = '2.1.1'
 
     # Naming preset for the organized roots:
     #   Windows  = Documents, Pictures, Videos, Music, Downloads   (Windows known-folder names)

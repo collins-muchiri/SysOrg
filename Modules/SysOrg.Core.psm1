@@ -162,7 +162,7 @@ function Import-SysOrgConfig {
     [CmdletBinding()]
     param([string]$Path,[string]$AppRoot,[switch]$AllowDegradedMode)
     $defaults = @{
-        Version          = '2.1.0'
+        Version          = '2.1.1'
         NamingPreset     = 'Windows'
         DestinationStyle = 'OrganizedRoot'
         OrganizedRoots   = @{ '*' = '__AUTO__' }

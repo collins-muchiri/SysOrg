@@ -2,6 +2,125 @@
 
 All notable changes to SysOrg. Versions follow [SemVer](https://semver.org/).
 
+## [2.1.1] - 2026-11-22 - Security and quality hardening (audit follow-up)
+
+Hardening release based on a full security/quality audit of v2.1.0. All core guarantees
+are preserved (never overwrite, never delete user data, preview before execute, crash-safe
+undo journal). Public function names and CLI parameters are unchanged; new helpers follow
+the `*-SysOrg*` naming.
+
+### Added
+- **Executor re-validation (High #1):** `Invoke-SysOrgPlan` treats the plan JSON as untrusted
+  input. Every action is re-validated at execution time: canonical path forms
+  (`Get-SysOrgCanonicalPlanPath` - no `..` segments, no 8.3 short names, no `\\?\` namespace,
+  absolute only), exclusion re-check on the source parent, reparse-point and cloud-placeholder
+  refusals, mutability re-check against a fresh drive profile for the plan's drive, and
+  destination containment inside the plan root (or resolved known folders when
+  `DestinationStyle='KnownFolders'`). Validation failures are recorded per action as `Failed`
+  with a reason - a bad action never aborts the whole run. The executor summary now counts
+  `Skipped`.
+- **Plan integrity hash:** `Save-SysOrgPlan` stores a SHA256 of the canonical action list
+  (`Get-SysOrgPlanIntegrityHash`); the executor verifies it and refuses a hand-edited or
+  corrupted plan unless `-Force` is passed (loud warning either way).
+- **Plan-time snapshot:** every file action carries `PlannedLength` and
+  `PlannedLastWriteTimeUtc`; sources that changed since planning are skipped
+  (`changed since plan`) and counted as `Skipped`. Older plans without the snapshot are
+  handled gracefully with a warning.
+- **Tamper-proof undo:** `Undo-SysOrgPlan` validates the `PlanId` format and canonicalizes
+  and re-checks every journal row's `CurrentLocation` and `OriginalSource` - a tampered
+  journal cannot move arbitrary files.
+- **Fail-closed configuration (High #2):** a config file that exists but cannot be parsed
+  now makes `Import-SysOrgConfig` THROW. Report-only/scheduled sessions may pass
+  `-AllowDegradedMode` (or run `-ScheduledReport`, which does) to continue with safe
+  defaults after a loud warning.
+- **Non-overridable protection floor:** `$env:SystemRoot`, `$env:ProgramFiles`,
+  `${env:ProgramFiles(x86)}`, `$env:ProgramData`, plus `$Recycle.Bin` and
+  `System Volume Information` at every fixed drive root are ALWAYS appended to
+  `ExcludedPaths` after the merge, independent of `Policy.ProtectedArtifacts`.
+- **Additive protection merges:** `Policy.ProtectedArtifacts` and the per-scope
+  `BlockedExtensions` lists merge additively (`Join-SysOrgProtectedList`) - a user config
+  can add entries but cannot remove built-ins; removal attempts are re-added with a warning.
+- **`Resolve-SysOrgWritablePath`:** `-WritablePath` input is resolved to a full canonical
+  path (a relative path used to be stored raw and never matched).
+- **Known-folder sanity check:** `Test-SysOrgKnownFolderPath` rejects known folders
+  redirected to a drive root, the profile root, or a parent of the Windows / Program Files
+  folders (ignored with a warning).
+- **Multi-label public suffixes (item 3):** `Get-SysOrgSourceBucket` honors a compact
+  table of common second-level suffixes - `www.kra.go.ke` -> `Kra`,
+  `safaricom.co.ke` -> `Safaricom`, `example.co.uk` -> `Example`. IP-address hosts and
+  `localhost` fall through to the filename heuristics; every bucket passes through
+  `Get-SysOrgSafeFolderName` (`nul.com` -> `_Nul`).
+- **MPEG transport stream sniffing:** real `.ts` transport streams (0x47 sync bytes at
+  offsets 0 and 188) route to Videos via `Test-SysOrgMpegTransportStream` (read-only,
+  189-byte sniff, after the placeholder gates).
+- **Stricter project detection (item 5):** a project folder requires a VCS marker
+  (`.git`, `.hg`, `.svn`, `.jj`) or at least two distinct markers; a lone `.gitignore`,
+  `Makefile` or lock file is not a project.
+- **Folder-move safety:** `Invoke-SysOrgSafeMoveFolder` walks the tree reparse-point-aware
+  (`Test-SysOrgFolderHasReparsePoint`) and REFUSES folders containing any junction or
+  symlink, or trees that cannot be fully enumerated; cross-volume moves verify per-file
+  SHA256 over matching relative paths, enumerate without `SilentlyContinue` on either
+  side, and delete the source only after full verification.
+- **Folder-move preview stats:** per folder move the preview shows the file count, the
+  number of non-code files (`Get-SysOrgFolderMoveStats`), and BLOCKED-EXTENSION files
+  outside build-output directories (documented choice: surfaced in the preview, the
+  folder still moves).
+- **OneDrive account detection (item 8):** `Get-SysOrgOneDriveRoots` /
+  `Test-SysOrgUnderOneDrive` consider `$env:OneDrive`, `$env:OneDriveCommercial`,
+  `$env:OneDriveConsumer` and the `HKCU:\Software\Microsoft\OneDrive\Accounts\*\UserFolder`
+  registry values; matching is case-insensitive and segment-safe. Replaces five duplicated
+  inline blocks (four in `New-SysOrgPlan`, one in `Get-SysOrgKnownFolders`).
+- **Crash-durable journal (item 9):** the undo journal opens with `WriteThrough` and every
+  row is flushed to disk (`Flush($true)`); a `Pending` row is written before each move and
+  a `Done` row after; on resume, orphaned `Pending` rows are resolved against the actual
+  filesystem state (skip-as-done when the source is gone, retry when it is present);
+  after a FULLY successful undo the journal is renamed to `undo-<PlanId>.undone.csv` so
+  the plan can be re-executed deliberately.
+- **Proper CSV escaping:** journal and provenance rows are written through
+  `ConvertTo-SysOrgCsvField`, so commas and quotes in untrusted URLs and file names survive
+  a CSV round trip (column layout backward compatible).
+- **Elevated-session gating (item 10):** the CLI warns prominently when running as
+  Administrator, and any execute or undo additionally requires typing `yes`
+  (`Confirm-SysOrgElevated`).
+- **Millisecond plan IDs (item 10):** `plan-yyyyMMdd-HHmmss-fff` / `migrate-...-fff` - two
+  plans within the same second can no longer collide; the executor regex accepts both the
+  old and the new format.
+- **Release pipeline (Phase 4):** `release.yml` builds `SysOrg-<version>.zip` from tracked
+  files only on `v*` tags, publishes it with a `SHA256SUMS` file, and contains a clearly
+  marked OPTIONAL Authenticode signing step that is skipped without certificate secrets.
+
+### Changed
+- **Copies keep their own names (item 6):** under `NumberCopies`, a copy keeps its OWN stem
+  and extension and is numbered only when the name collides in the destination folder.
+  `Copies.RenameToKeeper` (default `$false`) restores the v2.1.0 keeper-stem numbering as an
+  opt-in; validated in `Test-SysOrgConfig` and documented in the config file.
+- **`.ts` maps to Code only (item 4):** the duplicate `.ts` entry (Videos AND Code) is gone -
+  with undefined hashtable enumeration order on Windows PowerShell 5.1, a `.ts` file could
+  route differently per process. `ExtToCategory` is built deterministically
+  (`Keys | Sort-Object`).
+- **Scheduled reports (item 7):** `New-SysOrgScanReport` (and the folder-audit report)
+  write under `<AppRoot>\Reports\` instead of drive roots; the undefined `$prof` is fixed
+  (the drive profile is built fresh or accepted via the new optional `-DriveProfile`
+  parameter); drives with empty scan roots are skipped instead of producing empty reports;
+  the `*` default of `ScheduledDrives` covers fixed, non-removable drives only.
+- **CI (Phase 4):** least privilege (`contents: read`), `actions/checkout` pinned to a
+  commit SHA (v4.2.2), Pester pinned to 5.7.1 and PSScriptAnalyzer to 1.24.0, and an extra
+  PowerShell 7 test leg next to the Windows PowerShell 5.1 leg. PSScriptAnalyzer settings
+  now report Warning severity (printed; only Errors fail the build).
+- **Uninstaller:** the cleanup prompt states that deleting `Undo\` removes the ability to
+  undo past organizing (default stays "No"); "Scheduled task removed" is only printed when
+  a task was actually removed.
+- **Cross-volume hash reuse (item 10):** `Invoke-SysOrgSafeMove` accepts an optional
+  `-ExpectedHash`, so a pre-move hash is not computed twice.
+- **`Test-SysOrgElevated`** no longer throws on non-Windows hosts (returns `$false`).
+- Version bumped to 2.1.1 in `SysOrg.config.psd1` and the `Import-SysOrgConfig` defaults.
+
+### Fixed
+- The misleading config comment claiming `Policy.ProtectedArtifacts` "cannot be opted away
+  by accident" - they could be; now they genuinely cannot (additive merge + floor).
+- Weekly reports no longer write to drive roots and the "Drive profile" report line
+  actually prints (was an undefined `$prof`).
+
 ## [2.1.0] - 2026-11-20 - Windows-native, type-first, numbered copies
 
 Revision 2.1 (milestone M4, work items W1-W12) - see `ORGANIZATION-DESIGN.md`.
