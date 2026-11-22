@@ -745,3 +745,89 @@ Describe 'Smaller hardening items (v2.1.1)' {
         ($r -is [bool]) -or ($null -ne $r) | Should -BeTrue
     }
 }
+
+Describe 'Honest skip taxonomy (v3.0.1 A3)' {
+
+    It 'real plans tag skipped rows Protected / Preserved; Mutability.Denied counts ONLY protected rows' {
+        $sysProf = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='System'; ProposedScope='KnownFolders'
+            KnownFolders=@([pscustomobject]@{ Name='Documents'; Path='C:\Users\t\Documents'; IsRedirected=$false; UnderOneDrive=$false })
+            DownloadRoots=@('C:\Users\t\Downloads') }
+        $mk = { param($p,$ext,$cat)
+            [pscustomobject]@{ FullName=$p; Name=(Split-Path $p -Leaf); Stem=([System.IO.Path]::GetFileNameWithoutExtension($p))
+                Extension=$ext; Length=[long]5; LastWriteTime=(Get-Date '2026-02-03'); Directory=(Split-Path $p -Parent); Category=$cat } }
+        $ok  = & $mk 'C:\Users\t\Documents\note.txt' '.txt' 'Documents'
+        $dll = & $mk 'C:\Users\t\Documents\lib.dll' '.dll' 'Other'
+        $album = @(1..5 | ForEach-Object { & $mk ("C:\Users\t\Documents\Album\pic$_.jpg") '.jpg' 'Images' })
+        $mCfg = @{ OrganizedRoots=@{ 'C'='C:\Organized' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                   SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+                   PreserveExistingFolders=$true; PreserveMinFiles=5; PreserveSingleCategoryRatio=0.9
+                   Copies=@{Policy='NumberCopies';StartIndex=2;MinFileSizeKB=1}; Families=@{Enabled=$false}
+                   Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; DateFolders='Year'
+                   LayoutProfile='Windows'
+                   Policy=@{ SystemDrive=@{ Scope='KnownFolders'; WritablePaths=@(); BlockedExtensions=@('.dll'); AllowInstallersInDownloads=$true }
+                             DataDrives=@{ Scope='FullDrive' } } }
+        $plan = New-SysOrgPlan -Letter C -Inventory (@($ok,$dll) + $album) -DriveProfile $sysProf -DupGroups @() -Config $mCfg -KnownFolders @($sysProf.KnownFolders)
+        ($plan.Skipped | Where-Object { $_.Source -eq $dll.FullName }).Group | Should -Be 'Protected'
+        $albumSkip = @($plan.Skipped | Where-Object { $_.Source -like 'C:\Users\t\Documents\Album\*' })
+        $albumSkip.Count | Should -Be 5
+        $albumSkip[0].Group | Should -Be 'Preserved'
+        $albumSkip[0].Reason | Should -Match 'preserved'
+        # the OLD behaviour counted every skip as 'denied (provably never touched)';
+        # the honest engine counts only what the mutability engine refused
+        $plan.Mutability.DeniedTotal | Should -Be 1
+        $tax = Get-SysOrgSkipTaxonomy -Plan $plan
+        $tax.ProtectedCount | Should -Be 1
+        $tax.PreservedCount | Should -Be 5
+        $tax.DecisionCount  | Should -Be 0
+        $tax.Planned        | Should -Be 1
+    }
+
+    It 'taxonomy builds the exact headline, per-reason counts and one example each' {
+        $plan = [pscustomobject]@{
+            PlanId='plan-tax'; Drive='C:'; DestinationRoot='C:\Organized'
+            Actions=@([pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\a\n.txt'; Destination='C:\Organized\Documents\2026\n.txt' })
+            Skipped=@(
+                [pscustomobject]@{ Source='C:\s1'; Reason='Blocked extension .dll'; Group='Protected' }
+                [pscustomobject]@{ Source='C:\s2'; Reason='Blocked extension .dll'; Group='Protected' }
+                [pscustomobject]@{ Source='C:\s3'; Reason='Inside a folder that already looks organized (preserved)'; Group='Preserved' }
+                [pscustomobject]@{ Source='C:\s4'; Reason='Path >= 260 characters (recorded; PowerShell 5.1 cannot address it)'; Group='Other' }
+            )
+            NeedsDecision=@([pscustomobject]@{ Source='C:\s5'; Confidence=0.3; Disposition='left in place' })
+            Stats=[pscustomobject]@{ Scanned=100; Routed=1 }
+        }
+        $tax = Get-SysOrgSkipTaxonomy -Plan $plan
+        $tax.Headline | Should -Be '100 scanned: 1 planned, 1 preserved, 2 protected, 1 need a decision.'
+        $tax.UntouchedPct | Should -Be 99
+        $tax.ProtectedRows.Count | Should -Be 1
+        $tax.ProtectedRows[0].Reason  | Should -Be 'Blocked extension .dll'
+        $tax.ProtectedRows[0].Count   | Should -Be 2
+        $tax.ProtectedRows[0].Example | Should -Be 'C:\s1'
+        $tax.PreservedRows[0].Example | Should -Be 'C:\s3'
+        $tax.DecisionCount | Should -Be 1
+        $tax.DecisionExamples[0] | Should -Be 'C:\s5'
+        $tax.OtherRows[0].Reason | Should -Match '260 characters'
+    }
+
+    It 'legacy plans (rows without Group tags) still classify honestly' {
+        (Get-SysOrgSkipGroupFromReason -Reason 'Blocked extension .dll') | Should -Be 'Protected'
+        (Get-SysOrgSkipGroupFromReason -Reason 'Outside writable scope on system drive') | Should -Be 'Protected'
+        (Get-SysOrgSkipGroupFromReason -Reason 'Needs a decision: confidence 0.3 below 0.4 (default)') | Should -Be 'Decision'
+        (Get-SysOrgSkipGroupFromReason -Reason 'Already in its destination (idempotent re-plan)') | Should -Be 'Preserved'
+        (Get-SysOrgSkipGroupFromReason -Reason 'Inside a detected code project folder (moved as one unit)') | Should -Be 'Preserved'
+        (Get-SysOrgSkipGroupFromReason -Reason 'Path >= 260 characters (recorded)') | Should -Be 'Other'
+        $plan = [pscustomobject]@{
+            PlanId='plan-legacy'; Drive='C:'; DestinationRoot='C:\Organized'
+            Actions=@()
+            Skipped=@(
+                [pscustomobject]@{ Source='C:\s1'; Reason='Outside writable scope on system drive' }
+                [pscustomobject]@{ Source='C:\s2'; Reason='Already in its destination (idempotent re-plan)' }
+            )
+            NeedsDecision=@()
+            Stats=[pscustomobject]@{ Scanned=50; Routed=0 }
+        }
+        $tax = Get-SysOrgSkipTaxonomy -Plan $plan
+        $tax.ProtectedCount | Should -Be 1
+        $tax.PreservedCount | Should -Be 1
+        $tax.Headline | Should -Be '50 scanned: 0 planned, 1 preserved, 1 protected, 0 need a decision.'
+    }
+}

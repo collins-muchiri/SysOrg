@@ -171,10 +171,20 @@ function New-SysOrgPlan {
 
     # NOTE: this nested helper only MUTATES objects ($skipped list, $mutDenied h[hashtable) -
     # scalar counters would be rebound in the child scope, a classic PowerShell trap.
+    # v3.0.1 A3: every skip carries an honest group tag:
+    #   Protected = the mutability engine refused (provably never touched)
+    #   Preserved = intentionally left alone (organized folders, project units, user
+    #               collections, idempotent re-plans)
+    #   Decision  = below the confidence floor - needs a human decision
+    #   Other     = recorded but not planned (long paths, system types, analysis errors)
+    # Only Protected rows count into Mutability.Denied - preserved and needs-a-decision
+    # files were never 'denied by mutability'.
     function Add-SysOrgPlanSkip {
-        param([string]$Source,[string]$Reason)
-        $skipped.Add([pscustomobject]@{ Source=$Source; Reason=$Reason })
-        if($mutDenied.ContainsKey($Reason)){ $mutDenied[$Reason]++ } else { $mutDenied[$Reason] = 1 }
+        param([string]$Source,[string]$Reason,[string]$Group='Other')
+        $skipped.Add([pscustomobject]@{ Source=$Source; Reason=$Reason; Group=$Group })
+        if($Group -eq 'Protected'){
+            if($mutDenied.ContainsKey($Reason)){ $mutDenied[$Reason]++ } else { $mutDenied[$Reason] = 1 }
+        }
     }
     function Test-SysOrgPlanPreservedDir {
         param([string]$Directory)
@@ -206,14 +216,14 @@ function New-SysOrgPlan {
             if([string]::IsNullOrWhiteSpace($src)){ continue }
             # 0) recorded but never planned (P2-5)
             if("$($f.Category)" -eq 'SkippedLongPath'){
-                Add-SysOrgPlanSkip -Source $src -Reason 'Path >= 260 characters (recorded; PowerShell 5.1 cannot address it)'
+                Add-SysOrgPlanSkip -Source $src -Reason 'Path >= 260 characters (recorded; PowerShell 5.1 cannot address it)' -Group 'Other'
                 continue
             }
             if(Test-SysOrgDestinationPath -Path $src -Config $Config){ continue }
             # protected path (mutability engine, row 1 of the policy matrix)
             $parentDir = Split-Path $src -Parent
             if(Test-SysOrgExcludedPath -Path $parentDir -Config $Config){
-                Add-SysOrgPlanSkip -Source $src -Reason 'Protected path'
+                Add-SysOrgPlanSkip -Source $src -Reason 'Protected path' -Group 'Protected'
                 continue
             }
             # 2) code project folders move as one unit - their files are not planned individually
@@ -224,20 +234,20 @@ function New-SysOrgPlan {
                 $cur = Split-Path $cur -Parent
             }
             if($inProject){
-                Add-SysOrgPlanSkip -Source $src -Reason 'Inside a detected code project folder (moved as one unit)'
+                Add-SysOrgPlanSkip -Source $src -Reason 'Inside a detected code project folder (moved as one unit)' -Group 'Preserved'
                 continue
             }
             # preservation: organized heuristic + localized category recognition (W2)
             $pres = Test-SysOrgPlanPreservedDir -Directory $parentDir
-            if($pres){ Add-SysOrgPlanSkip -Source $src -Reason $pres; continue }
+            if($pres){ Add-SysOrgPlanSkip -Source $src -Reason $pres -Group 'Preserved'; continue }
             # 1) mutability engine (W3)
             $mut = Test-SysOrgFileMutable -Path $src -Extension "$($f.Extension)" -DriveProfile $DriveProfile -Config $Config
             if(-not $mut.Allowed){
-                Add-SysOrgPlanSkip -Source $src -Reason "$($mut.Reason)"
+                Add-SysOrgPlanSkip -Source $src -Reason "$($mut.Reason)" -Group 'Protected'
                 continue
             }
             if("$($f.Category)" -eq 'SKIP'){
-                Add-SysOrgPlanSkip -Source $src -Reason 'Non-organizable type (system PerceivedType)'
+                Add-SysOrgPlanSkip -Source $src -Reason 'Non-organizable type (system PerceivedType)' -Group 'Other'
                 continue
             }
             $mutAllowed++
@@ -301,7 +311,7 @@ function New-SysOrgPlan {
                         [void]$needsDecision.Add([pscustomobject]@{ Source=$src; Confidence=$dec.Confidence; Disposition='moved to review folder' })
                     } else {
                         [void]$needsDecision.Add([pscustomobject]@{ Source=$src; Confidence=$dec.Confidence; Disposition='left in place' })
-                        Add-SysOrgPlanSkip -Source $src -Reason ('Needs a decision: confidence {0} below {1} ({2})' -f $dec.Confidence, $minConfidence, $dec.RuleId)
+                        Add-SysOrgPlanSkip -Source $src -Reason ('Needs a decision: confidence {0} below {1} ({2})' -f $dec.Confidence, $minConfidence, $dec.RuleId) -Group 'Decision'
                         continue
                     }
                 }
@@ -333,7 +343,7 @@ function New-SysOrgPlan {
             $partitionLookup[$src] = $pk
             [void]$routed.Add($f)
         } catch {
-            Add-SysOrgPlanSkip -Source $src -Reason ("Analysis error: {0}" -f $_.Exception.Message)
+            Add-SysOrgPlanSkip -Source $src -Reason ("Analysis error: {0}" -f $_.Exception.Message) -Group 'Other'
         }
     }
     if($capped){ [void]$warnings.Add(("Plan capped at {0} actions; the remaining files were skipped this run." -f $maxActions)) }
@@ -486,7 +496,7 @@ function New-SysOrgPlan {
             $srcN = ("$src").Replace('/','\').TrimEnd('\')
             $destN = ("$dest").Replace('/','\').TrimEnd('\')
             if($srcN -ieq $destN){
-                Add-SysOrgPlanSkip -Source $src -Reason 'Already in its destination (idempotent re-plan)'
+                Add-SysOrgPlanSkip -Source $src -Reason 'Already in its destination (idempotent re-plan)' -Group 'Preserved'
                 continue
             }
             # v3.0 Findable: keep every destination inside the character budget with
@@ -524,7 +534,7 @@ function New-SysOrgPlan {
             })
             $actionFolderBySrc[$src] = $destFolder
         } catch {
-            Add-SysOrgPlanSkip -Source $src -Reason ("Routing error: {0}" -f $_.Exception.Message)
+            Add-SysOrgPlanSkip -Source $src -Reason ("Routing error: {0}" -f $_.Exception.Message) -Group 'Other'
         }
     }
 
@@ -689,7 +699,7 @@ function New-SysOrgPlan {
         try{
             $mut = Test-SysOrgFileMutable -Path "$($pf.Path)" -Extension '' -DriveProfile $DriveProfile -Config $Config -Container
             if(-not $mut.Allowed){
-                Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder not moved: {0}" -f $mut.Reason)
+                Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder not moved: {0}" -f $mut.Reason) -Group 'Protected'
                 continue
             }
             $db = Get-SysOrgDestinationBase -RelBase $docMap -DriveProfile $DriveProfile -Config $Config -KnownFolders $KnownFolders
@@ -720,7 +730,7 @@ function New-SysOrgPlan {
                 DifferentContent=$false; OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
             })
         } catch {
-            Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder error: {0}" -f $_.Exception.Message)
+            Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder error: {0}" -f $_.Exception.Message) -Group 'Other'
         }
     }
 
@@ -1008,6 +1018,129 @@ function Show-SysOrgPreviewTree {
     }
 }
 
+function Get-SysOrgSkipGroupFromReason {
+<#
+.SYNOPSIS
+    Legacy-plan fallback: classifies a skip reason into the A3 taxonomy group.
+.DESCRIPTION
+    Plans saved before v3.0.1 carry no Group tag on their skipped rows; this maps
+    the documented reason strings of those plans onto the honest taxonomy:
+    Protected (mutability engine) / Preserved (by design) / Decision / Other.
+.EXAMPLE
+    Get-SysOrgSkipGroupFromReason -Reason 'Outside writable scope on system drive'   # -> 'Protected'
+#>
+    param([string]$Reason)
+    $r = "$Reason"
+    if([string]::IsNullOrWhiteSpace($r)){ return 'Other' }
+    if($r.StartsWith('Needs a decision', [StringComparison]::OrdinalIgnoreCase)){ return 'Decision' }
+    foreach($p in @('Protected path','Blocked extension','Installer outside download roots','Outside writable scope')){
+        if($r.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)){ return 'Protected' }
+    }
+    if($r.StartsWith('Project folder not moved', [StringComparison]::OrdinalIgnoreCase)){ return 'Protected' }
+    foreach($p in @('Inside a detected code project folder','Inside a folder that already looks organized','Existing ','Already in its destination','Inside a user collection')){
+        if($r.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)){ return 'Preserved' }
+    }
+    return 'Other'
+}
+
+function Get-SysOrgSkipTaxonomy {
+<#
+.SYNOPSIS
+    The honest skip taxonomy of a plan (v3.0.1 A3).
+.DESCRIPTION
+    Replaces the old 'Mutability: N denied (provably never touched)' line, which
+    folded preserved and needs-a-decision files into 'denied'. Returns:
+      - Scanned      : every file the scan saw (plan.Stats.Scanned)
+      - Planned      : file moves in the plan
+      - Protected    : count + per-reason counts + one example each - the mutability
+                       engine refused (system paths, blocked extensions, scope)
+      - Preserved    : count + reasons - left alone BY DESIGN (organized-folder
+                       heuristic, project units, user collections, already in place)
+      - Decision     : count - below the confidence floor, needs a human decision
+                       (authoritative: the plan's NeedsDecision list)
+      - Other        : count + reasons - recorded but not planned (long paths,
+                       system PerceivedType, analysis errors)
+      - UntouchedPct : percentage of scanned files that stay untouched
+    Deterministic: reasons sorted by count descending, then natural order.
+.EXAMPLE
+    $tax = Get-SysOrgSkipTaxonomy -Plan $plan
+    $tax.Headline   # -> '9,579 scanned: 11 planned, 9,518 preserved, 50 protected, 0 need a decision.'
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan)
+    $scanned = 0
+    if($Plan.PSObject.Properties['Stats'] -and $Plan.Stats -and $Plan.Stats.PSObject.Properties['Scanned']){ $scanned = [int]$Plan.Stats.Scanned }
+    $planned = 0
+    foreach($a in @($Plan.Actions)){
+        if("$($a.Action)" -ne 'Move'){ continue }
+        if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
+        $planned++
+    }
+
+    # reason -> count per group, plus one deterministic example per reason
+    $byGroup = @{ Protected=@{}; Preserved=@{}; Decision=@{}; Other=@{} }
+    $examples = @{}
+    foreach($s in @($Plan.Skipped)){
+        $g = ''
+        if($s.PSObject.Properties['Group'] -and "$($s.Group)"){ $g = "$($s.Group)" }
+        else { $g = Get-SysOrgSkipGroupFromReason -Reason "$($s.Reason)" }
+        if(-not $byGroup.ContainsKey($g)){ $g = 'Other' }
+        $r = "$($s.Reason)"
+        if(-not $byGroup[$g].ContainsKey($r)){ $byGroup[$g][$r] = 0 }
+        $byGroup[$g][$r]++
+        if(-not $examples.ContainsKey($r)){ $examples[$r] = "$($s.Source)" }
+    }
+
+    function ConvertTo-SysOrgGroupRows {
+        param([hashtable]$ReasonMap,[hashtable]$Examples)
+        $rows = @()
+        foreach($r in ($ReasonMap.Keys | Sort-Object)){ $rows += [pscustomobject]@{ Reason=$r; Count=[int]$ReasonMap[$r]; Example=[string]$Examples[$r] } }
+        return @($rows | Sort-Object -Property @{e={$_.Count}}, @{e={$_.Reason}} -Descending:$false)
+    }
+    # deterministic: highest count first, ties by natural reason order
+    function Sort-SysOrgTaxonomyRows {
+        param($Rows)
+        return @($Rows | Sort-Object -Property @{e={ -$_.Count }}, @{e={ "$($_.Reason)" }})
+    }
+
+    # needs-a-decision: the authoritative source is the plan's NeedsDecision list
+    # (Review.Mode='Move' files them under _Review - planned, NOT skipped)
+    $decisionCount = 0
+    if($Plan.PSObject.Properties['NeedsDecision']){ $decisionCount = @($plan.NeedsDecision).Count }
+    $decisionRows = @(ConvertTo-SysOrgGroupRows -ReasonMap $byGroup['Decision'] -Examples $examples)
+    $decisionExamples = @()
+    if($Plan.PSObject.Properties['NeedsDecision'] -and @($Plan.NeedsDecision).Count -gt 0){
+        $decisionExamples = @(@($Plan.NeedsDecision) | Select-Object -First 3 | ForEach-Object { "$($_.Source)" })
+    }
+    elseif($decisionRows.Count -gt 0){ $decisionExamples = @($decisionRows[0].Example) }
+
+    $protectedRows = @(Sort-SysOrgTaxonomyRows -Rows (ConvertTo-SysOrgGroupRows -ReasonMap $byGroup['Protected'] -Examples $examples))
+    $preservedRows = @(Sort-SysOrgTaxonomyRows -Rows (ConvertTo-SysOrgGroupRows -ReasonMap $byGroup['Preserved'] -Examples $examples))
+    $otherRows     = @(Sort-SysOrgTaxonomyRows -Rows (ConvertTo-SysOrgGroupRows -ReasonMap $byGroup['Other'] -Examples $examples))
+    $protectedCount = 0; foreach($r in $protectedRows){ $protectedCount += $r.Count }
+    $preservedCount = 0; foreach($r in $preservedRows){ $preservedCount += $r.Count }
+    $otherCount = 0; foreach($r in $otherRows){ $otherCount += $r.Count }
+
+    $untouched = $scanned - $planned
+    $untouchedPct = 0.0
+    if($scanned -gt 0){ $untouchedPct = [Math]::Round(100.0 * $untouched / $scanned, 1) }
+    $fmt = [System.Globalization.CultureInfo]::InvariantCulture
+    $headline = ('{0} scanned: {1} planned, {2} preserved, {3} protected, {4} need a decision.' -f `
+        ([string]::Format($fmt, '{0:N0}', $scanned)), ([string]::Format($fmt, '{0:N0}', $planned)),
+        ([string]::Format($fmt, '{0:N0}', $preservedCount)), ([string]::Format($fmt, '{0:N0}', $protectedCount)),
+        ([string]::Format($fmt, '{0:N0}', $decisionCount)))
+
+    return [pscustomobject]@{
+        Scanned=$scanned; Planned=$planned
+        ProtectedCount=$protectedCount; ProtectedRows=$protectedRows
+        PreservedCount=$preservedCount; PreservedRows=$preservedRows
+        DecisionCount=$decisionCount;   DecisionRows=$decisionRows; DecisionExamples=$decisionExamples
+        OtherCount=$otherCount;         OtherRows=$otherRows
+        Untouched=$untouched; UntouchedPct=$untouchedPct
+        Headline=$headline
+    }
+}
+
 function Show-SysOrgPlan {
 <#
 .SYNOPSIS
@@ -1050,17 +1183,39 @@ function Show-SysOrgPlan {
         foreach($w in @($Plan.Warnings)){ Write-Host ("WARNING: {0}" -f $w) -ForegroundColor Yellow }
     }
 
-    # 12.2 mutability summary
-    if($showDenied -and $Plan.PSObject.Properties['Mutability'] -and $Plan.Mutability){
-        $m = $Plan.Mutability
-        Write-Host ''
-        Write-Host ("Mutability: {0} file(s) allowed; {1} denied (provably never touched):" -f $m.Allowed, $m.DeniedTotal) -ForegroundColor White
-        foreach($d in @($m.Denied)){
-            Write-Host ("  {0}  x{1}" -f $d.Reason, $d.Count) -ForegroundColor Yellow
+    # 12.2 mutability summary - v3.0.1 A3: the honest skip taxonomy. The old
+    # 'Mutability: N denied (provably never touched)' line folded preserved files
+    # (organized folders, project units) and needs-a-decision files into 'denied'.
+    $tax = Get-SysOrgSkipTaxonomy -Plan $Plan
+    Write-Host ''
+    Write-Host $tax.Headline -ForegroundColor White
+    Write-Host ('  {0}% of scanned files stay untouched.' -f $tax.UntouchedPct) -ForegroundColor Gray
+    if($showDenied){
+        if($tax.ProtectedCount -gt 0){
+            Write-Host ('  Protected/denied (mutability engine): {0}' -f $tax.ProtectedCount) -ForegroundColor Yellow
+            foreach($d in $tax.ProtectedRows){
+                Write-Host ('    x{0}  {1}' -f $d.Count, $d.Reason) -ForegroundColor Yellow
+                Write-Host ('      e.g. {0}' -f $d.Example) -ForegroundColor DarkYellow
+            }
         }
-        $deniedReasons = @(@($m.Denied) | ForEach-Object { "$($_.Reason)" })
-        $samples = @(@($Plan.Skipped) | Where-Object { $deniedReasons -contains "$($_.Reason)" } | Select-Object -First 5)
-        foreach($s in $samples){ Write-Host ("    e.g. {0}" -f $s.Source) -ForegroundColor DarkYellow }
+        if($tax.PreservedCount -gt 0){
+            Write-Host ('  Preserved by design (organized folders, project units, user collections): {0}' -f $tax.PreservedCount) -ForegroundColor Green
+            foreach($d in $tax.PreservedRows){
+                Write-Host ('    x{0}  {1}' -f $d.Count, $d.Reason) -ForegroundColor DarkGreen
+                Write-Host ('      e.g. {0}' -f $d.Example) -ForegroundColor DarkYellow
+            }
+        }
+        if($tax.DecisionCount -gt 0){
+            Write-Host ('  Left for a decision (low confidence): {0}' -f $tax.DecisionCount) -ForegroundColor Yellow
+            foreach($ex in (@($tax.DecisionExamples) | Select-Object -First 3)){ Write-Host ('      e.g. {0}' -f $ex) -ForegroundColor DarkYellow }
+        }
+        if($tax.OtherCount -gt 0){
+            Write-Host ('  Recorded, not planned (other): {0}' -f $tax.OtherCount) -ForegroundColor Gray
+            foreach($d in $tax.OtherRows){
+                Write-Host ('    x{0}  {1}' -f $d.Count, $d.Reason) -ForegroundColor DarkGray
+                Write-Host ('      e.g. {0}' -f $d.Example) -ForegroundColor DarkGray
+            }
+        }
     }
 
     # 12.1 destination tree
