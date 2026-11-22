@@ -3,5 +3,7 @@ Logs/
 Plans/
 Undo/
 Cache/
+Reports/
+BenchmarkCorpus/
 *.log
 *.zip

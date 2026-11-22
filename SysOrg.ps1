@@ -16,7 +16,10 @@
                 .\SysOrg.ps1 -ExecutePlan <plan> -Force   (resume after a crash; journaled actions skipped)
                 .\SysOrg.ps1 -UndoPlan plan-20260101-093000
                 .\SysOrg.ps1 -Migrate C              (map old Photo/Video/... trees to the Windows naming; preview first)
+                .\SysOrg.ps1 -MigrateProfile Findable (v3.0: migrate the v2.1 layout to the Findable layout; preview first)
                 .\SysOrg.ps1 -ScheduledReport        (report-only, used by Task Scheduler)
+                .\SysOrg.ps1 -Benchmark              (v3.0 Phase 0: corpus + cold/warm scan, duplicates, plan, execute timings)
+                .\SysOrg.ps1 -Benchmark -BenchmarkFiles 20000 -BenchmarkCorpus D:\corpus
 #>
 [CmdletBinding()]
 param(
@@ -25,6 +28,7 @@ param(
     [string[]]$ScanDrive,
     [string[]]$AuditDrive,
     [string[]]$Migrate,
+    [string]$MigrateProfile,
     [switch]$ReportOnly,
     [switch]$FullDrive,
     [switch]$NoCache,
@@ -33,7 +37,15 @@ param(
     [string]$ExecutePlan,
     [string]$UndoPlan,
     [switch]$ScheduledReport,
-    [string]$ConfigPath
+    [string]$ConfigPath,
+    [switch]$Benchmark,
+    [int]$BenchmarkFiles = 100000,
+    [string]$BenchmarkCorpus,
+    [int]$BenchmarkSeed = 42,
+    [string]$Find,
+    [string]$Explain,
+    [switch]$Score,
+    [int]$Parallelism = 0
 )
 $ErrorActionPreference = 'Stop'
 $appRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -290,6 +302,105 @@ function Invoke-SysOrgPlanFile {
     Write-Host ("Undo journal: {0}" -f $res.UndoFile)
 }
 
+function Invoke-SysOrgBenchmarkFlow {
+<#
+.SYNOPSIS
+    v3.0 Phase 0: measures cold scan, warm scan, duplicate detection, plan build and
+    execute on the synthetic corpus and writes a benchmark report.
+.DESCRIPTION
+    Never prompts and never touches anything inside the corpus except the generated
+    '_Organized' and '_SysOrgApp' subfolders (destination root + app folders for the
+    benchmark session). The report lands in <AppRoot>\Reports\benchmark-<stamp>.md.
+    Peak memory is the process-wide PeakWorkingSet64 sampled after each step (cumulative
+    by nature of the OS counter; documented in BENCHMARKS.md).
+#>
+    param([string]$Corpus,[int]$Files,[int]$BenchSeed)
+    if(-not $Corpus){ $Corpus = Join-Path $appRoot 'BenchmarkCorpus' }
+    $Corpus = [System.IO.Path]::GetFullPath($Corpus)
+    $gen = Join-Path $appRoot 'Tools\New-SysOrgCorpus.ps1'
+    $results = New-Object System.Collections.Generic.List[object]
+    function Measure-SysOrgBenchStep {
+        # Runs $Step once and records wall time + process peak working set.
+        param([string]$Name,[scriptblock]$Step)
+        $t = Measure-Command $Step
+        $proc = [System.Diagnostics.Process]::GetCurrentProcess()
+        try { $proc.Refresh() } catch { }
+        $r = [pscustomobject]@{ Step=$Name; Seconds=[math]::Round($t.TotalSeconds,3); PeakWorkingSetMB=[math]::Round($proc.PeakWorkingSet64/1MB,1) }
+        Write-Host ("  {0,-22} {1,8:N3} s   (peak WS {2} MB)" -f $r.Step, $r.Seconds, $r.PeakWorkingSetMB)
+        return $r
+    }
+
+    Write-Host '=== SysOrg benchmark (v3.0 Phase 0) ===' -ForegroundColor White
+    if(-not (Test-Path -LiteralPath $Corpus)){
+        Write-Host ("Generating corpus ({0} files, seed {1}) ..." -f $Files, $BenchSeed)
+        $results.Add((Measure-SysOrgBenchStep -Name 'corpus-generate' -Step { & $gen -Root $Corpus -FileCount $Files -Seed $BenchSeed -Clean }))
+    }
+
+    # benchmark-session config: destinations live under the corpus, no action cap
+    $benchCfg = @{} + $Config
+    $benchCfg.OrganizedRoots = @{ '*' = (Join-Path $Corpus '_Organized') }
+    $benchCfg.MaxPlanActions = 1000000
+    $benchApp = Join-Path $Corpus '_SysOrgApp'
+    if(-not (Test-Path -LiteralPath $benchApp)){ New-Item -ItemType Directory -Path $benchApp -Force | Out-Null }
+
+    # drive profile: real on Windows, a synthetic Data profile on portable hosts
+    $prof = $null
+    try { $prof = @(Get-SysOrgDriveProfile -Config $benchCfg -Letters 'C')[0] } catch { $prof = $null }
+    if(-not $prof){
+        $prof = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; Drive=$null; Artifacts=@(); KnownFolders=@();
+                                   DownloadRoots=@(); TopLevelDirs=@(); ProposedScope='FullDrive';
+                                   DestinationRoot=(Get-SysOrgDestinationRoot -Letter 'C' -Config $benchCfg) }
+        Write-Host 'No real drive profile available (portable host) - using a synthetic Data profile.' -ForegroundColor Yellow
+    }
+
+    Write-Host 'Measuring...' -ForegroundColor White
+    $inv = $null
+    $results.Add((Measure-SysOrgBenchStep -Name 'cold-scan' -Step { $script:BenchInv = @(Get-SysOrgInventory -Letter 'C' -Config $benchCfg -Roots @($Corpus) -NoCache) }))
+    $inv = $script:BenchInv
+    # refresh the JSON cache once, then measure the cached (warm) read
+    $null = Get-SysOrgInventory -Letter 'C' -Config $benchCfg -Roots @($Corpus) -CacheFolder $benchApp\Cache
+    $results.Add((Measure-SysOrgBenchStep -Name 'warm-scan' -Step { $script:BenchInv2 = @(Get-SysOrgInventory -Letter 'C' -Config $benchCfg -Roots @($Corpus) -CacheFolder $benchApp\Cache) }))
+    $dups = @()
+    $results.Add((Measure-SysOrgBenchStep -Name 'duplicate-detect' -Step { $script:BenchDups = @(Find-SysOrgDuplicates -Inventory $inv -Config $benchCfg) }))
+    $dups = $script:BenchDups
+    $plan = $null
+    $results.Add((Measure-SysOrgBenchStep -Name 'plan-build' -Step { $script:BenchPlan = New-SysOrgPlan -Letter 'C' -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $benchCfg }))
+    $plan = $script:BenchPlan
+    $res = $null
+    $results.Add((Measure-SysOrgBenchStep -Name 'execute-plan' -Step {
+        $script:BenchPlanPath = Save-SysOrgPlan -Plan $plan -PlansFolder (Join-Path $benchApp 'Plans')
+        $script:BenchExec = Invoke-SysOrgPlan -PlanPath $script:BenchPlanPath -Config $benchCfg -AppRoot $benchApp
+    }))
+
+    $res = $script:BenchExec
+    Write-Host ''
+    Write-Host ("Inventory: {0} files   Duplicate groups: {1}   Plan actions: {2}" -f @($inv).Count, @($dups).Count, @($plan.Actions).Count)
+    if($res){ Write-Host ("Executed: moved={0} copied={1} failed={2}" -f $res.Summary.Moved, $res.Summary.Copied, $res.Summary.Failed) }
+
+    # markdown report under <AppRoot>\Reports
+    $repFolder = Join-Path $appRoot 'Reports'
+    if(-not (Test-Path -LiteralPath $repFolder)){ New-Item -ItemType Directory -Path $repFolder -Force | Out-Null }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $repPath = Join-Path $repFolder ('benchmark-{0}.md' -f $stamp)
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('# SysOrg benchmark report')
+    [void]$lines.Add('')
+    [void]$lines.Add(('- Date: {0}' -f (Get-Date -Format s)))
+    $hostOs = 'portable host'
+    if($env:OS){ $hostOs = $env:OS }
+    [void]$lines.Add(('- Host: {0} ({1})' -f $env:COMPUTERNAME, $hostOs))
+    [void]$lines.Add(('- PSVersion: {0}' -f $PSVersionTable.PSVersion))
+    [void]$lines.Add(('- Corpus: {0} ({1} files configured, seed {2})' -f $Corpus, $Files, $BenchSeed))
+    [void]$lines.Add(('- Inventory: {0} files, duplicate groups: {1}, plan actions: {2}' -f @($inv).Count, @($dups).Count, @($plan.Actions).Count))
+    [void]$lines.Add('')
+    [void]$lines.Add('| Step | Seconds | Peak WS (MB) |')
+    [void]$lines.Add('|------|---------|--------------|')
+    foreach($r in $results){ [void]$lines.Add(('| {0} | {1} | {2} |' -f $r.Step, $r.Seconds, $r.PeakWorkingSetMB)) }
+    [void]$lines.Add('')
+    [System.IO.File]::WriteAllLines($repPath, $lines)
+    Write-Host ("Benchmark report saved: {0}" -f $repPath) -ForegroundColor Green
+}
+
 # ---------------- non-interactive modes ----------------
 if($ProfileDrives){
     [void](Invoke-SysOrgProfileFlow -Letters $null)
@@ -326,6 +437,10 @@ if($AuditDrive){
         $ll = $l.Trim().TrimEnd(':').ToUpper()
         Invoke-SysOrgFolderAuditFlow -Letter $ll
     }
+    return
+}
+if($Benchmark){
+    Invoke-SysOrgBenchmarkFlow -Corpus $BenchmarkCorpus -Files $BenchmarkFiles -BenchSeed $BenchmarkSeed
     return
 }
 if($UndoPlan){
