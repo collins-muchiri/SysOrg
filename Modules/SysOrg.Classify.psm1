@@ -201,6 +201,12 @@ function Invoke-SysOrgClassifyPipeline {
     elseif($ctx.IsVoiceNote -and ($cat -in @('Audio','Music'))){ $subtype = 'VoiceNote' }
 
     # --- stages 6-8: metadata, date resolution, lexicon (Phase 2.4+) ---
+    $minConf = 0.40
+    $revConf = 0.70
+    if($Config){
+        $minConf = [double](Get-SysOrgSetting $Config 'Classify.MinConfidence' 0.40)
+        $revConf = [double](Get-SysOrgSetting $Config 'Classify.ReviewConfidence' 0.70)
+    }
     $meta = $null
     $resolved = $null
     if($IncludeMetadata){
@@ -216,10 +222,14 @@ function Invoke-SysOrgClassifyPipeline {
         } catch { [void]$d.Signals.Add(('Date: failed soft (' + $_.Exception.Message + ')')) }
         if($cat -in @('Documents','Other','Spreadsheets','Databases') -and (Get-Command Get-SysOrgDocumentCategory -ErrorAction SilentlyContinue)){
             try {
-                $lex = Get-SysOrgDocumentCategory -Path $Path -Name $name -Metadata $meta -Config $Config
+                $lex = Get-SysOrgDocumentCategory -Path $Path -Name $name -Metadata $meta -Config $Config -AppRoot $AppRoot
                 if($lex -and ($lex.Confidence -gt 0)){
                     $subtype = $lex.Subtype
-                    [void]$d.Signals.Add(('Lexicon: ' + $lex.Subtype + ' score=' + $lex.Matched + ' -> confidence=' + $lex.Confidence))
+                    # a WEAK lexicon match never dumps the file into a junk folder:
+                    # below the threshold the document goes to Documents\General\<Year>
+                    # (still previewed; the confidence stays honest in the plan)
+                    if($lex.Confidence -lt $minConf){ $subtype = 'General' }
+                    [void]$d.Signals.Add(('Lexicon: ' + $lex.Subtype + ' score=' + $lex.Matched + ' -> confidence=' + $lex.Confidence + $(if($subtype -eq 'General'){ ' -> General' })))
                 }
             } catch { [void]$d.Signals.Add(('Lexicon: failed soft (' + $_.Exception.Message + ')')) }
         }
@@ -229,17 +239,19 @@ function Invoke-SysOrgClassifyPipeline {
     $d.Category = $cat
     $d.Subtype = $subtype
     $d.RuleId = 'default'
-    if($meta){ $d.Confidence = 0.9 } else { $d.Confidence = 0.8 }
-    if($cat -eq 'Other'){ $d.Confidence = [Math]::Min($d.Confidence, 0.5) }
-    if($IncludeMetadata -and $lex){
-        $d.Confidence = $lex.Confidence
-        $d.RuleId = 'lexicon'
+    if($cat -eq 'Other'){
+        # no extension, no magic match, no routing signal: NO confident placement -
+        # below the threshold the file is left in place and reported (needs a decision)
+        $d.Confidence = 0.3
     }
-    $minConf = 0.40
-    $revConf = 0.70
-    if($Config){
-        $minConf = [double](Get-SysOrgSetting $Config 'Classify.MinConfidence' 0.40)
-        $revConf = [double](Get-SysOrgSetting $Config 'Classify.ReviewConfidence' 0.70)
+    elseif($cat -in @('Documents','Spreadsheets','Databases')){
+        # documents: the lexicon score when one matched, otherwise the readable-document
+        # baseline (still organized, into Documents\General\<Year>)
+        if($lex){ $d.Confidence = [Math]::Max($lex.Confidence, 0.5); $d.RuleId = 'lexicon' }
+        else { $d.Confidence = 0.5 }
+    }
+    else {
+        if($meta){ $d.Confidence = 0.9 } else { $d.Confidence = 0.8 }
     }
     if($d.Confidence -lt $minConf){
         $d.NeedsDecision = $true
@@ -643,6 +655,140 @@ function Get-SysOrgTrueType {
         Matched=$true; SignatureType=$m.SignatureType; Category=$m.Category
         Corrected=$corrected; ExtensionCategory=$Category
     }
+}
+
+# ---------------------------------------------------------------------------
+# Stage 8: document category scoring against Rules\Lexicon.psd1 (v3.0 Phase 2.6).
+# The lexicon is extensible (multilingual tokens welcome). Missing file -> built-in
+# defaults; a file that exists but cannot be parsed FAILS CLOSED (a broken lexicon
+# is a broken rule set, like a broken config). Score becomes confidence:
+#   matched / (matched + Confidence.Divider), with filename tokens at 1.2x,
+#   metadata tokens at 1.0x and content tokens at 0.6x weight.
+# ---------------------------------------------------------------------------
+
+function Get-SysOrgLexicon {
+<#
+.SYNOPSIS
+    Loads and validates the lexicon (config Rules.LexiconPath, or <AppRoot>\Rules\Lexicon.psd1).
+.EXAMPLE
+    Get-SysOrgLexicon -Config $cfg -AppRoot 'C:\SysOrg'
+#>
+    [CmdletBinding()]
+    param($Config,[string]$AppRoot)
+    $path = "$(Get-SysOrgSetting $Config 'Rules.LexiconPath' '')"
+    if([string]::IsNullOrWhiteSpace($path) -and $AppRoot){ $path = (Join-Path $AppRoot 'Rules\Lexicon.psd1') }
+    if([string]::IsNullOrWhiteSpace($path) -or (-not (Test-Path -LiteralPath $path))){
+        # built-in minimal fallback so a missing file never breaks classification
+        return @{
+            Multiplier = @{ Filename = 1.2; Metadata = 1.0; Content = 0.6 }
+            Confidence = @{ Divider = 1.5 }
+            Entries = @(
+                @{ Subtype='Finance\Invoices';  Filename=@('invoice'); Content=@('invoice','amount due','payment due') }
+                @{ Subtype='Finance\Receipts';  Filename=@('receipt'); Content=@('receipt','received from','mpesa') }
+                @{ Subtype='Finance\Statements';Filename=@('statement'); Content=@('statement of account','closing balance') }
+                @{ Subtype='Finance\Tax';       Filename=@('tax','paye','kra'); Content=@('kra','paye','vat','tax return','itax') }
+                @{ Subtype='Legal-Identity';    Filename=@('contract','certificate','passport'); Content=@('this agreement','certificate of','passport number') }
+                @{ Subtype='Education';         Filename=@('thesis','syllabus','assignment'); Content=@('university','course outline','examination') }
+                @{ Subtype='Work';              Filename=@('proposal','minutes','memo'); Content=@('meeting minutes','action items','deliverables') }
+                @{ Subtype='Manuals';           Filename=@('manual','handbook','user guide'); Content=@('user manual','troubleshooting','quick start') }
+                @{ Subtype='Books';             Filename=@('book','novel','textbook'); Content=@('chapter','isbn','published by') }
+            )
+        }
+    }
+    $loaded = $null
+    try { $loaded = Import-PowerShellDataFile -LiteralPath $path -ErrorAction Stop }
+    catch { throw ("Lexicon file '{0}' could not be parsed: {1} (fix the file or remove it to use the built-in defaults)." -f $path, $_.Exception.Message) }
+    if($loaded -isnot [hashtable] -or (-not $loaded.ContainsKey('Entries'))){
+        throw ("Lexicon file '{0}' must be a hashtable with an Entries list." -f $path)
+    }
+    return $loaded
+}
+
+function Get-SysOrgTokenMatches {
+<#
+.SYNOPSIS
+    Counts lexicon token hits in one text source (case-insensitive, word-ish match).
+.DESCRIPTION
+    Multi-word tokens match as substrings; single-word tokens match on word
+    boundaries so 'tax' does not match 'taxi'. Returns the number of DISTINCT
+    tokens found (each token counts once per source).
+.EXAMPLE
+    Get-SysOrgTokenMatches -Text 'Invoice number 42, payment due' -Tokens @('invoice','payment due')   # -> 2
+#>
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text,[AllowEmptyCollection()][string[]]$Tokens)
+    if([string]::IsNullOrWhiteSpace("$Text")){ return 0 }
+    $lower = "$Text".ToLowerInvariant()
+    $hits = 0
+    foreach($t in $Tokens){
+        $tok = "$t".ToLowerInvariant().Trim()
+        if([string]::IsNullOrWhiteSpace($tok)){ continue }
+        if($tok.Contains(' ')){
+            if($lower.Contains($tok)){ $hits++ }
+        } else {
+            if("$lower" -match ('(^|[^a-z0-9])' + [regex]::Escape($tok) + '([^a-z0-9]|$)')){ $hits++ }
+        }
+    }
+    return $hits
+}
+
+function Get-SysOrgDocumentCategory {
+<#
+.SYNOPSIS
+    Stage 8: scores a document against the lexicon and returns category + confidence.
+.DESCRIPTION
+    Combines stem tokens (1.2x), metadata title/creator tokens (1.0x) and the 2 KB
+    text snippet tokens (0.6x) per lexicon entry; the best entry wins deterministically
+    (ties break by list order). Returns @{ Subtype; Matched; Confidence } or $null when
+    nothing matched. Fail soft: unreadable content simply contributes no tokens.
+.EXAMPLE
+    Get-SysOrgDocumentCategory -Path 'C:\x\tax return.pdf' -Name 'tax return.pdf' -Metadata $m -Config $cfg
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Name,
+          [hashtable]$Metadata,$Lexicon,$Config,[string]$AppRoot)
+    try{
+        if(-not $Lexicon){ $Lexicon = Get-SysOrgLexicon -Config $Config -AppRoot $AppRoot }
+        $mult = @{ Filename = 1.2; Metadata = 1.0; Content = 0.6 }
+        if($Lexicon -is [hashtable] -and $Lexicon.ContainsKey('Multiplier') -and ($Lexicon['Multiplier'] -is [hashtable])){
+            foreach($k in @('Filename','Metadata','Content')){ if($Lexicon['Multiplier'].ContainsKey($k)){ $mult[$k] = [double]$Lexicon['Multiplier'][$k] } }
+        }
+        $divider = 1.5
+        if($Lexicon -is [hashtable] -and $Lexicon.ContainsKey('Confidence') -and ($Lexicon['Confidence'] -is [hashtable]) -and $Lexicon['Confidence'].ContainsKey('Divider')){
+            $divider = [double]$Lexicon['Confidence']['Divider']
+        }
+        $stem = ([System.IO.Path]::GetFileNameWithoutExtension($Name))
+        $snippet = ''
+        if($Metadata -and $Metadata.ContainsKey('Snippet')){ $snippet = "$($Metadata['Snippet'])" }
+        else {
+            try{
+                $t = Get-SysOrgTextSnippet -Path $Path
+                if($t){ $snippet = "$($t['Snippet'])" }
+            } catch { $snippet = '' }
+        }
+        $metaText = ''
+        if($Metadata){
+            foreach($k in @('Title','Creator','Author')){
+                if($Metadata.ContainsKey($k)){ $metaText += ' ' + "$($Metadata[$k])" }
+            }
+        }
+        $best = $null; $bestMatched = -1.0
+        foreach($entry in @($Lexicon['Entries'])){
+            if(-not ($entry -is [hashtable]) -or (-not $entry.ContainsKey('Subtype'))){ continue }
+            $m = 0.0
+            $m += (Get-SysOrgTokenMatches -Text $stem -Tokens ([string[]]@($entry['Filename']))) * $mult.Filename
+            $m += (Get-SysOrgTokenMatches -Text $metaText -Tokens ([string[]](@($entry['Filename']) + @($entry['Content'])))) * $mult.Metadata
+            $m += (Get-SysOrgTokenMatches -Text $snippet -Tokens ([string[]]@($entry['Content']))) * $mult.Content
+            if($m -gt $bestMatched){
+                $bestMatched = $m
+                $best = "$($entry['Subtype'])"
+            }
+        }
+        if(($null -eq $best) -or ($bestMatched -le 0)){ return $null }
+        $conf = $bestMatched / ($bestMatched + $divider)
+        if($conf -gt 0.99){ $conf = 0.99 }
+        return [pscustomobject]@{ Subtype=$best; Matched=[Math]::Round($bestMatched,2); Confidence=[Math]::Round($conf,3) }
+    } catch { return $null }
 }
 
 function Show-SysOrgDecision {

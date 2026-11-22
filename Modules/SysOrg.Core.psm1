@@ -94,6 +94,15 @@ function Test-SysOrgConfig {
     if(@('Windows','Compact4','Findable') -notcontains $layoutProfile){ $errors += "LayoutProfile must be Windows, Compact4, or Findable (got '$layoutProfile')." }
     $reviewMode = Get-SysOrgSetting $Config 'Review.Mode' 'Report'
     if(@('Report','Move') -notcontains $reviewMode){ $errors += "Review.Mode must be Report or Move (got '$reviewMode')." }
+    # v3.0 confidence thresholds
+    $minConf = Get-SysOrgSetting $Config 'Classify.MinConfidence' 0.40
+    $revConf = Get-SysOrgSetting $Config 'Classify.ReviewConfidence' 0.70
+    foreach($pair in @(@('Classify.MinConfidence',$minConf), @('Classify.ReviewConfidence',$revConf))){
+        $v = $pair[1]
+        if(($v -isnot [int]) -and ($v -isnot [long]) -and ($v -isnot [double])){ $errors += ($pair[0] + ' must be a number between 0 and 1 (got ' + "$v" + ').') }
+        elseif([double]$v -lt 0 -or [double]$v -gt 1){ $errors += ($pair[0] + ' must be a number between 0 and 1 (got ' + "$v" + ').') }
+    }
+    if([double]$minConf -ge [double]$revConf){ $errors += 'Classify.MinConfidence must be below Classify.ReviewConfidence.' }
     $style = Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot'
     if(@('OrganizedRoot','KnownFolders') -notcontains $style){ $errors += "DestinationStyle must be OrganizedRoot or KnownFolders (got '$style')." }
     $cpol = Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies'
@@ -242,6 +251,13 @@ function Import-SysOrgConfig {
         # "needs a decision" section and leaves them in place; Mode='Move' files them
         # under <root>\_Review\<Year> (still previewed + undoable like any move).
         Review = @{ Mode='Report'; FolderName='_Review' }
+        # v3.0 confidence gating: >= ReviewConfidence plans normally, MinConfidence..
+        # ReviewConfidence plans with a 'review' flag in the preview, below
+        # MinConfidence the file is left in place (or moved to _Review) and reported.
+        Classify = @{ MinConfidence=0.40; ReviewConfidence=0.70 }
+        # v3.0 rules: UserRules are validated fail-closed at startup; learned rules are
+        # NEVER applied unless ApplyLearned=$true (and they are flagged in the preview).
+        Rules = @{ UserRulesPath=''; LexiconPath=''; LearnedRulesPath=''; ApplyLearned=$false }
         FolderAudit = @{ Enabled=$true; MaxTopLevelDepth=2; SkipHiddenSystemDirs=$true; RespectDefenderCFA=$true; IncludeRestrictedInPlans=$false }
         Move     = @{ AllowCrossVolume = $true }
         MaxPlanActions         = 5000

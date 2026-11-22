@@ -7,6 +7,7 @@ BeforeAll {
     $repo = Split-Path $PSScriptRoot -Parent
     Import-Module (Join-Path $repo 'Modules\SysOrg.Core.psm1')   -Force
     Import-Module (Join-Path $repo 'Modules\SysOrg.Layout.psm1') -Force
+    Import-Module (Join-Path $repo 'Modules\SysOrg.Metadata.psm1') -Force   # snippet reader for the lexicon stage
     Import-Module (Join-Path $repo 'Modules\SysOrg.Classify.psm1') -Force
     $script:prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
         KnownFolders=@(); DownloadRoots=@('C:\dl'); Artifacts=@(); TopLevelDirs=@() }
@@ -14,6 +15,7 @@ BeforeAll {
         Classify = @{ MinConfidence=0.40; ReviewConfidence=0.70 }
         Rules    = @{ ApplyLearned=$false; UserRulesPath='' }
     }
+    $script:appRoot = $repo
 }
 
 Describe 'Decision record and safety gates (Phase 2.1)' {
@@ -161,15 +163,23 @@ Describe 'User and learned rules (precedence, fail closed, never silent)' {
 
 Describe 'Confidence gating (Phase 2 stage 9)' {
 
-    It 'confident media plans normally; Other-category files are flagged for review' {
-        $d1 = Invoke-SysOrgClassifyPipeline -Path 'C:\x\IMG_2024.jpg' -Extension '.jpg' -Category 'Pictures' -Config $script:cfg -DriveProfile $script:prof
-        $d1.Confidence | Should -BeGreaterOrEqual 0.70
-        @($d1.Flags) | Should -Not -Contain 'review'
-        $d2 = Invoke-SysOrgClassifyPipeline -Path 'C:\x\mystery.bin' -Extension '.bin' -Category 'Other' -Config $script:cfg -DriveProfile $script:prof
-        $d2.Confidence | Should -BeGreaterOrEqual 0.40
-        $d2.Confidence | Should -BeLessThan 0.70
-        @($d2.Flags) | Should -Contain 'review'
-        $d2.NeedsDecision | Should -BeFalse
+    It 'needs-decision for unplaceable files; review flag for 0.40-0.70 documents' {
+        # a mystery .bin: no extension match, no magic match -> below MinConfidence
+        $bin = Join-Path $TestDrive 'mystery.bin'
+        [System.IO.File]::WriteAllBytes($bin, [byte[]]@(0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A))
+        $d2 = Invoke-SysOrgClassifyPipeline -Path $bin -Extension '.bin' -Category 'Other' -Config $script:cfg -DriveProfile $script:prof -IncludeMetadata
+        $d2.Confidence | Should -BeLessThan 0.40
+        $d2.NeedsDecision | Should -BeTrue
+        @($d2.Flags) | Should -Contain 'needs-decision'
+        # a readable document with no lexicon signal: planned into General with review flag
+        $txt = Join-Path $TestDrive 'random note.txt'
+        Set-Content -LiteralPath $txt -Value 'the quick brown fox says hello' -Encoding UTF8
+        $d3 = Invoke-SysOrgClassifyPipeline -Path $txt -Extension '.txt' -Category 'Documents' -Config $script:cfg -DriveProfile $script:prof -IncludeMetadata
+        $d3.Confidence | Should -BeGreaterOrEqual 0.40
+        $d3.Confidence | Should -BeLessThan 0.70
+        $d3.Subtype | Should -Be 'General'
+        @($d3.Flags) | Should -Contain 'review'
+        $d3.NeedsDecision | Should -BeFalse
     }
 
     It 'the pipeline never throws on odd inputs' {
@@ -244,5 +254,80 @@ Describe 'True type: magic-byte sniffing (Phase 2.3)' {
         [System.IO.File]::WriteAllBytes($short, [byte[]]@(0x50,0x4B))
         ($null -eq (Get-SysOrgTrueType -Path $short -Extension '.dat' -Category 'Other')) | Should -BeTrue
         { Get-SysOrgTrueType -Path (Join-Path $TestDrive 'does-not-exist.bin') -Extension '.bin' -Category 'Other' } | Should -Not -Throw
+    }
+}
+
+Describe 'Lexicon document scoring (Phase 2.6)' {
+
+    BeforeAll {
+        $script:repoLex = Join-Path (Split-Path $PSScriptRoot -Parent) 'Rules\Lexicon.psd1'
+    }
+
+    It 'scores a tax document high from filename + content tokens' {
+        $p = Join-Path $TestDrive 'KRA PAYE return 2024.txt'
+        Set-Content -LiteralPath $p -Value 'KENYA PAYE tax return for 2024. VAT and withholding tax. itax pin P051234456X.' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'KRA PAYE return 2024.txt' -Config $script:cfg -Lexicon (Get-SysOrgLexicon -Config $script:cfg)
+        $lex | Should -Not -BeNullOrEmpty
+        $lex.Subtype | Should -Be 'Finance\Tax'
+        $lex.Confidence | Should -BeGreaterOrEqual 0.70
+    }
+
+    It 'weights the filename tokens more heavily than content tokens' {
+        # 'invoice' in the name alone (1.2) -> confidence 0.44; 'invoice' in content only (0.6) -> 0.29
+        $p = Join-Path $TestDrive 'invoice.txt'
+        Set-Content -LiteralPath $p -Value 'nothing relevant here at all' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'invoice.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg)
+        $lex.Subtype | Should -Be 'Finance\Invoices'
+        $lex.Confidence | Should -BeGreaterThan 0.40
+        $p2 = Join-Path $TestDrive 'plain file.txt'
+        Set-Content -LiteralPath $p2 -Value 'attached is the invoice you asked for' -Encoding UTF8
+        $lex2 = Get-SysOrgDocumentCategory -Path $p2 -Name 'plain file.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg)
+        $lex2.Subtype | Should -Be 'Finance\Invoices'
+        $lex2.Confidence | Should -BeLessThan $lex.Confidence
+    }
+
+    It 'uses metadata title/creator when provided' {
+        $meta = @{ Source='pdf'; Title='Employment contract'; Author='Wanjiku' }
+        $p = Join-Path $TestDrive 'scan001.pdf'
+        Set-Content -LiteralPath $p -Value 'unrelated body text' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'scan001.pdf' -Metadata $meta -Lexicon (Get-SysOrgLexicon -Config $script:cfg)
+        $lex.Subtype | Should -Be 'Legal-Identity'
+    }
+
+    It 'single-word tokens do not match inside other words' {
+        (Get-SysOrgTokenMatches -Text 'the taxi driver went to the store' -Tokens @('tax')) | Should -Be 0
+        (Get-SysOrgTokenMatches -Text 'pay the tax now' -Tokens @('tax')) | Should -Be 1
+        (Get-SysOrgTokenMatches -Text 'Invoice number 42, payment due tomorrow' -Tokens @('invoice','payment due')) | Should -Be 2
+    }
+
+    It 'a weak lexicon match routes documents to General, not to a junk folder' {
+        $p = Join-Path $TestDrive 'letter home.txt'
+        Set-Content -LiteralPath $p -Value 'a single passing mention of a receipt from last year' -Encoding UTF8
+        $d = Invoke-SysOrgClassifyPipeline -Path $p -Extension '.txt' -Category 'Documents' -Config $script:cfg -DriveProfile $script:prof -IncludeMetadata
+        $d.Subtype | Should -Be 'General'
+        $d.Destination | Should -Be 'Documents\General'
+        $d.Confidence | Should -BeGreaterOrEqual 0.5    # honest max(lex, baseline)
+    }
+
+    It 'the shipped lexicon parses and every entry is well-formed' {
+        $cfg2 = @{ Rules = @{ LexiconPath = $script:repoLex } }
+        $lex = Get-SysOrgLexicon -Config $cfg2
+        $lex.Entries.Count | Should -BeGreaterOrEqual 5
+        foreach($e in $lex.Entries){
+            "$($e.Subtype)" | Should -Not -BeNullOrEmpty
+            @("$($e.Filename)").Count | Should -BeGreaterOrEqual 1
+            @("$($e.Content)").Count | Should -BeGreaterOrEqual 1
+        }
+    }
+
+    It 'a broken lexicon file fails closed with a clear message' {
+        $bad = Join-Path $TestDrive 'broken-lexicon.psd1'
+        Set-Content -LiteralPath $bad -Value '@{ Entries = @( @{ Subtype = (throw "boom") } ) }' -Encoding UTF8
+        { Get-SysOrgLexicon -Config @{ Rules = @{ LexiconPath = $bad } } } | Should -Throw '*could not be parsed*'
+    }
+
+    It 'a missing lexicon file falls back to the built-in defaults' {
+        $lex = Get-SysOrgLexicon -Config @{ Rules = @{ LexiconPath = (Join-Path $TestDrive 'nope.psd1') } }
+        $lex.Entries.Count | Should -BeGreaterOrEqual 5
     }
 }
