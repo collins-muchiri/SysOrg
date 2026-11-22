@@ -51,18 +51,18 @@ param(
 $ErrorActionPreference = 'Stop'
 $appRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $moduleRoot = Join-Path $appRoot 'Modules'
-Import-Module (Join-Path $moduleRoot 'SysOrg.Core.psm1')        -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.KnownFolders.psm1') -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Drives.psm1')      -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Layout.psm1')      -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Metadata.psm1')    -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Classify.psm1')    -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Cache.psm1')       -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Catalog.psm1')     -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
-Import-Module (Join-Path $moduleRoot 'SysOrg.Score.psm1')       -Force
+Import-Module (Join-Path $moduleRoot 'SysOrg.Core.psm1')        -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.KnownFolders.psm1') -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Drives.psm1')      -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Layout.psm1')      -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Metadata.psm1')    -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Classify.psm1')    -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Cache.psm1')       -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Catalog.psm1')     -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force -DisableNameChecking
+Import-Module (Join-Path $moduleRoot 'SysOrg.Score.psm1')       -Force -DisableNameChecking
 
 if(-not $ConfigPath){ $ConfigPath = Join-Path $appRoot 'SysOrg.config.psd1' }
 # v2.1.1 fail closed: a config that exists but cannot be parsed may carry user
