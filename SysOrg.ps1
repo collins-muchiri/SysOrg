@@ -229,6 +229,10 @@ function Invoke-SysOrgScanFlow {
     foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
     $null = Save-SysOrgFileStateCache -Path $cachePath -Entries $fileCache
     $sum = Show-SysOrgPlan -Plan $plan -Config $Config
+    # v3.0 Phase 5: before/after findability score in the preview
+    $scoreDelta = $null
+    try { $scoreDelta = Get-SysOrgPlanScoreDelta -Plan $plan -Config $Config -Root $plan.DestinationRoot } catch { $scoreDelta = $null }
+    if($scoreDelta){ Show-SysOrgScoreDelta -Delta $scoreDelta }
     $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $folders.Plans
     Write-Host ("Plan saved: {0}" -f $planPath) -ForegroundColor Green
     if($PreviewOnly){ return }
@@ -272,7 +276,44 @@ function Invoke-SysOrgScanFlow {
     }
 }
 function Invoke-SysOrgMigrationFlow {
-    param([string]$Letter)
+    param([string]$Letter,[string]$TargetProfile)
+    if($TargetProfile){
+        # v3.0 Phase 6: layout migration (v2.1 tree -> Findable), preview-first
+        Write-SysOrgLog "Building layout migration preview for drive $Letter`: ..." -LogFolder $logFolder
+        try{
+            $plan = New-SysOrgLayoutMigrationPlan -Letter $Letter -Config $Config -TargetProfile $TargetProfile
+        } catch {
+            Write-Host ("Layout migration: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+            return
+        }
+        [void](Show-SysOrgPlan -Plan $plan -Config $Config)
+        if(@($plan.Actions).Count -eq 0){
+            Write-Host 'Everything is already in its Findable place - nothing to migrate. Nothing was modified.' -ForegroundColor Yellow
+            return
+        }
+        $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $folders.Plans
+        Write-Host ("Migration plan saved: {0}" -f $planPath) -ForegroundColor Green
+        if(-not (Confirm-SysOrg 'Apply this layout migration now (whole folders move where possible; fully journaled)?')){
+            Write-Host 'Migration NOT applied. Nothing was modified.' -ForegroundColor Yellow
+            return
+        }
+        if(-not (Confirm-SysOrgElevated)){
+            Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
+            return
+        }
+        $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $Config -AppRoot $appRoot
+        Write-Host ''
+        Write-Host ("Layout migration done. Moved={0}  Folders={1}  Failed={2}" -f $res.Summary.Moved, $res.Summary.FolderMoves, $res.Summary.Failed) -ForegroundColor Green
+        Write-Host ("Undo journal: {0}" -f $res.UndoFile)
+        $catPath = Update-SysOrgCatalog -PlanPath $planPath -UndoPath $res.UndoFile -Root $plan.DestinationRoot -PlanId $plan.PlanId
+        if($catPath){
+            Write-Host ("Catalog updated: {0}" -f $catPath) -ForegroundColor Green
+            $html = Save-SysOrgIndexPage -Root $plan.DestinationRoot
+            $null = Save-SysOrgIndexReadme -Root $plan.DestinationRoot
+            Write-Host ("Offline index: {0}" -f $html) -ForegroundColor Green
+        }
+        return
+    }
     Write-SysOrgLog "Building migration preview for drive $Letter`: ..." -LogFolder $logFolder
     try{
         $plan = New-SysOrgMigrationPlan -Letter $Letter -Config $Config
@@ -490,6 +531,14 @@ if($Benchmark){
     Invoke-SysOrgBenchmarkFlow -Corpus $BenchmarkCorpus -Files $BenchmarkFiles -BenchSeed $BenchmarkSeed
     return
 }
+if($Score){
+    # v3.0 Phase 5: score an existing organized tree and check it against the targets
+    $scoreRoot = $null
+    try { $scoreRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $scoreRoot = 'C:\_Organized' }
+    $s = Get-SysOrgTreeScore -Root $scoreRoot -Config $Config
+    Show-SysOrgFindabilityScore -Score $s -Label ('organized tree ' + $scoreRoot) -Config $Config -WithTargets
+    return
+}
 if($null -ne $Find){
     # v3.0 Phase 4.2: instant search over the catalog (falls back to a live scan)
     if([string]::IsNullOrWhiteSpace($Find)){ $Find = '*' }
@@ -537,6 +586,20 @@ if($UndoPlan){
 }
 if($ExecutePlan){
     Invoke-SysOrgPlanFile -Path $ExecutePlan
+    return
+}
+if($MigrateProfile){
+    # v3.0 Phase 6: migrate an existing v2.1 organized tree to the Findable layout
+    if("$MigrateProfile" -ine 'Findable'){
+        Write-Host ("Unknown layout profile '{0}' - only 'Findable' is supported as a migration target." -f $MigrateProfile) -ForegroundColor Yellow
+        return
+    }
+    $migLetters = @()
+    if($Migrate -and @($Migrate).Count -gt 0){ $migLetters = @($Migrate) }
+    else { $migLetters = @('C') }
+    foreach($l in $migLetters){
+        Invoke-SysOrgMigrationFlow -Letter ($l.Trim().TrimEnd(':').ToUpper()) -TargetProfile 'Findable'
+    }
     return
 }
 if($Migrate){

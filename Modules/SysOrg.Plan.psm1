@@ -1601,6 +1601,163 @@ function Invoke-SysOrgPlan {
     return [pscustomobject]@{ PlanId=$plan.PlanId; UndoFile=$undoPath; Summary=$summary }
 }
 
+function New-SysOrgLayoutMigrationPlan {
+<#
+.SYNOPSIS
+    Builds a previewable, journaled, undoable plan that migrates an existing v2.1
+    organized tree to the Findable layout (v3.0 Phase 6).
+.DESCRIPTION
+    Walks the destination root (skipping the app-managed runtime folders _Index,
+    _Reports, _Duplicates, _Review and the Downloads provenance branch),
+    re-classifies every file with the v3.0 routing table and re-buckets dates
+    adaptively. Whole folders move as ONE MoveFolder unit when every file inside
+    them maps to the same destination folder; files that are ALREADY in their
+    Findable place are skipped (running the migration twice is a no-op). The plan
+    runs through the same executor as everything else: preview first, never
+    overwrites, crash-safe journal, full undo.
+.EXAMPLE
+    New-SysOrgLayoutMigrationPlan -Letter D -Config $cfg -TargetProfile Findable
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,$Config,[string]$TargetProfile='Findable')
+    if(-not $Config){ throw 'New-SysOrgLayoutMigrationPlan requires -Config.' }
+    $stamp = Get-Date
+    $planId = 'migrate-' + $stamp.ToString('yyyyMMdd-HHmmss') + '-' + $stamp.ToString('fff')
+    $root = Get-SysOrgDestinationRoot -Letter $Letter -Config $Config
+    if(-not (Test-Path -LiteralPath $root)){ throw ("Nothing to migrate: destination root '{0}' does not exist." -f $root) }
+    $layoutCap = [int](Get-SysOrgSetting $Config 'Layout.MaxFilesPerFolder' 150)
+    $layoutMin = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
+    $runtimeFolders = @('_index','_reports','_duplicates','_review','_sysorg')
+
+    $files = New-Object System.Collections.Generic.List[object]
+    $skipped = New-Object System.Collections.Generic.List[object]
+    try{
+        foreach($f in [System.IO.Directory]::EnumerateFiles($root, '*', [System.IO.SearchOption]::AllDirectories)){
+            $fn = [string]$f                                    # NATIVE separators (the executor needs them)
+            $rel = $fn.Substring($root.Length).TrimStart('\','/').Replace('/','\')   # logic runs on '\'
+            $segs = @($rel.Split('\'))
+            if($runtimeFolders -contains $segs[0].ToLowerInvariant()){ continue }
+            if($segs[0] -ieq 'Downloads'){ continue }   # provenance branch already Findable-shaped
+            try { $fi = Get-Item -LiteralPath $fn -Force; [void]$files.Add([pscustomobject]@{ Path=$fn; Rel=$rel; Segs=$segs; Length=[long]$fi.Length; LastWriteTime=$fi.LastWriteTime; CreationTime=$fi.CreationTime }) } catch { }
+        }
+    } catch { }
+    if($files.Count -eq 0){
+        [void]$skipped.Add([pscustomobject]@{ Source=$root; Reason='No organized files found under the destination root.' })
+    }
+
+    # route every file to its Findable leaf + adaptive date segment
+    $recs = New-Object System.Collections.Generic.List[object]
+    $leafOf = @{}
+    foreach($f in $files.ToArray()){
+        $ext = [System.IO.Path]::GetExtension($f.Path).ToLowerInvariant()
+        $category = Get-SysOrgCategory -Extension $ext -Config $Config
+        if($category -eq 'SKIP'){ $category = 'Other' }
+        $subtype = Get-SysOrgFindableSubtype -Category $category -Name ([System.IO.Path]::GetFileName($f.Path)) -Source ''
+        $rb = Get-SysOrgFindableRelBase -Category $category -Subtype $subtype -Name ([System.IO.Path]::GetFileName($f.Path))
+        # date: prefer the date already embedded in the current path, then filename, then filesystem
+        $d = $null
+        foreach($seg in $f.Segs){
+            if($seg -match '^(19|20)\d{2}(-\d{2}){0,2}$'){
+                try { $d = [datetime]::ParseExact($seg, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture); break } catch { }
+                try { $d = [datetime]::ParseExact($seg, 'yyyy-MM', [System.Globalization.CultureInfo]::InvariantCulture); break } catch { }
+                try { $d = [datetime]::ParseExact($seg, 'yyyy', [System.Globalization.CultureInfo]::InvariantCulture); break } catch { }
+            }
+        }
+        if($null -eq $d){
+            try { $r = Resolve-SysOrgFileDate -Path $f.Path; $d = $r.Date } catch { $d = $f.LastWriteTime }
+        }
+        $leafOf[$f.Path] = $rb.RelBase
+        [void]$recs.Add([pscustomobject]@{ Key=$rb.RelBase; FileKey=$f.Path; Date=$d; Family=$false; TakesDate=$true })
+    }
+    $dateSegs = Add-SysOrgFindableDateSegments -Records $recs.ToArray() -Cap $layoutCap -MinPerFolder $layoutMin
+
+    # group by source directory: a whole folder moves when all files share one target
+    $byDir = @{}
+    foreach($f in $files.ToArray()){
+        $dir = Split-Path $f.Path -Parent
+        $k = $dir.ToLowerInvariant()
+        if(-not $byDir.ContainsKey($k)){ $byDir[$k] = New-Object System.Collections.Generic.List[object] }
+        [void]$byDir[$k].Add($f)
+    }
+    $actions = New-Object System.Collections.Generic.List[object]
+    $dirKeys = @($byDir.Keys | Sort-Object)
+    foreach($k in $dirKeys){
+        $members = @($byDir[$k].ToArray())
+        $srcDir = Split-Path $members[0].Path -Parent
+        $dirName = Split-Path $srcDir -Leaf
+        $targets = New-Object System.Collections.Generic.HashSet[string]
+        foreach($m in $members){
+            $rb = $leafOf[$m.Path]
+            $seg = ''
+            $lk = $rb.ToLowerInvariant()
+            if($dateSegs.ContainsKey($lk) -and $dateSegs[$lk].ContainsKey($m.Path)){ $seg = [string]$dateSegs[$lk][$m.Path] }
+            if($seg){ [void]$targets.Add($rb + '\' + $seg) } else { [void]$targets.Add($rb) }
+        }
+        if($targets.Count -eq 1){
+            $destFolder = $root + '\' + (@($targets)[0])
+            $relNow = $members[0].Rel
+            $idx = $relNow.LastIndexOf('\')
+            $relNow = $(if($idx -ge 0){ $relNow.Substring(0, $idx) } else { '' })
+            $already = ($destFolder.Substring($root.Length).TrimStart('\')).ToLowerInvariant()
+            if($relNow.ToLowerInvariant() -eq $already){
+                [void]$skipped.Add([pscustomobject]@{ Source=$srcDir; Reason='Already in its Findable place (idempotent migration)' })
+                continue
+            }
+            [void]$actions.Add([pscustomobject]@{
+                Action='Move'; Kind='Folder'; Source=$srcDir; Destination=$destFolder; DestRoot=$root
+                SizeBytes=[int64]0; Family=$null; CopyIndex=$null; SourceBucket=$null
+                Reason=('Migrate to Findable: whole folder re-bucketed to ' + (@($targets)[0]))
+                DifferentContent=$false; OneDriveSyncOut=$false; OneDriveIntoCloud=$false
+                Confidence=$null; RuleId='migration'; ReviewFlag=$false
+            })
+        } else {
+            foreach($m in $members){
+                $rb = $leafOf[$m.Path]
+                $seg = ''
+                $lk = $rb.ToLowerInvariant()
+                if($dateSegs.ContainsKey($lk) -and $dateSegs[$lk].ContainsKey($m.Path)){ $seg = [string]$dateSegs[$lk][$m.Path] }
+                $destFolder = if($seg){ $root + '\' + $rb + '\' + $seg } else { $root + '\' + $rb }
+                $dest = $destFolder + '\' + [System.IO.Path]::GetFileName($m.Path)
+                if($dest.Substring($root.Length).TrimStart('\').ToLowerInvariant() -eq $m.Rel.ToLowerInvariant()){
+                    [void]$skipped.Add([pscustomobject]@{ Source=$m.Path; Reason='Already in its Findable place (idempotent migration)' })
+                    continue
+                }
+                [void]$actions.Add([pscustomobject]@{
+                    Action='Move'; Kind='File'; Source=$m.Path; Destination=$dest; DestRoot=$root
+                    SizeBytes=[int64]$m.Length; Family=$null; CopyIndex=$null; SourceBucket=$null
+                    Reason=('Migrate to Findable: ' + $rb + $(if($seg){ '\' + $seg }))
+                    DifferentContent=$false; OneDriveSyncOut=$false; OneDriveIntoCloud=$false
+                    PlannedLength=[int64]$m.Length
+                    PlannedLastWriteTimeUtc=([datetime]$m.LastWriteTime).ToUniversalTime().ToString('o')
+                    Confidence=$null; RuleId='migration'; ReviewFlag=$false
+                })
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        PlanId          = $planId
+        Created         = (Get-Date).ToString('s')
+        Computer        = $env:COMPUTERNAME
+        Drive           = "$Letter`:"
+        DestinationRoot = $root
+        DestinationStyle= 'OrganizedRoot'
+        Mode            = ('Layout migration ({0} -> Findable); _Index/_Reports/_Duplicates untouched' -f $TargetProfile)
+        DriveProfile    = $null
+        Actions         = $actions.ToArray()
+        Skipped         = $skipped.ToArray()
+        Families        = @()
+        Copies          = [pscustomobject]@{ Policy='n/a'; Numbered=0; Quarantined=0; Reported=0; Groups=@() }
+        Mutability      = [pscustomobject]@{ Allowed=$actions.Count; DeniedTotal=0; Denied=@() }
+        OneDrive        = [pscustomobject]@{ SyncOut=@(); IntoCloud=@() }
+        NeedsDecision   = @()
+        Warnings        = @()
+        Provenance      = @()
+        ProvenanceFile  = ''
+        Stats           = [pscustomobject]@{ Scanned=$files.Count; Routed=$actions.Count }
+    }
+}
+
 function Undo-SysOrgPlan {
 <#
 .SYNOPSIS

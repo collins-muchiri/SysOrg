@@ -248,4 +248,133 @@ function Show-SysOrgFindabilityScore {
     }
 }
 
+function Get-SysOrgPlanScoreDelta {
+<#
+.SYNOPSIS
+    Before/after findability scores for a plan (v3.0 Phase 5).
+.DESCRIPTION
+    BEFORE scores the files at their CURRENT locations (every planned source plus
+    every needs-a-decision file, which stays put). AFTER scores the planned
+    destinations (needs-a-decision files keep their current path). Confidence shares
+    come from the actions' Decision confidence. The verdict states plainly whether
+    the plan improves or worsens the score, and why. Deterministic.
+.EXAMPLE
+    $delta = Get-SysOrgPlanScoreDelta -Plan $plan -Config $cfg -Root $root
+    $delta.Verdict   # -> 'improves' | 'worsens' | 'unchanged'
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan,[Parameter(Mandatory)]$Config,[Parameter(Mandatory)][string]$Root)
+    $cap = [int](Get-SysOrgSetting $Config 'Layout.MaxFilesPerFolder' 150)
+    $min = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
+    $rootN = ("$Root").Replace('/','\').TrimEnd('\')
+
+    $beforePaths = New-Object System.Collections.Generic.List[string]
+    $beforeSizes = @{}
+    $beforeConf = @{}
+    $afterPaths = New-Object System.Collections.Generic.List[string]
+    $afterSizes = @{}
+    $afterConf = @{}
+    $moved = 0
+    foreach($a in @($Plan.Actions)){
+        if("$($a.Action)" -ne 'Move'){ continue }
+        if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
+        $src = "$($a.Source)"
+        $dst = "$($a.Destination)"
+        $sz = 0
+        if($a.PSObject.Properties['SizeBytes'] -and $a.SizeBytes){ $sz = [long]$a.SizeBytes }
+        [void]$beforePaths.Add($src)
+        $beforeSizes[$src] = $sz
+        $conf = $null
+        if($a.PSObject.Properties['Confidence']){ $conf = $a.Confidence }
+        if($null -ne $conf){ $beforeConf[$src] = [double]$conf }
+        [void]$afterPaths.Add($dst)
+        $afterSizes[$dst] = $sz
+        if($null -ne $conf){ $afterConf[$dst] = [double]$conf }
+        if($src -ine $dst){ $moved++ }
+    }
+    if($Plan.PSObject.Properties['NeedsDecision']){
+        foreach($nd in @($Plan.NeedsDecision)){
+            $src = "$($nd.Source)"
+            if($beforeSizes.ContainsKey($src)){ continue }
+            [void]$beforePaths.Add($src)
+            [void]$afterPaths.Add($src)
+        }
+    }
+    # The BEFORE tree must be measured on its own structure: sources live OUTSIDE the
+    # destination root (and possibly on another drive), so each tree is scored relative
+    # to its own deepest common ancestor - that keeps depth/fan-out comparable between
+    # the current layout and the planned one.
+    function Get-SysOrgCommonAncestor {
+        param([AllowEmptyCollection()][string[]]$Paths)
+        $root2 = $null
+        foreach($p in $Paths){
+            $pn = ("$p").Replace('/','\')
+            $dir = $pn.Substring(0, [Math]::Max(0, $pn.LastIndexOf('\')))
+            if($null -eq $root2){ $root2 = $dir; continue }
+            $a = $root2.ToLowerInvariant()
+            $b = $dir.ToLowerInvariant()
+            $n = [Math]::Min($a.Length, $b.Length)
+            $i = 0
+            while($i -lt $n -and $a[$i] -eq $b[$i]){ $i++ }
+            $root2 = $root2.Substring(0, $i)
+        }
+        if([string]::IsNullOrWhiteSpace($root2)){ return $null }
+        return $root2.TrimEnd('\')
+    }
+    $beforeRoot = Get-SysOrgCommonAncestor -Paths $beforePaths.ToArray()
+    $afterRoot = Get-SysOrgCommonAncestor -Paths $afterPaths.ToArray()
+    if([string]::IsNullOrWhiteSpace($beforeRoot)){ $beforeRoot = $rootN }
+    if([string]::IsNullOrWhiteSpace($afterRoot)){ $afterRoot = $rootN }
+    $before = Get-SysOrgFindabilityScore -Root $beforeRoot -FilePaths $beforePaths.ToArray() -FileSizes $beforeSizes -Confidences $beforeConf -Cap $cap -MinPerFolder $min
+    $after  = Get-SysOrgFindabilityScore -Root $afterRoot  -FilePaths $afterPaths.ToArray()  -FileSizes $afterSizes  -Confidences $afterConf  -Cap $cap -MinPerFolder $min
+    $verdict = 'unchanged'
+    $why = ''
+    if($after.Score -gt $before.Score){ $verdict = 'improves' }
+    elseif($after.Score -lt $before.Score){ $verdict = 'worsens' }
+    $why = ('depth {0} -> {1}; over-cap {2}% -> {3}%{4}' -f $before.AvgDepth, $after.AvgDepth, [Math]::Round($before.OverCapShare*100), [Math]::Round($after.OverCapShare*100),
+        $(if($before.ConfidentShare -ge 0){ ('; confident {0}% -> {1}%' -f [Math]::Round($before.ConfidentShare*100), [Math]::Round($after.ConfidentShare*100)) } else { '' }))
+    return [pscustomobject]@{
+        Before=$before; After=$after; Verdict=$verdict; Why=$why; Moved=$moved; CommonRoot=$beforeRoot
+    }
+}
+
+function Show-SysOrgScoreDelta {
+<#
+.SYNOPSIS
+    Prints the before/after score and the plain-language verdict.
+.EXAMPLE
+    Show-SysOrgScoreDelta -Delta $delta
+#>
+    param([Parameter(Mandatory)]$Delta)
+    $color = 'Gray'
+    if($Delta.Verdict -eq 'improves'){ $color = 'Green' }
+    elseif($Delta.Verdict -eq 'worsens'){ $color = 'Yellow' }
+    Write-Host ''
+    Write-Host ('Findability score: {0} -> {1}  (this plan {2} it)' -f $Delta.Before.Score, $Delta.After.Score, $Delta.Verdict) -ForegroundColor $color
+    Write-Host ('  ' + $Delta.Why) -ForegroundColor Gray
+    if($Delta.Verdict -eq 'worsens'){ Write-Host '  The plan makes the tree harder to browse - review the destination settings before executing.' -ForegroundColor Yellow }
+}
+
+function Get-SysOrgTreeScore {
+<#
+.SYNOPSIS
+    Scores an existing tree live (the -Score CLI path).
+.EXAMPLE
+    Get-SysOrgTreeScore -Root 'C:\_Organized' -Config $cfg
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Root,$Config)
+    $cap = [int](Get-SysOrgSetting $Config 'Layout.MaxFilesPerFolder' 150)
+    $min = [int](Get-SysOrgSetting $Config 'Layout.MinFilesPerFolder' 8)
+    $paths = New-Object System.Collections.Generic.List[string]
+    $sizes = @{}
+    try{
+        foreach($f in [System.IO.Directory]::EnumerateFiles($Root, '*', [System.IO.SearchOption]::AllDirectories)){
+            $paths.Add([string]$f)
+            try { $sizes[[string]$f] = (Get-Item -LiteralPath $f -Force).Length } catch { }
+        }
+    } catch { }
+    return (Get-SysOrgFindabilityScore -Root $Root -FilePaths $paths.ToArray() -FileSizes $sizes -Cap $cap -MinPerFolder $min)
+}
+
 Export-ModuleMember -Function *-SysOrg*
