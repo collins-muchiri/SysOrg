@@ -109,9 +109,13 @@ Describe 'Find-SysOrgFile (Phase 4.2)' {
         $script:catPath = Join-Path $script:catDir '_Index\catalog.ndjson'
         New-Item -ItemType Directory -Path (Split-Path $script:catPath) -Force | Out-Null
         $lines = @()
-        $lines += ('{{"CurrentPath":"{0}\\Documents\\Finance\\Invoices\\2024\\inv1.pdf","OriginalPath":"C:\\dl\\inv1.pdf","Type":"File","Category":"Documents\\Finance\\Invoices","Date":"2024-03-01T10:00:00","DateSource":"plan","SourceBucket":"GitHub","Family":"inv","Hash":"AAA","SizeBytes":12000,"Confidence":0.9,"RuleId":"lexicon","PlanId":"plan-1"}}' -f $script:catDir)
-        $lines += ('{{"CurrentPath":"{0}\\Pictures\\Camera\\2024\\img1.jpg","OriginalPath":"C:\\pics\\img1.jpg","Type":"File","Category":"Pictures\\Camera","Date":"2024-05-05T11:00:00","DateSource":"exif","SourceBucket":"","Family":"","Hash":"BBB","SizeBytes":900000,"Confidence":0.8,"RuleId":"default","PlanId":"plan-1"}}' -f $script:catDir)
-        $lines += ('{{"CurrentPath":"{0}\\Documents\\Finance\\Invoices\\2024\\inv2.pdf","OriginalPath":"C:\\dl\\inv2.pdf","Type":"File","Category":"Documents\\Finance\\Invoices","Date":"2024-03-15T10:00:00","DateSource":"plan","SourceBucket":"WhatsApp","Family":"","Hash":"AAA","SizeBytes":12000,"Confidence":0.85,"RuleId":"lexicon","PlanId":"plan-1"}}' -f $script:catDir)
+        # v3.0.1: the injected path MUST be JSON-escaped - on Windows it contains
+        # backslashes, which pwsh 7 tolerates inside JSON strings but PS 5.1's
+        # ConvertFrom-Json rejects as invalid escape sequences.
+        $script:catEsc = $script:catDir.Replace('\','\\')
+        $lines += ('{{"CurrentPath":"{0}\\Documents\\Finance\\Invoices\\2024\\inv1.pdf","OriginalPath":"C:\\dl\\inv1.pdf","Type":"File","Category":"Documents\\Finance\\Invoices","Date":"2024-03-01T10:00:00","DateSource":"plan","SourceBucket":"GitHub","Family":"inv","Hash":"AAA","SizeBytes":12000,"Confidence":0.9,"RuleId":"lexicon","PlanId":"plan-1"}}' -f $script:catEsc)
+        $lines += ('{{"CurrentPath":"{0}\\Pictures\\Camera\\2024\\img1.jpg","OriginalPath":"C:\\pics\\img1.jpg","Type":"File","Category":"Pictures\\Camera","Date":"2024-05-05T11:00:00","DateSource":"exif","SourceBucket":"","Family":"","Hash":"BBB","SizeBytes":900000,"Confidence":0.8,"RuleId":"default","PlanId":"plan-1"}}' -f $script:catEsc)
+        $lines += ('{{"CurrentPath":"{0}\\Documents\\Finance\\Invoices\\2024\\inv2.pdf","OriginalPath":"C:\\dl\\inv2.pdf","Type":"File","Category":"Documents\\Finance\\Invoices","Date":"2024-03-15T10:00:00","DateSource":"plan","SourceBucket":"WhatsApp","Family":"","Hash":"AAA","SizeBytes":12000,"Confidence":0.85,"RuleId":"lexicon","PlanId":"plan-1"}}' -f $script:catEsc)
         [System.IO.File]::WriteAllLines($script:catPath, $lines)
         $script:findRoot = $script:catDir
     }

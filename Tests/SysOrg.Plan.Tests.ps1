@@ -722,7 +722,7 @@ Describe 'Smaller hardening items (v2.1.1)' {
                     Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; TypeMap=@{}
                     Move=@{ AllowCrossVolume=$true }; MaxPlanActions=5000 }
         $plan = New-SysOrgPlan -Letter T -Inventory @([pscustomobject]@{ FullName=$src; Name='doc.txt'; Stem='doc'; Extension='.txt'
-            Length=2; LastWriteTime=(Get-Date); Directory=(Split-Path $src); Category='Documents' }) -DriveProfile $fakeProf -DupGroups @() -Config $msCfg
+            Length=(Get-Item -LiteralPath $src).Length; LastWriteTime=(Get-Date); Directory=(Split-Path $src); Category='Documents' }) -DriveProfile $fakeProf -DupGroups @() -Config $msCfg   # v3.0.1: REAL length - Set-Content writes CRLF on Windows, and the v2.1.1 drift check honestly skips size mismatches
         $plan.PlanId | Should -Match '^plan-\d{8}-\d{6}-\d{3}$'
         $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder (Join-Path $TestDrive 'ms-plans')
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $msCfg -AppRoot $TestDrive
