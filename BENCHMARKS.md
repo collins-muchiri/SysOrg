@@ -115,8 +115,25 @@ numbers are reported; the honest comparisons follow the table.
    parallel-hash path runs sequentially - on a typical 8-core Windows machine the
    cold duplicate stage should drop further (the pool is bounded by min(4, cores-1)).
 
-Findability (Phase 5's scoring, measured on the executed destination tree after the
-final run): the v2.1-layout comparison table above stays the reference; the Findable
-layout's own score on the same corpus is recorded in the Phase 5 section below once
-`-Score` wiring lands (same corpus, same scoring function).
+Findability (Phase 5's scoring, same corpus, same scoring function, measured on the
+executed destination trees):
+
+| Metric | v2.1 layout | Findable layout |
+|--------|-------------|-----------------|
+| Score (0-100) | 74.4 | **77.4** |
+| Files / folders | 1881 / 100 | 1881 / **269** (adaptive split) |
+| Avg depth / max depth | 2.69 / 3 | 2.78 / **4** (still within the cap) |
+| Files per folder p50 / p90 / p99 | 2 / 3 / **310** | 1 / 2 / **106** |
+| Files in over-cap folders | **78.4%** | **62.0%** |
+| Files in near-empty folders | 10.5% | 20.0% |
+
+The honest reading: the Findable layout cuts the worst-case folder from 310 files
+to 106 (p99) and over-cap share from 78% to 62%, at the cost of more (smaller)
+folders - the near-empty share rises from 10.5% to 20%. The residual over-cap
+share is a CORPUS ARTIFACT: the generator stamps most documents with the same
+day, and YYYY-MM-DD is the finest date granularity, so a single-day bulk dump
+still exceeds the 150-file cap and is reported as such by the score. On real
+drives (dates spread over months) the day buckets stay small. All numbers above
+are reproducible: `SysOrg.ps1 -Benchmark -BenchmarkFiles 20000 -BenchmarkSeed 42`
+then `Get-SysOrgFindabilityScore` over the two `_Organized` trees.
 
