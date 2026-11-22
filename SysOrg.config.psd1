@@ -199,6 +199,16 @@
         WarnOneDriveSyncOut = $true    # list moves that would remove files from OneDrive sync
     }
 
+    # v3.0.1 A4: the download-source bucket map. 'Rules.SourcesPath' may point at a
+    # custom map file; empty = <AppRoot>\Rules\Sources.psd1 (shipped). The map is
+    # EXTENSIBLE: add Hosts (exact host -> bucket, e.g. 'myportal.go.ke' = 'MyPortal'),
+    # SecondLevelSuffixes (registrable-domain awareness) and FileNamePatterns there -
+    # entries merge over the built-ins. AI sources (z.ai -> Z-AI, meta.ai -> Meta-AI,
+    # claude.ai -> Claude, chatgpt.com/openai.com -> OpenAI, gemini.google.com ->
+    # Gemini) are built in. A file that cannot be parsed fails closed at startup.
+    # A derived bucket name shorter than 3 characters falls back to the full host label.
+    Rules = @{ UserRulesPath=''; LexiconPath=''; LearnedRulesPath=''; SourcesPath=''; ApplyLearned=$false }
+
     Privacy = @{
         # Full download URLs (HostUrl/ReferrerUrl) are stored ONLY in the local journal sidecar
         # (Plans\<PlanId>-provenance.csv). Plan JSONs carry the source bucket name only.

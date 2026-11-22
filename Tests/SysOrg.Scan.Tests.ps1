@@ -396,3 +396,84 @@ Describe 'Project folder detection and preview stats (v2.1.1)' {
         @($stats.BlockedSamples)[0] | Should -Match 'native\.dll$'
     }
 }
+
+Describe 'Source buckets: AI map, registrable domains, short labels, extensibility (v3.0.1 A4)' {
+
+    BeforeAll {
+        $script:repoRoot = Split-Path $PSScriptRoot -Parent
+    }
+
+    It 'maps the AI and chat sources' {
+        Get-SysOrgSourceBucket -HostUrl 'https://z.ai/x'                  | Should -Be 'Z-AI'
+        Get-SysOrgSourceBucket -HostUrl 'https://chat.z.ai/f/abc'         | Should -Be 'Z-AI'
+        Get-SysOrgSourceBucket -HostUrl 'https://meta.ai/r/xyz'           | Should -Be 'Meta-AI'
+        Get-SysOrgSourceBucket -HostUrl 'https://claude.ai/chat'          | Should -Be 'Claude'
+        Get-SysOrgSourceBucket -HostUrl 'https://chatgpt.com/g/g-1'       | Should -Be 'OpenAI'
+        Get-SysOrgSourceBucket -HostUrl 'https://openai.com/api'          | Should -Be 'OpenAI'
+        Get-SysOrgSourceBucket -HostUrl 'https://gemini.google.com/app'   | Should -Be 'Gemini'
+        Get-SysOrgSourceBucket -HostUrl 'https://cdn.z.ai/f.bin'          | Should -Be 'Z-AI'   # prefix-stripped hosts resolve too
+    }
+
+    It 'still maps the established sources and public-suffix registrable domains' {
+        Get-SysOrgSourceBucket -HostUrl 'https://github.com/a/b/releases/download/1/f.zip' | Should -Be 'GitHub'
+        Get-SysOrgSourceBucket -HostUrl 'https://www.kra.go.ke/portal' | Should -Be 'Kra'
+        Get-SysOrgSourceBucket -HostUrl 'https://safaricom.co.ke/x'    | Should -Be 'Safaricom'
+        Get-SysOrgSourceBucket -HostUrl 'https://example.co.uk/f.zip'  | Should -Be 'Example'
+        Get-SysOrgSourceBucket -ReferrerUrl 'https://t.me/durov'       | Should -Be 'Telegram'
+    }
+
+    It 'a bucket label shorter than 3 characters falls back to the full host label' {
+        Get-SysOrgSourceBucket -HostUrl 'https://q.io/f.bin' | Should -Be 'q.io'
+        Get-SysOrgSourceBucket -HostUrl 'https://ab.co/f.bin' | Should -Be 'ab.co'
+        Get-SysOrgSourceBucket -HostUrl 'https://example.org/f.bin' | Should -Be 'Example'   # 7-char label is untouched
+    }
+
+    It 'loads the SHIPPED Rules\Sources.psd1 and keeps every built-in host' {
+        $map = Get-SysOrgSourceMap -AppRoot $script:repoRoot
+        $map.SourceFile | Should -Not -BeNullOrEmpty
+        $map.Hosts['z.ai'] | Should -Be 'Z-AI'
+        $map.Hosts['github.com'] | Should -Be 'GitHub'
+        $map.SecondLevelSuffixes['go.ke'] | Should -BeTrue
+        $map.FileNamePatterns.Count | Should -BeGreaterOrEqual 5
+    }
+
+    It 'an extension file MERGES over the built-ins without losing them' {
+        $extApp = Join-Path $TestDrive ('sources-app-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Path (Join-Path $extApp 'Rules') -Force | Out-Null
+        @'
+@{
+    Hosts = @{ 'myportal.go.ke' = 'MyPortal'; 'github.com' = 'CodeHost' }
+    SecondLevelSuffixes = @{ 'or.tz' = $true }
+    FileNamePatterns = @( @{ Pattern = '^mchanga'; Bucket = 'Mchanga' } )
+}
+'@ | Set-Content -LiteralPath (Join-Path $extApp 'Rules\Sources.psd1') -Encoding UTF8
+        $map = Get-SysOrgSourceMap -AppRoot $extApp
+        $map.Hosts['myportal.go.ke'] | Should -Be 'MyPortal'
+        $map.Hosts['github.com']     | Should -Be 'CodeHost'    # override wins
+        $map.Hosts['z.ai']           | Should -Be 'Z-AI'        # built-in kept
+        $map.SecondLevelSuffixes['or.tz'] | Should -BeTrue
+        $map.SecondLevelSuffixes['go.ke'] | Should -BeTrue
+        Get-SysOrgSourceBucket -HostUrl 'https://myportal.go.ke/x' -AppRoot $extApp | Should -Be 'MyPortal'
+        Get-SysOrgSourceBucket -HostUrl 'https://sub.myportal.or.tz/x' -AppRoot $extApp | Should -Be 'MyPortal'
+        Get-SysOrgSourceBucket -FileName 'MCHANGA-payout.pdf' -AppRoot $extApp | Should -Be 'Mchanga'
+        Get-SysOrgSourceBucket -FileName 'WhatsApp Image 2024-01-01.jpg' -AppRoot $extApp | Should -Be 'WhatsApp'
+    }
+
+    It 'a broken Sources file fails closed with a clear message' {
+        $badApp = Join-Path $TestDrive ('sources-bad-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Path (Join-Path $badApp 'Rules') -Force | Out-Null
+        $broken = '@{ Hosts = @{ ''x'' = ''Unbalanced }'
+        $broken | Set-Content -LiteralPath (Join-Path $badApp 'Rules\Sources.psd1') -Encoding UTF8
+        { Get-SysOrgSourceMap -AppRoot $badApp } | Should -Throw '*could not be parsed*'
+        { Get-SysOrgSourceBucket -HostUrl 'https://x.org/f' -AppRoot $badApp } | Should -Throw
+    }
+
+    It 'a Sources file with the wrong shape fails closed' {
+        $shapeApp = Join-Path $TestDrive ('sources-shape-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Path (Join-Path $shapeApp 'Rules') -Force | Out-Null
+        '@(1,2,3)' | Set-Content -LiteralPath (Join-Path $shapeApp 'Rules\Sources.psd1') -Encoding UTF8
+        # a bare array is either refused by the data-file parser or by the shape check -
+        # both fail closed with the file name in the message
+        { Get-SysOrgSourceMap -AppRoot $shapeApp } | Should -Throw '*Sources.psd1*'
+    }
+}

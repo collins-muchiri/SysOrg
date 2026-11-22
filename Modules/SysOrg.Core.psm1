@@ -261,7 +261,9 @@ function Import-SysOrgConfig {
         Classify = @{ MinConfidence=0.40; ReviewConfidence=0.70 }
         # v3.0 rules: UserRules are validated fail-closed at startup; learned rules are
         # NEVER applied unless ApplyLearned=$true (and they are flagged in the preview).
-        Rules = @{ UserRulesPath=''; LexiconPath=''; LearnedRulesPath=''; ApplyLearned=$false }
+        # v3.0.1 A4: the source-bucket map is extensible via Rules\Sources.psd1
+        # (empty path = <AppRoot>\Rules\Sources.psd1).
+        Rules = @{ UserRulesPath=''; LexiconPath=''; LearnedRulesPath=''; SourcesPath=''; ApplyLearned=$false }
         # v3.0 speed: worker count for hashing/metadata. 0 = auto (min(4, cores-1);
         # an HDD spindle throttles to 1 automatically).
         Run = @{ Parallelism = 0 }

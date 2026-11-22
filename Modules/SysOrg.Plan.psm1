@@ -266,12 +266,12 @@ function New-SysOrgPlan {
                 $prov = Get-SysOrgZoneIdentifier -Path $src
             }
             $bucket = $null
-            if($prov){ $bucket = Get-SysOrgSourceBucket -HostUrl "$($prov['HostUrl'])" -ReferrerUrl "$($prov['ReferrerUrl'])" -FileName "$($f.Name)" }
+            if($prov){ $bucket = Get-SysOrgSourceBucket -HostUrl "$($prov['HostUrl'])" -ReferrerUrl "$($prov['ReferrerUrl'])" -FileName "$($f.Name)" -Config $Config -AppRoot "$planAppRoot" }
             $downloadContext = $inDownloads -or ($null -ne $prov) -or ($category -eq 'Installers')
             $sourceName = $null
             if($downloadContext){
                 if((-not $bucket) -and ($inDownloads -or $prov)){
-                    $bucket = Get-SysOrgSourceBucket -HostUrl '' -ReferrerUrl '' -FileName "$($f.Name)"
+                    $bucket = Get-SysOrgSourceBucket -HostUrl '' -ReferrerUrl '' -FileName "$($f.Name)" -Config $Config -AppRoot "$planAppRoot"
                 }
                 if($bucket){ $sourceName = "$bucket" } else { $sourceName = $unknownSrc }
                 $rel = ''

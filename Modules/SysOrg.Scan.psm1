@@ -763,6 +763,122 @@ function Get-SysOrgMultipartSets {
     return [pscustomobject]@{ Map=$map; Sets=$sets.ToArray() }
 }
 
+# ---------------------------------------------------------------------------
+# A4 (v3.0.1): the source bucket map is extensible via Rules\Sources.psd1
+# (config Rules.SourcesPath). The built-in defaults below keep working when the
+# file is missing; a file that exists but cannot be parsed FAILS CLOSED (like a
+# broken lexicon). File entries MERGE over the built-ins: users can add hosts,
+# second-level suffixes and filename patterns without losing the shipped ones.
+# ---------------------------------------------------------------------------
+$script:SysOrgSourceMapCache = @{}
+
+$script:SysOrgBuiltinSourceHosts = @{
+    'github.com'='GitHub'; 'raw.githubusercontent.com'='GitHub'; 'objects.githubusercontent.com'='GitHub'
+    'codeload.github.com'='GitHub'; 'gist.github.com'='GitHub'
+    'z.ai'='Z-AI'; 'chat.z.ai'='Z-AI'; 'meta.ai'='Meta-AI'; 'claude.ai'='Claude'
+    'chatgpt.com'='OpenAI'; 'openai.com'='OpenAI'; 'gemini.google.com'='Gemini'; 'gemini.googleusercontent.com'='Gemini'
+    'whatsapp.com'='WhatsApp'; 'web.whatsapp.com'='WhatsApp'; 'cdn.whatsapp.net'='WhatsApp'
+    'telegram.org'='Telegram'; 't.me'='Telegram'; 'cdn-telegram.org'='Telegram'
+    'signal.org'='Signal'; 'updates.signal.org'='Signal'
+    'discord.com'='Discord'; 'discordapp.com'='Discord'; 'cdn.discordapp.com'='Discord'
+    'dropbox.com'='Dropbox'; 'dl.dropboxusercontent.com'='Dropbox'
+    'drive.google.com'='GoogleDrive'; 'docs.google.com'='GoogleDrive'
+    'onedrive.live.com'='OneDrive'; '1drv.ms'='OneDrive'
+    'live.com'='Microsoft'; 'sharepoint.com'='Microsoft'; 'office.com'='Microsoft'; 'microsoft.com'='Microsoft'
+    'slack.com'='Slack'; 'files.slack.com'='Slack'
+    'reddit.com'='Reddit'; 'i.redd.it'='Reddit'
+    'steamcontent.com'='Steam'; 'steampowered.com'='Steam'
+    'zoom.us'='Zoom'; 'archive.org'='InternetArchive'
+}
+
+$script:SysOrgBuiltinSourceSuffixes = @{
+    'co.uk'=$true;'org.uk'=$true;'ac.uk'=$true;'gov.uk'=$true;'me.uk'=$true;'net.uk'=$true;'ltd.uk'=$true;'plc.uk'=$true
+    'com.au'=$true;'net.au'=$true;'org.au'=$true;'edu.au'=$true;'gov.au'=$true
+    'co.nz'=$true;'net.nz'=$true;'org.nz'=$true
+    'co.za'=$true;'org.za'=$true;'ac.za'=$true;'gov.za'=$true
+    'co.ke'=$true;'or.ke'=$true;'go.ke'=$true;'ac.ke'=$true;'ne.ke'=$true;'sc.ke'=$true;'info.ke'=$true
+    'com.ng'=$true;'org.ng'=$true;'gov.ng'=$true;'edu.ng'=$true;'net.ng'=$true
+    'co.in'=$true;'net.in'=$true;'org.in'=$true;'gov.in'=$true;'ac.in'=$true;'firm.in'=$true
+    'com.br'=$true;'net.br'=$true;'org.br'=$true;'gov.br'=$true
+    'com.mx'=$true;'org.mx'=$true;'net.mx'=$true
+    'com.tr'=$true;'net.tr'=$true;'org.tr'=$true
+    'co.kr'=$true;'ne.kr'=$true;'or.kr'=$true
+    'co.jp'=$true;'ne.jp'=$true;'or.jp'=$true;'ac.jp'=$true;'go.jp'=$true
+    'com.sg'=$true;'net.sg'=$true;'org.sg'=$true;'gov.sg'=$true
+    'com.cn'=$true;'net.cn'=$true;'org.cn'=$true;'gov.cn'=$true
+    'com.ar'=$true;'net.ar'=$true;'org.ar'=$true
+    'com.hk'=$true;'org.hk'=$true;'net.hk'=$true
+    'co.id'=$true;'or.id'=$true;'web.id'=$true
+    'com.my'=$true;'org.my'=$true;'net.my'=$true
+    'com.ph'=$true;'org.ph'=$true;'net.ph'=$true
+    'com.tw'=$true;'org.tw'=$true;'net.tw'=$true
+    'com.vn'=$true;'net.vn'=$true;'org.vn'=$true
+    'com.pk'=$true;'net.pk'=$true;'org.pk'=$true
+    'com.eg'=$true;'net.eg'=$true;'org.eg'=$true
+    'co.th'=$true;'or.th'=$true;'ac.th'=$true
+    'com.ua'=$true;'net.ua'=$true;'org.ua'=$true
+    'co.il'=$true;'org.il'=$true;'net.il'=$true;'ac.il'=$true
+    'com.co'=$true;'net.co'=$true;'org.co'=$true
+}
+
+$script:SysOrgBuiltinSourcePatterns = @(
+    @{ Pattern='^whatsapp';   Bucket='WhatsApp' }
+    @{ Pattern='wa\d{4}';     Bucket='WhatsApp' }
+    @{ Pattern='^telegram';   Bucket='Telegram' }
+    @{ Pattern='^signal-';    Bucket='Signal' }
+    @{ Pattern='^screenshot'; Bucket='Screenshots' }
+)
+
+function Get-SysOrgSourceMap {
+<#
+.SYNOPSIS
+    Loads the extensible source-bucket map (Rules\Sources.psd1) over the built-ins.
+.DESCRIPTION
+    Resolution: config Rules.SourcesPath, or <AppRoot>\Rules\Sources.psd1. A missing
+    file yields the built-in defaults; a file that exists but cannot be parsed, or
+    that has the wrong shape, THROWS (fail closed - a broken source map is a broken
+    rule set). File entries merge over the built-ins per key: Hosts and
+    SecondLevelSuffixes by host/suffix key, FileNamePatterns appended after the
+    built-in patterns. Results are cached per (path, file mtime).
+.EXAMPLE
+    $map = Get-SysOrgSourceMap -Config $cfg -AppRoot 'C:\SysOrg'
+    $map.Hosts['z.ai']   # -> 'Z-AI'
+#>
+    [CmdletBinding()]
+    param($Config,[string]$AppRoot)
+    $path = "$(Get-SysOrgSetting $Config 'Rules.SourcesPath' '')"
+    if([string]::IsNullOrWhiteSpace($path) -and $AppRoot){ $path = (Join-Path $AppRoot 'Rules\Sources.psd1') }
+    $hosts = $script:SysOrgBuiltinSourceHosts.Clone()
+    $suffixes = $script:SysOrgBuiltinSourceSuffixes.Clone()
+    $patterns = @($script:SysOrgBuiltinSourcePatterns)
+    if([string]::IsNullOrWhiteSpace($path) -or (-not (Test-Path -LiteralPath $path))){
+        return [pscustomobject]@{ Hosts=$hosts; SecondLevelSuffixes=$suffixes; FileNamePatterns=$patterns; SourceFile='' }
+    }
+    $mtime = (Get-Item -LiteralPath $path -Force).LastWriteTimeUtc.Ticks
+    $cacheKey = ('{0}|{1}' -f $path, $mtime)
+    if($script:SysOrgSourceMapCache.ContainsKey($cacheKey)){ return $script:SysOrgSourceMapCache[$cacheKey] }
+    $loaded = $null
+    try { $loaded = Import-PowerShellDataFile -LiteralPath $path -ErrorAction Stop }
+    catch { throw ("Source map file '{0}' could not be parsed: {1} (fix the file or remove it to use the built-in defaults)." -f $path, $_.Exception.Message) }
+    if($loaded -isnot [hashtable]){ throw ("Source map file '{0}' must be a hashtable with Hosts / SecondLevelSuffixes / FileNamePatterns." -f $path) }
+    if($loaded.ContainsKey('Hosts') -and ($loaded['Hosts'] -is [hashtable])){
+        foreach($k in $loaded['Hosts'].Keys){ $hosts[[string]$k] = [string]$loaded['Hosts'][$k] }
+    }
+    if($loaded.ContainsKey('SecondLevelSuffixes') -and ($loaded['SecondLevelSuffixes'] -is [hashtable])){
+        foreach($k in $loaded['SecondLevelSuffixes'].Keys){ $suffixes[[string]$k] = $true }
+    }
+    if($loaded.ContainsKey('FileNamePatterns') -and ($loaded['FileNamePatterns'] -is [System.Collections.IEnumerable])){
+        foreach($p in @($loaded['FileNamePatterns'])){
+            if($p -is [hashtable] -and (-not [string]::IsNullOrWhiteSpace("$($p['Pattern'])"))){
+                $patterns += @{ Pattern=[string]$p['Pattern']; Bucket=[string]$p['Bucket'] }
+            }
+        }
+    }
+    $map = [pscustomobject]@{ Hosts=$hosts; SecondLevelSuffixes=$suffixes; FileNamePatterns=$patterns; SourceFile=$path }
+    $script:SysOrgSourceMapCache[$cacheKey] = $map
+    return $map
+}
+
 function Get-SysOrgSourceBucket {
 <#
 .SYNOPSIS
@@ -774,60 +890,22 @@ function Get-SysOrgSourceBucket {
     addresses and localhost fall through to the filename heuristics instead of producing
     buckets like '1' or 'Localhost', and every bucket passes through
     Get-SysOrgSafeFolderName so reserved device names ('nul', 'con', ...) come out safe.
-    Returns $null when nothing matches - the caller routes to Downloads\_NoSource.
+    v3.0.1 A4: the host/suffix/pattern maps are extensible via Rules\Sources.psd1
+    (pass -Config/-AppRoot to load it); AI sources (z.ai, meta.ai, claude.ai,
+    chatgpt.com/openai.com, gemini.google.com) are built in. A derived bucket name
+    SHORTER THAN 3 characters (e.g. 'q' from 'q.io') is replaced by the FULL HOST
+    label, so single-letter folders never appear in the tree.
+    Returns $null when nothing matches - the caller decides the fallback routing.
 .EXAMPLE
     Get-SysOrgSourceBucket -HostUrl 'https://github.com/x/y/releases/download/1/f.zip'   # -> 'GitHub'
+.EXAMPLE
+    Get-SysOrgSourceBucket -HostUrl 'https://chat.z.ai/f/x' -Config $cfg -AppRoot 'C:\SysOrg'   # -> 'Z-AI'
 #>
     [CmdletBinding()]
-    param([string]$HostUrl,[string]$ReferrerUrl,[string]$FileName)
-    $hostMap = @{
-        'github.com'='GitHub'; 'raw.githubusercontent.com'='GitHub'; 'objects.githubusercontent.com'='GitHub'
-        'codeload.github.com'='GitHub'; 'gist.github.com'='GitHub'
-        'whatsapp.com'='WhatsApp'; 'web.whatsapp.com'='WhatsApp'; 'cdn.whatsapp.net'='WhatsApp'
-        'telegram.org'='Telegram'; 't.me'='Telegram'; 'cdn-telegram.org'='Telegram'
-        'signal.org'='Signal'; 'updates.signal.org'='Signal'
-        'discord.com'='Discord'; 'discordapp.com'='Discord'; 'cdn.discordapp.com'='Discord'
-        'dropbox.com'='Dropbox'; 'dl.dropboxusercontent.com'='Dropbox'
-        'drive.google.com'='GoogleDrive'; 'docs.google.com'='GoogleDrive'
-        'onedrive.live.com'='OneDrive'; '1drv.ms'='OneDrive'
-        'live.com'='Microsoft'; 'sharepoint.com'='Microsoft'; 'office.com'='Microsoft'; 'microsoft.com'='Microsoft'
-        'slack.com'='Slack'; 'files.slack.com'='Slack'
-        'reddit.com'='Reddit'; 'i.redd.it'='Reddit'
-        'steamcontent.com'='Steam'; 'steampowered.com'='Steam'
-        'zoom.us'='Zoom'; 'archive.org'='InternetArchive'
-    }
-    # v2.1.1: compact list of common second-level public suffixes. For hosts under one of
-    # these, the bucket comes from the label BEFORE the two-part suffix, not the label
-    # before the TLD (www.kra.go.ke -> Kra, not Go).
-    $secondLevelSuffixes = @{
-        'co.uk'=$true;'org.uk'=$true;'ac.uk'=$true;'gov.uk'=$true;'me.uk'=$true;'net.uk'=$true;'ltd.uk'=$true;'plc.uk'=$true
-        'com.au'=$true;'net.au'=$true;'org.au'=$true;'edu.au'=$true;'gov.au'=$true
-        'co.nz'=$true;'net.nz'=$true;'org.nz'=$true
-        'co.za'=$true;'org.za'=$true;'ac.za'=$true;'gov.za'=$true
-        'co.ke'=$true;'or.ke'=$true;'go.ke'=$true;'ac.ke'=$true;'ne.ke'=$true;'sc.ke'=$true;'info.ke'=$true
-        'com.ng'=$true;'org.ng'=$true;'gov.ng'=$true;'edu.ng'=$true;'net.ng'=$true
-        'co.in'=$true;'net.in'=$true;'org.in'=$true;'gov.in'=$true;'ac.in'=$true;'firm.in'=$true
-        'com.br'=$true;'net.br'=$true;'org.br'=$true;'gov.br'=$true
-        'com.mx'=$true;'org.mx'=$true;'net.mx'=$true
-        'com.tr'=$true;'net.tr'=$true;'org.tr'=$true
-        'co.kr'=$true;'ne.kr'=$true;'or.kr'=$true
-        'co.jp'=$true;'ne.jp'=$true;'or.jp'=$true;'ac.jp'=$true;'go.jp'=$true
-        'com.sg'=$true;'net.sg'=$true;'org.sg'=$true;'gov.sg'=$true
-        'com.cn'=$true;'net.cn'=$true;'org.cn'=$true;'gov.cn'=$true
-        'com.ar'=$true;'net.ar'=$true;'org.ar'=$true
-        'com.hk'=$true;'org.hk'=$true;'net.hk'=$true
-        'co.id'=$true;'or.id'=$true;'web.id'=$true
-        'com.my'=$true;'org.my'=$true;'net.my'=$true
-        'com.ph'=$true;'org.ph'=$true;'net.ph'=$true
-        'com.tw'=$true;'org.tw'=$true;'net.tw'=$true
-        'com.vn'=$true;'net.vn'=$true;'org.vn'=$true
-        'com.pk'=$true;'net.pk'=$true;'org.pk'=$true
-        'com.eg'=$true;'net.eg'=$true;'org.eg'=$true
-        'co.th'=$true;'or.th'=$true;'ac.th'=$true
-        'com.ua'=$true;'net.ua'=$true;'org.ua'=$true
-        'co.il'=$true;'org.il'=$true;'net.il'=$true;'ac.il'=$true
-        'com.co'=$true;'net.co'=$true;'org.co'=$true
-    }
+    param([string]$HostUrl,[string]$ReferrerUrl,[string]$FileName,$Config,[string]$AppRoot)
+    $map = Get-SysOrgSourceMap -Config $Config -AppRoot $AppRoot
+    $hostMap = $map.Hosts
+    $secondLevelSuffixes = $map.SecondLevelSuffixes
     $u = $null
     foreach($c in @($HostUrl,$ReferrerUrl)){ if("$c"){ $u = "$c"; break } }
     if($u){
@@ -835,10 +913,11 @@ function Get-SysOrgSourceBucket {
             if($u -notmatch '^[a-zA-Z][a-zA-Z0-9+.-]*://'){ $u = 'https://' + $u }
             $uri = [uri]$u
             $h = $uri.Host.ToLowerInvariant()
-            if($hostMap.ContainsKey($h)){ return $hostMap[$h] }
+            if($hostMap.ContainsKey($h)){ return (Get-SysOrgSafeFolderName -Name ([string]$hostMap[$h]) -MaxLength 60) }
             foreach($pfx in @('cdn.','dl.','download.','downloads.','www.','data.','assets.','static.','media.')){
                 if($h.StartsWith($pfx)){ $h = $h.Substring($pfx.Length); break }
             }
+            if($hostMap.ContainsKey($h)){ return (Get-SysOrgSafeFolderName -Name ([string]$hostMap[$h]) -MaxLength 60) }
             $parts = $h.Split('.')
             $name = $null
             # v2.1.1: IP addresses and localhost have no registrable domain - leave the
@@ -853,18 +932,22 @@ function Get-SysOrgSourceBucket {
             else { $name = $parts[0] }
             if($name -and ("$name" -ne '')){
                 $ti = (Get-Culture).TextInfo
+                # v3.0.1 A4: a derived label shorter than 3 characters ('q' from 'q.io')
+                # is too generic for a folder - use the full host as the label instead.
+                $label = "$name"
+                if($label.Length -lt 3){ $label = $h }
+                if($label.Length -lt 3){ return $null }   # the whole host is shorter than 3 chars
                 # v2.1.1: sanitize - reserved device names ('nul.com' -> Nul) must never
                 # become destination folder names.
-                return (Get-SysOrgSafeFolderName -Name ($ti.ToTitleCase("$name")) -MaxLength 60)
+                if($label -eq $h){ return (Get-SysOrgSafeFolderName -Name $label -MaxLength 60) }
+                return (Get-SysOrgSafeFolderName -Name ($ti.ToTitleCase("$label")) -MaxLength 60)
             }
         } catch { Write-Verbose "Source bucket parse failed for '$u': $($_.Exception.Message)" }
     }
     if($FileName){
-        if("$FileName" -imatch '^whatsapp'){ return 'WhatsApp' }
-        if("$FileName" -imatch 'wa\d{4}'){ return 'WhatsApp' }
-        if("$FileName" -imatch '^telegram'){ return 'Telegram' }
-        if("$FileName" -imatch '^signal-'){ return 'Signal' }
-        if("$FileName" -imatch '^screenshot'){ return 'Screenshots' }
+        foreach($fp in @($map.FileNamePatterns)){
+            if("$FileName" -imatch "$($fp.Pattern)"){ return ([string]$fp.Bucket) }
+        }
     }
     return $null
 }
