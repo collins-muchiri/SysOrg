@@ -22,6 +22,52 @@ function Merge-SysOrgHashtable {
     return $Base
 }
 
+function Join-SysOrgProtectedList {
+<#
+.SYNOPSIS
+    Additive merge for protection lists (v2.1.1): user entries + built-ins, built-ins re-added.
+.DESCRIPTION
+    A user config can ADD entries to Policy.ProtectedArtifacts and the per-scope
+    BlockedExtensions lists, but cannot REMOVE the built-in entries. Missing built-ins
+    are re-added and a warning is written, so a hostile or careless config can never
+    shrink the protection lists. Comparison is case-insensitive.
+.EXAMPLE
+    Join-SysOrgProtectedList -User @('.foo') -BuiltIn @('.dll','.sys') -Label 'Policy.SystemDrive.BlockedExtensions'
+#>
+    param([AllowEmptyCollection()]$User,[AllowEmptyCollection()][string[]]$BuiltIn,[string]$Label)
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach($v in @($User)){
+        $s = "$v"
+        if(-not [string]::IsNullOrWhiteSpace($s) -and (-not ($out -contains $s))){ [void]$out.Add($s) }
+    }
+    $missing = @()
+    foreach($b in $BuiltIn){
+        if(-not ($out -contains $b)){ $missing += $b; [void]$out.Add($b) }
+    }
+    if($missing.Count -gt 0){
+        Write-Warning ("{0}: user configuration cannot remove built-in entries; re-added: {1}" -f $Label, ($missing -join ', '))
+    }
+    return $out.ToArray()
+}
+
+function Resolve-SysOrgWritablePath {
+<#
+.SYNOPSIS
+    Resolves -WritablePath input to a full canonical path (v2.1.1).
+.DESCRIPTION
+    Previously a relative -WritablePath was stored raw into the policy and never matched
+    any absolute path at mutability-check time. This resolves the path against the
+    current location and canonicalizes it with [IO.Path]::GetFullPath. Throws when the
+    path does not exist (the CLI warns and continues).
+.EXAMPLE
+    Resolve-SysOrgWritablePath -Path 'C:\Work\Exports'
+#>
+    param([Parameter(Mandatory)][string]$Path)
+    if(-not (Test-Path -LiteralPath $Path)){ throw ("WritablePath does not exist: $Path") }
+    $rp = (Resolve-Path -LiteralPath $Path).ProviderPath
+    return ([System.IO.Path]::GetFullPath($rp))
+}
+
 function Test-SysOrgConfig {
 <#
 .SYNOPSIS
@@ -90,14 +136,29 @@ function Import-SysOrgConfig {
       ProjectDetection -> Projects.Enabled (file clusters were replaced by name families)
     W9: Policy.ProtectedArtifacts are appended for EVERY fixed drive (not just C) after the
     user merge, so D:\WindowsApps and E:\XboxGames are protected without user configuration.
+    v2.1.1 (audit High #2):
+      - FAIL CLOSED: when the config file exists but cannot be parsed, Import-SysOrgConfig
+        THROWS by default - silently moving files on dropped user exclusions is not
+        acceptable. Report-only/scheduled sessions may pass -AllowDegradedMode to continue
+        with safe defaults after a loud warning.
+      - NON-OVERRIDABLE PROTECTION FLOOR: SystemRoot, Program Files, Program Files (x86),
+        ProgramData plus $Recycle.Bin and System Volume Information at every fixed drive
+        root are always appended to ExcludedPaths after the merge, independent of
+        Policy.ProtectedArtifacts.
+      - ADDITIVE MERGE: Policy.ProtectedArtifacts and the per-scope BlockedExtensions lists
+        merge additively - user configs can add entries but cannot remove built-ins.
 .PARAMETER Path
     Path to the .psd1 config file. Missing file silently yields defaults.
 .PARAMETER AppRoot
     Folder containing SysOrg.ps1; recorded in the config and excluded from scans.
+.PARAMETER AllowDegradedMode
+    Report-only/scheduled switch: on a parse error, continue with safe defaults after a
+    loud warning instead of throwing. Never combine with plan execution.
 .EXAMPLE
     $cfg = Import-SysOrgConfig -Path .\SysOrg.config.psd1 -AppRoot (Get-Location)
 #>
-    param([string]$Path,[string]$AppRoot)
+    [CmdletBinding()]
+    param([string]$Path,[string]$AppRoot,[switch]$AllowDegradedMode)
     $defaults = @{
         Version          = '2.1.0'
         NamingPreset     = 'Windows'
@@ -194,12 +255,35 @@ function Import-SysOrgConfig {
                 [void](Merge-SysOrgHashtable -Base $defaults -Override $loaded)
             }
         } catch {
-            Write-Warning "Config '$Path' could not be parsed ($($_.Exception.Message)). Using safe defaults."
+            $msg = "Config '$Path' could not be parsed ($($_.Exception.Message))."
+            if($AllowDegradedMode){
+                Write-Warning ("$msg CONTINUING WITH SAFE DEFAULTS in degraded/report-only mode - user exclusions from the config are NOT applied. Do not execute plans in this session.")
+            } else {
+                # v2.1.1 fail closed: a config that cannot be parsed may carry user
+                # exclusions that are now unknown; moving files with defaults alone is
+                # not acceptable.
+                throw ("$msg SysOrg fails closed: fix or remove the config file, or use -AllowDegradedMode for report-only sessions.")
+            }
         }
     }
     if($defaults.ExcludedPaths -is [string]){ $defaults.ExcludedPaths = @($defaults.ExcludedPaths) }
-    # W9/P1-7: protected artifacts on EVERY fixed drive, appended after the user merge so they
-    # can never be opted away by accident (the user override replaces the array wholesale).
+    # v2.1.1: additive merges - user configuration can ADD to the protection lists but
+    # cannot remove the built-in entries (a config with ProtectedArtifacts = @() used to
+    # clear every system protection). Guards keep a hostile non-hashtable Policy harmless.
+    $builtInArtifacts = @('Windows','Program Files','Program Files (x86)','ProgramData','WindowsApps',
+                          'XboxGames','$Recycle.Bin','System Volume Information','Recovery','Boot','MSOCache','PerfLogs')
+    $builtInBlockedSystem = @('.dll','.sys','.drv','.ocx','.cpl','.scr','.lnk','.url')
+    $builtInBlockedData   = @('.dll','.sys','.drv','.ocx','.cpl','.scr')
+    if($defaults.Policy -is [hashtable]){
+        $defaults.Policy.ProtectedArtifacts = Join-SysOrgProtectedList -User $defaults.Policy.ProtectedArtifacts -BuiltIn $builtInArtifacts -Label 'Policy.ProtectedArtifacts'
+        if($defaults.Policy.SystemDrive -is [hashtable]){
+            $defaults.Policy.SystemDrive.BlockedExtensions = Join-SysOrgProtectedList -User $defaults.Policy.SystemDrive.BlockedExtensions -BuiltIn $builtInBlockedSystem -Label 'Policy.SystemDrive.BlockedExtensions'
+        }
+        if($defaults.Policy.DataDrives -is [hashtable]){
+            $defaults.Policy.DataDrives.BlockedExtensions = Join-SysOrgProtectedList -User $defaults.Policy.DataDrives.BlockedExtensions -BuiltIn $builtInBlockedData -Label 'Policy.DataDrives.BlockedExtensions'
+        }
+    }
+    # W9/P1-7: protected artifacts on EVERY fixed drive, appended after the user merge.
     try{
         $artifacts = @($defaults.Policy.ProtectedArtifacts)
         foreach($drv in [System.IO.DriveInfo]::GetDrives()){
@@ -209,6 +293,26 @@ function Import-SysOrgConfig {
             foreach($a in $artifacts){ $defaults.ExcludedPaths += ($r + '\' + $a) }
         }
     } catch { Write-Verbose "Could not enumerate fixed drives for default exclusions: $($_.Exception.Message)" }
+    # v2.1.1: NON-OVERRIDABLE protection floor - always appended after the merge,
+    # independent of Policy.ProtectedArtifacts. Even a config that replaces ExcludedPaths
+    # wholesale cannot remove these.
+    $floor = @()
+    foreach($envName in @('SystemRoot','ProgramFiles','ProgramFiles(x86)','ProgramData')){
+        $v = [Environment]::GetEnvironmentVariable($envName)
+        if($v -and (Test-Path -LiteralPath $v)){ $floor += ($v.TrimEnd('\')) }
+    }
+    try{
+        foreach($drv in [System.IO.DriveInfo]::GetDrives()){
+            if($drv.DriveType -ne 'Fixed'){ continue }
+            if(-not $drv.IsReady){ continue }
+            $r = $drv.Name.TrimEnd('\')
+            $floor += ($r + '\$Recycle.Bin')
+            $floor += ($r + '\System Volume Information')
+        }
+    } catch { Write-Verbose "Could not enumerate fixed drives for the protection floor: $($_.Exception.Message)" }
+    foreach($f in $floor){
+        if(@($defaults.ExcludedPaths) -notcontains $f){ $defaults.ExcludedPaths = @($defaults.ExcludedPaths) + $f }
+    }
     Test-SysOrgConfig -Config $defaults
     $defaults.AppRoot = $AppRoot
     return ,$defaults

@@ -30,9 +30,11 @@
 
     # Paths never scanned or modified. Prefix match unless it contains wildcards.
     # Root-less single names (e.g. 'Recovery') match ANY path segment on ANY drive.
-    # NOTE: every fixed drive also automatically gets Policy.ProtectedArtifacts appended at
-    # startup (Windows, Program Files, ProgramData, WindowsApps, XboxGames, $Recycle.Bin, ...)
-    # - they cannot be opted away by accident.
+    # NOTE (v2.1.1): the protection floor - SystemRoot, Program Files, Program Files (x86),
+    # ProgramData, and $Recycle.Bin / System Volume Information at every fixed drive root -
+    # and the built-in entries of Policy.ProtectedArtifacts / BlockedExtensions are ALWAYS
+    # re-added after the merge. User configuration can ADD entries but can never REMOVE
+    # these built-ins, and a config file that cannot be parsed makes SysOrg fail closed.
     ExcludedPaths = @(
         'C:\Windows'
         'C:\Program Files'

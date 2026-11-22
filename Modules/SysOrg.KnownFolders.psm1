@@ -32,6 +32,40 @@ $script:CanonicalCategoryNames = @{
     Desktop   = @('desktop')
 }
 
+function Test-SysOrgKnownFolderPath {
+<#
+.SYNOPSIS
+    Sanity-checks a resolved known folder path (v2.1.1).
+.DESCRIPTION
+    Rejects paths that must never be treated as an organizable known folder: a drive
+    root, the user-profile root, or a parent of the Windows or Program Files folders.
+    A bad registry redirect (or a malicious one) could otherwise point the writable
+    scope, the scan scope or plan logic at system locations. Returns $true when the
+    path is acceptable.
+.EXAMPLE
+    Test-SysOrgKnownFolderPath -Path 'C:\'          # -> False (drive root)
+    Test-SysOrgKnownFolderPath -Path 'C:\Users\t\Documents'   # -> True
+#>
+    param([AllowEmptyString()][string]$Path)
+    if([string]::IsNullOrWhiteSpace($Path)){ return $false }
+    $p = ("$Path").Replace('/','\').TrimEnd('\')
+    if($p -match '^[A-Za-z]:$'){ return $false }        # drive root ('C:')
+    if($p -match '^[A-Za-z]:\\$'){ return $false }      # drive root ('C:\')
+    $up = $env:USERPROFILE
+    if($up){
+        $upN = $up.Replace('/','\').TrimEnd('\')
+        if($p -ieq $upN){ return $false }               # the profile root itself
+    }
+    foreach($sysEnv in @('SystemRoot','ProgramFiles')){
+        $sys = [Environment]::GetEnvironmentVariable($sysEnv)
+        if($sys){
+            $sysN = $sys.Replace('/','\').TrimEnd('\')
+            if($p -ieq $sysN -or $sysN.StartsWith($p + '\',[StringComparison]::OrdinalIgnoreCase)){ return $false }
+        }
+    }
+    return $true
+}
+
 function Get-SysOrgKnownFolders {
 <#
 .SYNOPSIS
@@ -78,10 +112,17 @@ function Get-SysOrgKnownFolders {
     foreach($k in $out.Keys){
         $path = ([string]$out[$k]).TrimEnd('\')
         if(-not $path){ continue }
+        # v2.1.1: sanity check - a known folder redirected to a drive root, the profile
+        # root, or a parent of a system folder is ignored with a warning.
+        if(-not (Test-SysOrgKnownFolderPath -Path $path)){
+            Write-Warning ("Known folder '{0}' resolves to '{1}', which is unsafe (drive root, profile root, or a parent of a system folder) - it is ignored for scoping." -f $k, $path)
+            continue
+        }
         $redirected = $false
         $underOD = $false
         if($profilePrefix){ $redirected = -not $path.StartsWith($profilePrefix,[StringComparison]::OrdinalIgnoreCase) }
         if($oneDrive){
+            # (replaced by Test-SysOrgUnderOneDrive in the v2.1.1 OneDrive item)
             $underOD = $path.StartsWith($oneDrive + '\',[StringComparison]::OrdinalIgnoreCase) -or ($path -ieq $oneDrive)
         }
         $result += [pscustomobject]@{

@@ -46,24 +46,35 @@ Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
 
 if(-not $ConfigPath){ $ConfigPath = Join-Path $appRoot 'SysOrg.config.psd1' }
-$Config  = Import-SysOrgConfig -Path $ConfigPath -AppRoot $appRoot
+# v2.1.1 fail closed: a config that exists but cannot be parsed may carry user
+# exclusions we know nothing about. Interactive/execute sessions stop; the
+# report-only scheduled session may continue with safe defaults after a loud warning.
+try {
+    $Config  = Import-SysOrgConfig -Path $ConfigPath -AppRoot $appRoot
+} catch {
+    if($ScheduledReport){
+        Write-Warning ("CONFIG PARSE FAILED ({0}) - scheduled report continues with SAFE DEFAULTS; user exclusions from the config are NOT applied. Nothing will be moved (report-only mode)." -f $_.Exception.Message)
+        $Config = Import-SysOrgConfig -Path $ConfigPath -AppRoot $appRoot -AllowDegradedMode
+    } else {
+        throw
+    }
+}
 $folders = New-SysOrgAppFolders -AppRoot $appRoot
 $logFolder = $folders.Logs
 
-# -WritablePath extends the writable scope on any drive (design section 5.1)
+# -WritablePath extends the writable scope on any drive (design section 5.1).
+# v2.1.1: the input is resolved to a FULL CANONICAL path first - a relative path used to
+# be stored raw and never matched any absolute path at mutability-check time.
 if($WritablePath -and @($WritablePath).Count -gt 0){
     foreach($wp in $WritablePath){
-        if(Test-Path -LiteralPath $wp){
-            try{
-                $sd = $Config.Policy.SystemDrive
-                if($sd -is [hashtable]){ $sd.WritablePaths = @($sd.WritablePaths) + $wp }
-                $dd = $Config.Policy.DataDrives
-                if($dd -is [hashtable]){ $dd.WritablePaths = @($dd.WritablePaths) + $wp }
-                Write-SysOrgLog "Writable scope extended via -WritablePath: $wp" -LogFolder $logFolder
-            } catch { Write-Warning "Could not apply -WritablePath '$wp': $($_.Exception.Message)" }
-        } else {
-            Write-Warning "WritablePath does not exist and was ignored: $wp"
-        }
+        try{
+            $full = Resolve-SysOrgWritablePath -Path $wp
+            $sd = $Config.Policy.SystemDrive
+            if($sd -is [hashtable]){ $sd.WritablePaths = @($sd.WritablePaths) + $full }
+            $dd = $Config.Policy.DataDrives
+            if($dd -is [hashtable]){ $dd.WritablePaths = @($dd.WritablePaths) + $full }
+            Write-SysOrgLog "Writable scope extended via -WritablePath: $full" -LogFolder $logFolder
+        } catch { Write-Warning "Could not apply -WritablePath '$wp': $($_.Exception.Message)" }
     }
 }
 

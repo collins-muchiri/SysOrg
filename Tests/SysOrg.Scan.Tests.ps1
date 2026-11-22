@@ -250,3 +250,29 @@ Describe 'Get-SysOrgSourceBucket (downloads provenance)' {
         Get-SysOrgSourceBucket | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Known-folder sanity check (v2.1.1)' {
+    It 'rejects a drive root, an empty path and the profile root' {
+        Test-SysOrgKnownFolderPath -Path 'C:\' | Should -BeFalse
+        Test-SysOrgKnownFolderPath -Path 'C:'  | Should -BeFalse
+        Test-SysOrgKnownFolderPath -Path ''    | Should -BeFalse
+        if($env:USERPROFILE){ Test-SysOrgKnownFolderPath -Path $env:USERPROFILE | Should -BeFalse }
+    }
+    It 'accepts a normal subfolder' {
+        $d = Join-Path $TestDrive 'kf-ok'
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        Test-SysOrgKnownFolderPath -Path $d | Should -BeTrue
+    }
+    It 'rejects a known folder redirected to C:\ (drive root)' {
+        # exactly the audit scenario: a redirected known folder pointing at the drive root
+        Test-SysOrgKnownFolderPath -Path 'C:\' | Should -BeFalse
+    }
+    It 'rejects a folder that is a parent of the Windows or Program Files folders (env override)' {
+        $oldPf = $env:ProgramFiles
+        try{
+            $env:ProgramFiles = (Join-Path $TestDrive 'sysroot\Program Files')
+            Test-SysOrgKnownFolderPath -Path (Join-Path $TestDrive 'sysroot') | Should -BeFalse
+            Test-SysOrgKnownFolderPath -Path (Join-Path $TestDrive 'sysroot\Program Files') | Should -BeFalse
+        } finally { $env:ProgramFiles = $oldPf }
+    }
+}

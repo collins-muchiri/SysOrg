@@ -44,11 +44,51 @@ Describe 'Import-SysOrgConfig' {
         $cfg.Copies.MinFileSizeKB | Should -Be 777
         ($cfg -is [hashtable] -and -not $cfg.ContainsKey('Duplicates')) | Should -BeTrue
     }
-    It 'falls back to defaults when the config file cannot be parsed' {
+    It 'fails closed: throws when the config file exists but cannot be parsed (v2.1.1)' {
         $file = Join-Path $TestDrive 'cfg-bad.psd1'
         Set-Content -LiteralPath $file -Value '@{ DateFolders = (Get-Date) }'
-        $cfg = Import-SysOrgConfig -Path $file -AppRoot $TestDrive
+        { Import-SysOrgConfig -Path $file -AppRoot $TestDrive } | Should -Throw '*could not be parsed*'
+    }
+    It 'degraded mode (-AllowDegradedMode) continues with safe defaults after a loud warning (v2.1.1)' {
+        $file = Join-Path $TestDrive 'cfg-bad2.psd1'
+        Set-Content -LiteralPath $file -Value '@{ DateFolders = (Get-Date) }'
+        $warned = $null
+        $cfg = Import-SysOrgConfig -Path $file -AppRoot $TestDrive -AllowDegradedMode -WarningVariable warned -WarningAction SilentlyContinue
         $cfg.DateFolders | Should -Be 'Year'
+        ($warned -join ' ') | Should -Match 'SAFE DEFAULTS'
+    }
+    It 'the non-overridable protection floor survives a user override of ExcludedPaths (v2.1.1)' {
+        if($env:OS -ne 'Windows_NT'){ Set-ItResult -Inconclusive -Because 'the env-based floor paths (SystemRoot, Program Files) are Windows-specific; the portable part is asserted below'; return }
+        $file = Join-Path $TestDrive 'cfg-floor.psd1'
+        Set-Content -LiteralPath $file -Value "@{`n  ExcludedPaths = @('D:\Private')`n}"
+        $cfg = Import-SysOrgConfig -Path $file -AppRoot $TestDrive
+        Test-SysOrgExcludedPath -Path (Join-Path $env:SystemRoot 'evil.dll') -Config $cfg | Should -BeTrue
+        Test-SysOrgExcludedPath -Path (Join-Path $env:ProgramFiles 'evil.dll') -Config $cfg | Should -BeTrue
+        Test-SysOrgExcludedPath -Path (Join-Path $env:ProgramData 'evil.dll') -Config $cfg | Should -BeTrue
+        Test-SysOrgExcludedPath -Path 'C:\$Recycle.Bin\x' -Config $cfg | Should -BeTrue
+        Test-SysOrgExcludedPath -Path 'C:\System Volume Information\x' -Config $cfg | Should -BeTrue
+        Test-SysOrgExcludedPath -Path 'D:\Private\keep.txt' -Config $cfg | Should -BeTrue   # the user rule is kept
+    }
+    It 'the per-drive floor names survive a hostile ExcludedPaths override (portable part)' {
+        $file = Join-Path $TestDrive 'cfg-floor2.psd1'
+        Set-Content -LiteralPath $file -Value "@{`n  ExcludedPaths = @('D:\Private')`n}"
+        $cfg = Import-SysOrgConfig -Path $file -AppRoot $TestDrive
+        (@($cfg.ExcludedPaths) | Where-Object { $_ -ieq '$Recycle.Bin' -or $_ -like '*\$Recycle.Bin' }) | Should -Not -BeNullOrEmpty
+        (@($cfg.ExcludedPaths) | Where-Object { $_ -ieq 'System Volume Information' -or $_ -like '*\System Volume Information' }) | Should -Not -BeNullOrEmpty
+    }
+    It 'BlockedExtensions and ProtectedArtifacts merge additively: built-ins cannot be removed (v2.1.1)' {
+        $file = Join-Path $TestDrive 'cfg-add.psd1'
+        Set-Content -LiteralPath $file -Value "@{`n  Policy = @{`n    SystemDrive = @{ BlockedExtensions = @('.foo') }`n    DataDrives = @{ BlockedExtensions = @() }`n    ProtectedArtifacts = @('MyStuff')`n  }`n}"
+        $warned = $null
+        $cfg = Import-SysOrgConfig -Path $file -AppRoot $TestDrive -WarningVariable warned -WarningAction SilentlyContinue
+        $cfg.Policy.SystemDrive.BlockedExtensions | Should -Contain '.foo'
+        $cfg.Policy.SystemDrive.BlockedExtensions | Should -Contain '.dll'
+        $cfg.Policy.SystemDrive.BlockedExtensions | Should -Contain '.lnk'
+        $cfg.Policy.DataDrives.BlockedExtensions | Should -Contain '.dll'
+        $cfg.Policy.SystemDrive.Scope | Should -Be 'KnownFolders'    # sibling defaults preserved by the deep merge
+        $cfg.Policy.ProtectedArtifacts | Should -Contain 'MyStuff'
+        $cfg.Policy.ProtectedArtifacts | Should -Contain 'Windows'
+        ($warned -join ' ') | Should -Match 'cannot remove built-in entries'
     }
     It 'appends Policy.ProtectedArtifacts for every fixed drive (W9: WindowsApps included)' {
         if($env:OS -ne 'Windows_NT'){ Set-ItResult -Inconclusive -Because 'DriveInfo fixed-drive enumeration is Windows-specific'; return }
@@ -319,6 +359,26 @@ Describe 'Test-SysOrgExcludedPath segment matching (P1-7)' {
     }
     It 'honors wildcard rules (AppData under any user)' {
         Test-SysOrgExcludedPath -Path 'C:\Users\alice\AppData\Local\Temp' -Config $exCfg | Should -BeTrue
+    }
+}
+
+Describe 'Resolve-SysOrgWritablePath (v2.1.1)' {
+    It 'resolves a relative path to a full canonical path' {
+        Push-Location $TestDrive
+        try{
+            New-Item -ItemType Directory -Path 'rel-sub' -Force | Out-Null
+            $r = Resolve-SysOrgWritablePath -Path 'rel-sub'
+            [System.IO.Path]::IsPathRooted($r) | Should -BeTrue
+            ("$r").Replace('/','\').ToLowerInvariant() | Should -Be (("$TestDrive").Replace('/','\').TrimEnd('\').ToLowerInvariant() + '\rel-sub')
+        } finally { Pop-Location }
+    }
+    It 'throws for a path that does not exist' {
+        { Resolve-SysOrgWritablePath -Path (Join-Path $TestDrive 'no-such-dir-xyz') } | Should -Throw '*does not exist*'
+    }
+    It 'canonicalizes an existing absolute path' {
+        $d = Join-Path $TestDrive 'abs-sub'
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        Resolve-SysOrgWritablePath -Path $d | Should -Be ([System.IO.Path]::GetFullPath($d))
     }
 }
 
