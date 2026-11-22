@@ -2,6 +2,76 @@
 
 All notable changes to SysOrg. Versions follow [SemVer](https://semver.org/).
 
+## [3.0.0] - 2026-11-22 - Faster, smarter, more findable (Findable layout + scored pipeline)
+
+The layout becomes a choice (`LayoutProfile = Windows | Compact4 | Findable`; new
+installs default to Findable, existing configs keep their current profile), the
+extension-only router becomes a scored Decision pipeline, large drives get a
+persistent file-state cache and parallel hashing, and the organized tree gets a
+catalog you can actually search. All v2.1.1 hardening guarantees are preserved:
+preview before execute, never overwrite, never delete user data, crash-safe undo,
+executor re-validation, fail-closed config, non-overridable protection floor.
+
+### Added
+- **Phase 0 (measurement):** `Tools/New-SysOrgCorpus.ps1` (deterministic synthetic
+  corpus with REAL EXIF/ID3/MP4/PDF fixtures, ~5% exact duplicates, a metadata
+  manifest) and `-Benchmark` (cold/warm scan, duplicate detection, plan build,
+  execute, peak working set -> `Reports\benchmark-*.md`). Baselines and final
+  numbers live in `BENCHMARKS.md`.
+- **Phase 1 (Findable layout):** max depth 4 below the root, 10 routing roots,
+  adaptive ISO date granularity (YYYY -> YYYY-MM -> YYYY-MM-DD above
+  `Layout.MaxFilesPerFolder`, merged back up when mostly near-empty - the cap
+  wins), a 200-character path budget with deterministic hash-suffixed shortening,
+  family leaves kept date-free, "needs a decision" handling (never a junk folder;
+  optional `_Review` via `Review.Mode`).
+- **Phase 2 (classification):** a fixed-order Decision pipeline (safety gates >
+  user rules > learned rules > context > true type > metadata > date > lexicon >
+  confidence gating) producing Destination/Confidence/RuleId/Signals; magic-byte
+  true-type sniffing (<= 512 bytes) for missing/mismatched extensions; zero-
+  dependency, mockable, fail-soft metadata extractors (EXIF, ID3v2/v1, MP4 mvhd,
+  Office core.xml, PDF info dict, 2 KB text snippet); date resolution (metadata >
+  filename > filesystem, source recorded); `Rules\Lexicon.psd1` weighted document
+  scoring; event clustering (GPS cell + time gap -> `Pictures\Events\<range>`);
+  near-duplicate image dHash (REPORT ONLY); confidence gating (>= 0.70 plans,
+  0.40-0.70 flagged review, < 0.40 needs a decision); `Rules\UserRules.psd1`
+  (validated fail-closed) and learned rules that are NEVER applied silently
+  (`Rules.ApplyLearned`, flagged in the preview). `-Explain <path>` prints the
+  full Decision.
+- **Phase 3 (speed):** persistent file-state cache (`Cache\filestate.ndjson`,
+  streamed, corrupt->rescan fallback); compiled exclusion matcher; RunspacePool
+  parallel hashing (deterministic order, HDD throttling via the drive profile's
+  MediaType); head+tail hash duplicate pre-filter; in-memory destination name
+  sets; batched directory creation; buffered logging with the undo journal still
+  flushed per row.
+- **Phase 4 (find things):** `_Index\catalog.ndjson` built after every executed
+  plan and updated by undo; `Find-SysOrgFile` + `-Find` + menu search (instant,
+  live-scan fallback); offline `_Index\Index.html` (no network); warn-only
+  Windows Search status check; `_Index\README.txt`.
+- **Phase 5 (measurable findability):** `Get-SysOrgFindabilityScore` (depth,
+  fan-out percentiles, over-cap/near-empty shares, confidence shares, duplicate
+  byte share, composite 0-100), targets in `Score.Targets`, before/after delta in
+  the plan preview, `-Score` for existing trees.
+- **Phase 6 (migration):** `-MigrateProfile Findable` migrates a v2.1 tree to the
+  Findable layout - previewable, journaled, undoable, whole-folder moves, adaptive
+  date re-bucketing, idempotent, `_Index`/`_Reports`/`_Duplicates` untouched.
+- **Property tests:** determinism, idempotence (a second run plans ZERO moves),
+  conservation (hash multiset survives execute), depth/root/collision bounds,
+  protected-path exclusion; Perf-tagged tests excluded from the default CI run.
+
+### Changed
+- Plan-build now runs the full classifier per routed file (the honest cost is
+  documented in BENCHMARKS.md: cold plan-build is ~1.6x the v2.1.1 baseline; warm
+  duplicate detection is 5.1x faster; execute is unchanged).
+- Data-type files (csv/tsv/xlsx/json/db) route to the `Data` leaf in the Findable
+  layout via their extension (the Windows routing set calls them Documents).
+- `New-SysOrgPlan` skips source==destination files (idempotent re-plans).
+
+### Compatibility
+- Existing configs keep working unchanged: a config file without `LayoutProfile`
+  keeps the Windows profile; `NamingPreset='Compact4'` still maps to Compact4;
+  existing plans, journals and configs are honored; new config keys all have
+  safe defaults validated in `Test-SysOrgConfig`.
+
 ## [2.1.1] - 2026-11-22 - Security and quality hardening (audit follow-up)
 
 Hardening release based on a full security/quality audit of v2.1.0. All core guarantees

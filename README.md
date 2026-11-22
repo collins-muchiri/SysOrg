@@ -15,6 +15,75 @@ integrity hash), a broken config fails closed instead of moving files on dropped
 exclusions, protection lists have a non-overridable floor, copies keep their own names,
 and the undo journal survives a power cut (WriteThrough + Pending/Done rows).
 
+
+## v3.0 in one page
+
+- **Choose a layout.** `LayoutProfile = Windows` (v2.1 behaviour), `Compact4`
+  (rev 2.0 naming) or **`Findable`** (new). New installs default to Findable;
+  an existing config file without the key keeps its current profile.
+
+  ```
+  <Root>\
+  +- Documents\   Finance\{Invoices,Receipts,Statements,Tax}\<Year>
+  |               Legal-Identity\<Year>   Work\<Year>   Education\<Year>
+  |               Manuals\<Product>  Books\<Author|A-Z>  General\<Year>
+  +- Pictures\    {Camera,Screenshots,Scans,Messaging\<Source>,Edited}\<date>
+  |               Events\<YYYY-MM-DD to MM-DD>          (time-gap clusters)
+  +- Videos\      {Camera,Screen-Recordings,Messaging\<Source>,Media}\<date>
+  +- Music\       <Artist>\<Album>   (from tags)   Music\_Untagged\<Year>
+  +- Audio-Recordings\<Year>          voice notes, meetings
+  +- Data\<Year>                      csv/xlsx/json/db exports
+  +- Software\    {Installers\<App>,Disk-Images,Drivers}
+  +- Archives\<Year>  Code\Projects\<Name> + Code\Files\<Year>
+  +- Design\<Year> + Fonts\
+  +- Downloads\<Source>\<Type>\<date> (existing provenance branch)
+  +- _Index\                          catalog, offline index, learned rules
+  ```
+
+  Max depth 4 below the root, 10 routing roots, ISO dates with ADAPTIVE
+  granularity (YYYY -> YYYY-MM -> YYYY-MM-DD when a folder exceeds
+  `Layout.MaxFilesPerFolder`), a 200-character path budget with deterministic
+  hash-suffixed shortening. Files that cannot be classified confidently are LEFT
+  IN PLACE and listed in the plan preview ("NEEDS A DECISION") - never dumped
+  into a junk folder (`Review.Mode = Move` opts into `_Review\<Year>`).
+
+- **Smarter classification.** Every file gets a scored Decision (destination,
+  confidence 0..1, deciding rule, and the signals that produced it): safety
+  gates > your rules (`Rules\UserRules.psd1`, validated fail-closed) > learned
+  rules (never applied silently) > context > magic-byte true type (<= 512 B) >
+  metadata (EXIF / ID3 / MP4 / Office / PDF / text - zero dependencies, mockable,
+  fail-soft) > date (metadata > filename > filesystem, source recorded) >
+  lexicon (`Rules\Lexicon.psd1`) > confidence gating. Photos/videos cluster into
+  `Pictures\Events\<range>` by GPS cell + time gaps; near-duplicate images are
+  reported, never moved.
+- **Speed.** Persistent file-state cache (unchanged files are never re-hashed or
+  re-parsed), compiled exclusions, parallel hashing (HDD-aware), head+tail
+  duplicate pre-filter, in-memory name sets, batched execution. Real numbers and
+  honest misses: see `BENCHMARKS.md`.
+- **Find things.** Every executed plan updates `_Index\catalog.ndjson`; search
+  it instantly (name, type, date range, source, family, size, duplicates-of):
+
+      .\SysOrg.ps1 -Find '*invoice*'                 (wildcard)
+      .\SysOrg.ps1 -Find '.*\.pdf$' -Type Documents  (regex via module)
+
+  `_Index\Index.html` is a static offline browse page; `_Index\README.txt`
+  explains the folder.
+- **Measure it.** `-Score` scores an existing tree against `Score.Targets`;
+  every organize preview shows the before/after findability score and states
+  plainly whether the plan improves or worsens it.
+- **Migrate.** `-MigrateProfile Findable` moves an existing v2.1 tree into the
+  Findable layout (previewable, journaled, undoable, whole folders where
+  possible, `_Index`/`_Reports`/`_Duplicates` untouched).
+- **Explain anything.** `-Explain <path>` prints the full Decision for one file:
+  every signal, rule and the confidence math. Nothing is moved.
+- **Benchmark.** `Tools\New-SysOrgCorpus.ps1` + `SysOrg.ps1 -Benchmark`
+  reproduce every number in `BENCHMARKS.md`.
+
+All v2.1.1 guarantees are unchanged: preview before execute, never overwrite,
+never delete user data, crash-safe undo journals, executor re-validation,
+fail-closed config, non-overridable protection floor.
+
+
 ## Features
 
 - **Drive hierarchy profiler (v2.1)** — `-ProfileDrives` / menu `[1]` shows, per volume: role

@@ -45,7 +45,8 @@ param(
     [string]$Find,
     [string]$Explain,
     [switch]$Score,
-    [int]$Parallelism = 0
+    [int]$Parallelism = 0,
+    [string]$Root
 )
 $ErrorActionPreference = 'Stop'
 $appRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -534,16 +535,24 @@ if($Benchmark){
 if($Score){
     # v3.0 Phase 5: score an existing organized tree and check it against the targets
     $scoreRoot = $null
-    try { $scoreRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $scoreRoot = 'C:\_Organized' }
+    if($Root){ $scoreRoot = $Root }
+    else {
+        $scoreLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
+        try { $scoreRoot = Get-SysOrgDestinationRoot -Letter $scoreLetter -Config $Config } catch { $scoreRoot = ('{0}:\_Organized' -f $scoreLetter) }
+    }
     $s = Get-SysOrgTreeScore -Root $scoreRoot -Config $Config
     Show-SysOrgFindabilityScore -Score $s -Label ('organized tree ' + $scoreRoot) -Config $Config -WithTargets
     return
 }
-if($null -ne $Find){
+if($PSBoundParameters.ContainsKey('Find')){
     # v3.0 Phase 4.2: instant search over the catalog (falls back to a live scan)
     if([string]::IsNullOrWhiteSpace($Find)){ $Find = '*' }
     $findRoot = $null
-    try { $findRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $findRoot = 'C:\_Organized' }
+    if($Root){ $findRoot = $Root }
+    else {
+        $findLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
+        try { $findRoot = Get-SysOrgDestinationRoot -Letter $findLetter -Config $Config } catch { $findRoot = ('{0}:\_Organized' -f $findLetter) }
+    }
     $results = @(Find-SysOrgFile -Root $findRoot -Name $Find -Config $Config)
     Write-Host ("{0} result(s):" -f $results.Count) -ForegroundColor White
     foreach($r in ($results | Select-Object -First 40)){
@@ -562,7 +571,14 @@ if($Explain){
     $ext = [System.IO.Path]::GetExtension($Explain).ToLowerInvariant()
     try { $cat = Get-SysOrgCategory -Extension $ext -Config $Config } catch { $cat = 'Other' }
     $profX = $null
-    try { $profX = @(Get-SysOrgDriveProfile -Config $Config -Letters 'C')[0] } catch { $profX = $null }
+    if($env:OS -eq 'Windows_NT'){
+        try { $profX = @(Get-SysOrgDriveProfile -Config $Config -Letters 'C')[0] } catch { $profX = $null }
+    } else {
+        # portable host: no real drive profile - a synthetic Data profile keeps the
+        # mutability stage out of the way for this read-only explanation
+        $profX = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+    }
     $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata
     Show-SysOrgDecision -Decision $dec
     return
@@ -634,6 +650,8 @@ while($running){
     Write-Host ' [6] Undo a plan (restore files to original locations)'
     Write-Host ' [7] Migrate old organized trees (Photo/Video/... -> Windows naming; preview first)'
     Write-Host ' [8] Open working folder (plans, undo journals, logs, reports)'
+    Write-Host ' [9] Find files in the catalog (instant search)'
+    Write-Host ' [10] Score the organized tree (findability)'
     Write-Host ' [0] Exit'
     $choice = Read-Host 'Choose'
     # P2-4: one bad drive or folder never kills the whole app
@@ -668,6 +686,8 @@ while($running){
                 }
             '7' { $l = Get-SysOrgLetterInput -Prompt 'Drive letter to migrate'; Invoke-SysOrgMigrationFlow -Letter $l }
             '8' { Start-Process explorer.exe $appRoot }
+            '9' { $q = Read-Host 'Search (wildcard, e.g. *invoice*)'; $res = @(Find-SysOrgFile -Root (Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config) -Name $q -Config $Config 3>$null); Write-Host ("{0} result(s):" -f $res.Count); $res | Select-Object -First 30 | ForEach-Object { Write-Host ('  ' + $_.CurrentPath + '  [' + $_.Category + ']') } }
+            '10' { $sr = Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config; $sc = Get-SysOrgTreeScore -Root $sr -Config $Config; Show-SysOrgFindabilityScore -Score $sc -Label $sr -Config $Config -WithTargets }
             '0' { $running = $false }
             default { Write-Host 'Unknown option.' }
         }

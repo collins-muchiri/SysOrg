@@ -58,6 +58,7 @@ jobs:
           $cfg = New-PesterConfiguration
           $cfg.Run.Path = '.\Tests'
           $cfg.Run.Exit = $true
+          $cfg.Filter.ExcludeTag = 'Perf'   # v3.0: performance tests run on demand, not in CI
           $cfg.TestResult.Enabled = $true
           Invoke-Pester -Configuration $cfg
 
@@ -68,4 +69,5 @@ jobs:
           $cfg = New-PesterConfiguration
           $cfg.Run.Path = '.\Tests'
           $cfg.Run.Exit = $true
+          $cfg.Filter.ExcludeTag = 'Perf'   # v3.0: performance tests run on demand, not in CI
           Invoke-Pester -Configuration $cfg

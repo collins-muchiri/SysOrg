@@ -1,5 +1,5 @@
 @{
-    Version = '2.1.1'
+    Version = '3.0.0'
 
     # v3.0 layout profile - the new Findable layout organizes EVERY file type into a
     # fast-to-browse tree (max depth 4 below the root, max 10 routing roots, adaptive
@@ -175,6 +175,14 @@
         Extract               = $false
         KeepMultipartTogether = $true   # .zip.001/.002, part1.rar/.r00 move as one unit
     }
+
+
+    # v3.0 findability: the Data leaves (csv/xlsx/json/db exports route here via
+    # their extension even though Windows' routing set calls them Documents).
+    # Events cluster photos/videos by capture time (Events.GapHours); near-duplicate
+    # images are REPORTED, never moved. Findability score targets live in Score.
+    Events          = @{ GapHours=8; MinFiles=15 }
+    NearDuplicates  = @{ Enabled=$true; MaxHammingDistance=8 }
 
     Preview = @{
         NaturalSort         = $true    # StrCmpLogicalW: file (2) before file (10), like Explorer
