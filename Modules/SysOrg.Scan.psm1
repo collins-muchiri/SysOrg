@@ -714,6 +714,10 @@ function Get-SysOrgSourceBucket {
 .DESCRIPTION
     Resolution order: Zone.Identifier HostUrl, then ReferrerUrl (exact host map, then the
     registrable domain), then filename heuristics (WhatsApp, Telegram, Signal, Screenshots).
+    v2.1.1: multi-label public suffixes are honored (www.kra.go.ke -> Kra, not Go), IP
+    addresses and localhost fall through to the filename heuristics instead of producing
+    buckets like '1' or 'Localhost', and every bucket passes through
+    Get-SysOrgSafeFolderName so reserved device names ('nul', 'con', ...) come out safe.
     Returns $null when nothing matches - the caller routes to Downloads\_NoSource.
 .EXAMPLE
     Get-SysOrgSourceBucket -HostUrl 'https://github.com/x/y/releases/download/1/f.zip'   # -> 'GitHub'
@@ -736,6 +740,38 @@ function Get-SysOrgSourceBucket {
         'steamcontent.com'='Steam'; 'steampowered.com'='Steam'
         'zoom.us'='Zoom'; 'archive.org'='InternetArchive'
     }
+    # v2.1.1: compact list of common second-level public suffixes. For hosts under one of
+    # these, the bucket comes from the label BEFORE the two-part suffix, not the label
+    # before the TLD (www.kra.go.ke -> Kra, not Go).
+    $secondLevelSuffixes = @{
+        'co.uk'=$true;'org.uk'=$true;'ac.uk'=$true;'gov.uk'=$true;'me.uk'=$true;'net.uk'=$true;'ltd.uk'=$true;'plc.uk'=$true
+        'com.au'=$true;'net.au'=$true;'org.au'=$true;'edu.au'=$true;'gov.au'=$true
+        'co.nz'=$true;'net.nz'=$true;'org.nz'=$true
+        'co.za'=$true;'org.za'=$true;'ac.za'=$true;'gov.za'=$true
+        'co.ke'=$true;'or.ke'=$true;'go.ke'=$true;'ac.ke'=$true;'ne.ke'=$true;'sc.ke'=$true;'info.ke'=$true
+        'com.ng'=$true;'org.ng'=$true;'gov.ng'=$true;'edu.ng'=$true;'net.ng'=$true
+        'co.in'=$true;'net.in'=$true;'org.in'=$true;'gov.in'=$true;'ac.in'=$true;'firm.in'=$true
+        'com.br'=$true;'net.br'=$true;'org.br'=$true;'gov.br'=$true
+        'com.mx'=$true;'org.mx'=$true;'net.mx'=$true
+        'com.tr'=$true;'net.tr'=$true;'org.tr'=$true
+        'co.kr'=$true;'ne.kr'=$true;'or.kr'=$true
+        'co.jp'=$true;'ne.jp'=$true;'or.jp'=$true;'ac.jp'=$true;'go.jp'=$true
+        'com.sg'=$true;'net.sg'=$true;'org.sg'=$true;'gov.sg'=$true
+        'com.cn'=$true;'net.cn'=$true;'org.cn'=$true;'gov.cn'=$true
+        'com.ar'=$true;'net.ar'=$true;'org.ar'=$true
+        'com.hk'=$true;'org.hk'=$true;'net.hk'=$true
+        'co.id'=$true;'or.id'=$true;'web.id'=$true
+        'com.my'=$true;'org.my'=$true;'net.my'=$true
+        'com.ph'=$true;'org.ph'=$true;'net.ph'=$true
+        'com.tw'=$true;'org.tw'=$true;'net.tw'=$true
+        'com.vn'=$true;'net.vn'=$true;'org.vn'=$true
+        'com.pk'=$true;'net.pk'=$true;'org.pk'=$true
+        'com.eg'=$true;'net.eg'=$true;'org.eg'=$true
+        'co.th'=$true;'or.th'=$true;'ac.th'=$true
+        'com.ua'=$true;'net.ua'=$true;'org.ua'=$true
+        'co.il'=$true;'org.il'=$true;'net.il'=$true;'ac.il'=$true
+        'com.co'=$true;'net.co'=$true;'org.co'=$true
+    }
     $u = $null
     foreach($c in @($HostUrl,$ReferrerUrl)){ if("$c"){ $u = "$c"; break } }
     if($u){
@@ -749,10 +785,21 @@ function Get-SysOrgSourceBucket {
             }
             $parts = $h.Split('.')
             $name = $null
-            if($parts.Count -ge 2){ $name = $parts[$parts.Count - 2] } else { $name = $parts[0] }
+            # v2.1.1: IP addresses and localhost have no registrable domain - leave the
+            # name empty so the URL branch returns nothing and the FILENAME heuristics run.
+            if(($h -match '^\d{1,3}(\.\d{1,3}){3}$') -or ($h -eq 'localhost') -or ($h.Contains(':'))){
+                $name = $null
+            }
+            elseif(($parts.Count -ge 3) -and $secondLevelSuffixes.ContainsKey(($parts[($parts.Count - 2)..($parts.Count - 1)] -join '.'))){
+                $name = $parts[$parts.Count - 3]
+            }
+            elseif($parts.Count -ge 2){ $name = $parts[$parts.Count - 2] }
+            else { $name = $parts[0] }
             if($name -and ("$name" -ne '')){
                 $ti = (Get-Culture).TextInfo
-                return $ti.ToTitleCase("$name")
+                # v2.1.1: sanitize - reserved device names ('nul.com' -> Nul) must never
+                # become destination folder names.
+                return (Get-SysOrgSafeFolderName -Name ($ti.ToTitleCase("$name")) -MaxLength 60)
             }
         } catch { Write-Verbose "Source bucket parse failed for '$u': $($_.Exception.Message)" }
     }

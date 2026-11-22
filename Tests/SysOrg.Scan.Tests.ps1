@@ -276,3 +276,27 @@ Describe 'Known-folder sanity check (v2.1.1)' {
         } finally { $env:ProgramFiles = $oldPf }
     }
 }
+
+Describe 'Get-SysOrgSourceBucket hardening (v2.1.1)' {
+    It 'handles multi-label public suffixes' {
+        Get-SysOrgSourceBucket -HostUrl 'https://www.kra.go.ke/portal' | Should -Be 'Kra'
+        Get-SysOrgSourceBucket -HostUrl 'https://safaricom.co.ke/x'     | Should -Be 'Safaricom'
+        Get-SysOrgSourceBucket -HostUrl 'https://example.co.uk/f.zip'   | Should -Be 'Example'
+        Get-SysOrgSourceBucket -HostUrl 'https://unza.zm'               | Should -Be 'Unza'
+    }
+    It 'IP-address and localhost hosts fall through to the filename heuristics' {
+        Get-SysOrgSourceBucket -HostUrl 'https://192.168.1.1/f.zip' | Should -BeNullOrEmpty
+        Get-SysOrgSourceBucket -HostUrl 'http://localhost:8080/f.zip' | Should -BeNullOrEmpty
+        Get-SysOrgSourceBucket -HostUrl 'https://192.168.1.1/f.zip' -FileName 'WhatsApp Image 2024-01-01.jpg' | Should -Be 'WhatsApp'
+        Get-SysOrgSourceBucket -HostUrl 'http://localhost/x' -FileName 'Screenshot 2024-05-01 090000.png' | Should -Be 'Screenshots'
+    }
+    It 'reserved device names come out safe' {
+        Get-SysOrgSourceBucket -HostUrl 'https://nul.com/file.zip'    | Should -Be '_Nul'
+        Get-SysOrgSourceBucket -HostUrl 'https://con.info/x'          | Should -Be '_Con'
+        Get-SysOrgSourceBucket -HostUrl 'https://con.example.org/x'   | Should -Be 'Example'   # registrable domain is example.org
+    }
+    It 'keeps the existing known-host mappings and normal buckets' {
+        Get-SysOrgSourceBucket -HostUrl 'https://github.com/x/y/releases/download/1/f.zip' | Should -Be 'GitHub'
+        Get-SysOrgSourceBucket -HostUrl 'https://cdn.example.org/file.zip' | Should -Be 'Example'
+    }
+}
