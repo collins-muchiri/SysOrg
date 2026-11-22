@@ -57,6 +57,7 @@ Import-Module (Join-Path $moduleRoot 'SysOrg.Layout.psm1')      -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Metadata.psm1')    -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Classify.psm1')    -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Cache.psm1')       -Force
+Import-Module (Join-Path $moduleRoot 'SysOrg.Catalog.psm1')     -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Scan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Plan.psm1')        -Force
 Import-Module (Join-Path $moduleRoot 'SysOrg.Audit.psm1')       -Force
@@ -259,6 +260,16 @@ function Invoke-SysOrgScanFlow {
     Write-Host ("Done. Moved={0} (numbered copies={1})  Copied={2}  Folders={3}  Quarantined={4}  Failed={5}" -f `
         $res.Summary.Moved, $res.Summary.Numbered, $res.Summary.Copied, $res.Summary.FolderMoves, $res.Summary.Quarantined, $res.Summary.Failed) -ForegroundColor Green
     Write-Host ("Undo journal: {0}" -f $res.UndoFile)
+    # v3.0 Phase 4: catalog + offline index after every executed plan
+    $catPath = Update-SysOrgCatalog -PlanPath $planPath -UndoPath $res.UndoFile -Root $plan.DestinationRoot -PlanId $plan.PlanId
+    if($catPath){
+        Write-Host ("Catalog updated: {0}" -f $catPath) -ForegroundColor Green
+        $html = Save-SysOrgIndexPage -Root $plan.DestinationRoot
+        $rme = Save-SysOrgIndexReadme -Root $plan.DestinationRoot
+        Write-Host ("Offline index: {0}" -f $html) -ForegroundColor Green
+        $si = Test-SysOrgSearchIndexStatus -Root $plan.DestinationRoot
+        if($si.Status -ne 'Ok'){ Write-Warning ('Windows Search: ' + $si.Reason) }
+    }
 }
 function Invoke-SysOrgMigrationFlow {
     param([string]$Letter)
@@ -316,6 +327,18 @@ function Invoke-SysOrgPlanFile {
     Write-Host ("Done. Moved={0} (numbered copies={1})  Copied={2}  Folders={3}  Quarantined={4}  Failed={5}" -f `
         $res.Summary.Moved, $res.Summary.Numbered, $res.Summary.Copied, $res.Summary.FolderMoves, $res.Summary.Quarantined, $res.Summary.Failed) -ForegroundColor Green
     Write-Host ("Undo journal: {0}" -f $res.UndoFile)
+    # v3.0 Phase 4: catalog + offline index after every executed plan
+    if($plan.PSObject.Properties['DestinationRoot'] -and $plan.PSObject.Properties['PlanId']){
+        $catPath = Update-SysOrgCatalog -PlanPath $Path -UndoPath $res.UndoFile -Root $plan.DestinationRoot -PlanId $plan.PlanId
+        if($catPath){
+            Write-Host ("Catalog updated: {0}" -f $catPath) -ForegroundColor Green
+            $html = Save-SysOrgIndexPage -Root $plan.DestinationRoot
+            $null = Save-SysOrgIndexReadme -Root $plan.DestinationRoot
+            Write-Host ("Offline index: {0}" -f $html) -ForegroundColor Green
+            $si = Test-SysOrgSearchIndexStatus -Root $plan.DestinationRoot
+            if($si.Status -ne 'Ok'){ Write-Warning ('Windows Search: ' + $si.Reason) }
+        }
+    }
 }
 
 function Invoke-SysOrgBenchmarkFlow {
@@ -467,6 +490,19 @@ if($Benchmark){
     Invoke-SysOrgBenchmarkFlow -Corpus $BenchmarkCorpus -Files $BenchmarkFiles -BenchSeed $BenchmarkSeed
     return
 }
+if($null -ne $Find){
+    # v3.0 Phase 4.2: instant search over the catalog (falls back to a live scan)
+    if([string]::IsNullOrWhiteSpace($Find)){ $Find = '*' }
+    $findRoot = $null
+    try { $findRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $findRoot = 'C:\_Organized' }
+    $results = @(Find-SysOrgFile -Root $findRoot -Name $Find -Config $Config)
+    Write-Host ("{0} result(s):" -f $results.Count) -ForegroundColor White
+    foreach($r in ($results | Select-Object -First 40)){
+        Write-Host ('  ' + $r.CurrentPath + '  [' + $r.Category + $(if($r.Family){ ' | family ' + $r.Family }) + ']')
+    }
+    if($results.Count -gt 40){ Write-Host ('  ... and {0} more' -f ($results.Count - 40)) -ForegroundColor DarkGray }
+    return
+}
 if($Explain){
     # v3.0 Phase 2.9: the full Decision for ONE file - every signal, rule and the
     # confidence math. Read-only: nothing is moved, nothing is planned.
@@ -490,6 +526,13 @@ if($UndoPlan){
     }
     $res = Undo-SysOrgPlan -PlanId $UndoPlan -AppRoot $appRoot -Config $Config
     Write-Host ("Undo complete. Restored={0}  Failed={1}  SkippedMissing={2}  SkippedChanged={3}" -f $res.Restored, $res.Failed, $res.SkippedMissing, $res.SkippedChanged)
+    # v3.0 Phase 4.1: point catalog entries back at the original locations
+    $planJsonPath = Join-Path $folders.Plans ("{0}.json" -f $UndoPlan)
+    $undoRoot = $null
+    if(Test-Path -LiteralPath $planJsonPath){
+        try { $undoRoot = ((Get-Content -LiteralPath $planJsonPath -Raw | ConvertFrom-Json).DestinationRoot) } catch { $undoRoot = $null }
+    }
+    if($undoRoot){ $null = Update-SysOrgCatalogOnUndo -PlanId $UndoPlan -AppRoot $appRoot -Root $undoRoot }
     return
 }
 if($ExecutePlan){
