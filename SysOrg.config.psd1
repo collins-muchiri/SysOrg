@@ -140,6 +140,11 @@
 
     # Code project folders (dirs containing .git, package.json, *.sln, ...): moved whole,
     # one MoveFolder unit, .git intact -> Documents\Projects\Code\<Name>.
+    # v2.1.1: detection requires a VCS marker (.git/.hg/.svn/.jj) OR at least TWO distinct
+    # markers - a lone .gitignore/Makefile/lock file is not a project. Folders containing
+    # junctions or symlinks are never moved. Blocked-extension files OUTSIDE build-output
+    # directories (node_modules, bin, obj, dist, ...) are SURFACED IN THE PREVIEW - the
+    # folder still moves (documented choice); the user sees the risk before confirming.
     Projects = @{
         Enabled        = $true
         Destination    = 'Documents\Projects\Code'

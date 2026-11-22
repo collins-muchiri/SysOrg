@@ -674,13 +674,19 @@ function Get-SysOrgProjectFolders {
         try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir) | ForEach-Object { Split-Path $_ -Leaf }) } catch { $entries = @() }
         $isProject = $false
         if($entries.Count -gt 0){
+            # v2.1.1: a project needs a VCS marker (.git/.hg/.svn/.jj) OR at least TWO
+            # distinct markers. A lone .gitignore, Makefile or lock file is not enough
+            # (thesis folders, data directories and exports carry those too).
+            $matched = New-Object System.Collections.Generic.List[string]
             foreach($m in $markers){
                 if([string]::IsNullOrWhiteSpace("$m")){ continue }
                 if("$m".Contains('*') -or "$m".Contains('?')){
-                    foreach($e in $entries){ if($e -like "$m"){ $isProject = $true; break } }
-                } elseif($entries -contains "$m"){ $isProject = $true }
-                if($isProject){ break }
+                    foreach($e in $entries){ if($e -like "$m"){ [void]$matched.Add("$m"); break } }
+                } elseif($entries -contains "$m"){ [void]$matched.Add("$m") }
             }
+            $vcsHit = $false
+            foreach($v in @('.git','.hg','.svn','.jj')){ if($matched -contains $v){ $vcsHit = $true; break } }
+            if($vcsHit -or ($matched.Count -ge 2)){ $isProject = $true }
         }
         if($isProject){
             $name = Split-Path $dir -Leaf

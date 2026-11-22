@@ -457,6 +457,10 @@ function New-SysOrgPlan {
                 $base = $root + '\' + $projCfgDest
             }
             $dest = $base + '\' + "$($pf.SafeName)"
+            # v2.1.1: preview data - per folder move, the file count, the number of
+            # non-code files, and blocked-extension files OUTSIDE build-output directories
+            # (surfaced in the preview; the folder still moves).
+            $stats = Get-SysOrgFolderMoveStats -Path "$($pf.Path)" -Config $Config -DriveProfile $DriveProfile
             $syncOut = $false; $intoCloud = $false
             if($oneDriveRoot){
                 $srcUnder = "$($pf.Path)".StartsWith($oneDriveRoot + '\',[StringComparison]::OrdinalIgnoreCase)
@@ -468,6 +472,8 @@ function New-SysOrgPlan {
                 Action='Move'; Kind='Folder'; Source="$($pf.Path)"; Destination=$dest; DestRoot=$db.DisplayRoot
                 SizeBytes=[int64]0; Family=$null; CopyIndex=$null; SourceBucket=$null
                 Reason='Code project folder (markers detected); moved whole, .git intact'
+                FilesInside=$stats.Files; NonCodeFilesInside=$stats.NonCode
+                BlockedFilesCount=$stats.BlockedCount; BlockedFileSamples=$stats.BlockedSamples
                 DifferentContent=$false; OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
             })
         } catch {
@@ -856,6 +862,25 @@ function Show-SysOrgPlan {
     if($dc.Count -gt 0){
         Write-Host ''
         Write-Host ("Name collisions with different content: {0} (renamed safely at execution; originals are never overwritten)" -f $dc.Count) -ForegroundColor Yellow
+    }
+
+    # v2.1.1: per folder move, show the file count, the number of non-code files inside,
+    # and any blocked-extension files found OUTSIDE build-output directories (surfaced -
+    # the folder still moves; the user sees the risk before confirming).
+    if($folderMoves.Count -gt 0){
+        Write-Host ''
+        Write-Host 'Folder moves:' -ForegroundColor White
+        foreach($fm in $folderMoves){
+            $info = ''
+            if($fm.PSObject.Properties['FilesInside']){
+                $info = ('  ({0} file(s), {1} non-code' -f $fm.FilesInside, $fm.NonCodeFilesInside)
+                if($fm.PSObject.Properties['BlockedFilesCount'] -and ([int]$fm.BlockedFilesCount -gt 0)){
+                    $info += (', {0} BLOCKED-EXTENSION file(s) outside build-output dirs, e.g. {1}' -f $fm.BlockedFilesCount, (@($fm.BlockedFileSamples) | Select-Object -First 3) -join ', ')
+                }
+                $info += ')'
+            }
+            Write-Host ('  ' + $fm.Source + ' -> ' + $fm.Destination + $info) -ForegroundColor Gray
+        }
     }
 
     Write-Host ''

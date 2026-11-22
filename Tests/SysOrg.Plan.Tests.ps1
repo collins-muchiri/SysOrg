@@ -377,3 +377,32 @@ Describe 'Executor re-validation (v2.1.1)' {
         Test-Path -LiteralPath (Join-Path (Join-Path $TestDrive 'rv7-org') 'Documents\doc-renamed.txt') | Should -BeTrue
     }
 }
+Describe 'Project folder plan actions and preview (v2.1.1)' {
+    BeforeAll {
+        $script:projCfg = @{ Projects=@{ Enabled=$true; Markers=@() }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                             ExcludeDestinations=$false; TypeMap=@{}; FolderAudit=@{ Enabled=$false } }
+        $script:projProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; KnownFolders=@(); DownloadRoots=@() }
+    }
+    It 'a plan action for a project folder carries the preview counts' {
+        $root = Join-Path $TestDrive ('pact-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $repo = Join-Path $root 'myapp'
+        New-Item -ItemType Directory -Path (Join-Path $repo '.git') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $repo 'main.py')   -Value 'print(1)'
+        Set-Content -LiteralPath (Join-Path $repo 'notes.txt') -Value 'n'
+        $inv = @([pscustomobject]@{ FullName=(Join-Path $repo 'main.py'); Name='main.py'; Stem='main'; Extension='.py'
+            Length=8; LastWriteTime=(Get-Date); Directory=$repo; Category='Code' })
+        $projects = @(Get-SysOrgProjectFolders -Roots @($root) -Config $projCfg -DriveProfile $projProf)
+        $planCfg5 = @{ OrganizedRoots=@{ '*'='__AUTO__' }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                       SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                       Copies=@{Policy='NumberCopies';StartIndex=2}; Families=@{Enabled=$false}
+                       Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; DateFolders='None'
+                       Projects=@{ Enabled=$true; Destination='Documents\Projects\Code'; Markers=@() }
+                       TypeMap=@{}; Move=@{ AllowCrossVolume=$true }; MaxPlanActions=5000 }
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $projProf -DupGroups @() -Config $planCfg5 -KnownFolders @() -ProjectFolders $projects
+        $fa = @($plan.Actions | Where-Object { "$($_.Kind)" -eq 'Folder' })
+        $fa.Count | Should -Be 1
+        $fa[0].FilesInside        | Should -Be 2
+        $fa[0].NonCodeFilesInside | Should -Be 1   # notes.txt (main.py is code; .git is VCS metadata)
+        { Show-SysOrgPlan -Plan $plan -Config $planCfg5 } | Should -Not -Throw
+    }
+}

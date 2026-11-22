@@ -850,15 +850,136 @@ function Invoke-SysOrgSafeMove {
     return $result
 }
 
+function Test-SysOrgFolderHasReparsePoint {
+<#
+.SYNOPSIS
+    Walks a folder and reports whether its tree contains any junction or symlink (v2.1.1).
+.DESCRIPTION
+    Folder-move safety: a folder that contains a reparse point anywhere in its tree is
+    refused for moves, because a verification or deletion pass could otherwise follow the
+    link outside the folder. Detection uses the raw 0x400 ReparsePoint attribute (identical
+    behavior on Windows PowerShell 5.1 and PowerShell 7) plus the .NET Core LinkTarget
+    property for symlinks on non-Windows hosts, where reparse attributes do not exist.
+    ANY enumeration error aborts with Error set - the caller keeps the source (fail closed).
+    The path is resolved through the PowerShell provider FIRST: the provider accepts both
+    separator styles ('X\Y' segments from plan JSON resolve on POSIX test hosts too), while
+    raw .NET APIs do not, and a missing path reports Attributes=-1 (all bits set) instead of
+    throwing - both traps are handled here.
+.EXAMPLE
+    Test-SysOrgFolderHasReparsePoint -Path 'C:\proj'   # -> @{ HasLink=$false; Error='' }
+#>
+    param([Parameter(Mandatory)][string]$Path)
+    $rootPath = $Path
+    try { $rootPath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).ProviderPath }
+    catch { return @{ HasLink=$true; Error=("path could not be resolved: '{0}'" -f $Path) } }
+    $stack = New-Object System.Collections.Stack
+    [void]$stack.Push($rootPath)
+    $visited = @{}
+    while($stack.Count -gt 0){
+        $dir = [string]$stack.Pop()
+        $key = $dir.ToLowerInvariant()
+        if($visited.ContainsKey($key)){ continue }
+        $visited[$key] = $true
+        try{
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            $da = [int]$di.Attributes
+            if($da -eq -1){ return @{ HasLink=$true; Error=("folder vanished during the walk: {0}" -f $dir) } }
+            if(($da -band 0x400) -ne 0){ return @{ HasLink=$true; Error='' } }
+            if($di.PSObject.Properties['LinkTarget'] -and $di.LinkTarget){ return @{ HasLink=$true; Error='' } }
+            foreach($sub in $di.GetDirectories()){
+                $sa = [int]$sub.Attributes
+                if($sa -eq -1){ return @{ HasLink=$true; Error=("folder vanished during the walk: {0}" -f $sub.FullName) } }
+                if(($sa -band 0x400) -ne 0){ return @{ HasLink=$true; Error='' } }
+                if($sub.PSObject.Properties['LinkTarget'] -and $sub.LinkTarget){ return @{ HasLink=$true; Error='' } }
+                [void]$stack.Push($sub.FullName)
+            }
+            foreach($f in $di.GetFiles()){
+                $fa = [int]$f.Attributes
+                if($fa -eq -1){ return @{ HasLink=$true; Error=("file vanished during the walk: {0}" -f $f.FullName) } }
+                if(($fa -band 0x400) -ne 0){ return @{ HasLink=$true; Error='' } }
+                if($f.PSObject.Properties['LinkTarget'] -and $f.LinkTarget){ return @{ HasLink=$true; Error='' } }
+            }
+        } catch {
+            return @{ HasLink=$true; Error=("enumeration failed on '{0}': {1}" -f $dir, $_.Exception.Message) }
+        }
+    }
+    return @{ HasLink=$false; Error='' }
+}
+
+function Get-SysOrgFolderMoveStats {
+<#
+.SYNOPSIS
+    Plan-time statistics for a folder move: file count, non-code files, blocked extensions.
+.DESCRIPTION
+    Used by the preview (v2.1.1): per folder move it shows how many files and how many
+    non-code files the folder contains. Project folders containing BLOCKED extension files
+    outside build-output directories are surfaced in the preview (documented choice - the
+    folder still moves; the user sees the risk before confirming). VCS metadata (.git) and
+    common build-output directories (node_modules, bin, obj, dist, ...) are excluded from
+    the counts. The walk is reparse-point-aware: it never descends into junctions/symlinks.
+.EXAMPLE
+    Get-SysOrgFolderMoveStats -Path 'C:\proj\repo' -Config $cfg -DriveProfile $prof
+#>
+    param([Parameter(Mandatory)][string]$Path,$Config,$DriveProfile)
+    $vcsDirs   = @('.git','.hg','.svn','.jj')
+    $buildDirs = @('node_modules','bin','obj','dist','build','out','target','vendor','packages','__pycache__','.venv','venv','debug','release','cmake-files','.idea','.vs')
+    $role = "$($DriveProfile.Role)"
+    $polKey = if($role -ieq 'System'){ 'Policy.SystemDrive' } else { 'Policy.DataDrives' }
+    $blockedExts = @(Get-SysOrgSetting $Config ($polKey + '.BlockedExtensions') @())
+    $files = 0; $nonCode = 0; $blockedCount = 0
+    $catCache = @{}
+    $blockedSamples = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Stack
+    [void]$stack.Push(@{ Path=$Path; InBuild=$false })
+    while($stack.Count -gt 0){
+        $entry = $stack.Pop()
+        $dir = [string]$entry.Path
+        try{
+            # provider resolution first: plan paths can carry '\' segments on POSIX hosts
+            $root2 = (Resolve-Path -LiteralPath $dir -ErrorAction Stop).ProviderPath
+            $di = New-Object System.IO.DirectoryInfo($root2)
+            $da = [int]$di.Attributes
+            if($da -eq -1 -or (($da -band 0x400) -ne 0)){ continue }
+            foreach($f in $di.GetFiles()){
+                $fa = [int]$f.Attributes
+                if($fa -eq -1){ continue }
+                $files++
+                $ext = $f.Extension.ToLowerInvariant()
+                if(-not $catCache.ContainsKey($ext)){ $catCache[$ext] = (Get-SysOrgCategory -Extension $ext -Config $Config) }
+                if("$($catCache[$ext])" -ne 'Code'){ $nonCode++ }
+                # blocked extensions are surfaced only OUTSIDE build-output directories
+                if((-not ([bool]$entry.InBuild)) -and ($blockedExts.Count -gt 0) -and ($blockedExts -contains $ext)){
+                    $blockedCount++
+                    if($blockedSamples.Count -lt 5){ [void]$blockedSamples.Add($f.FullName) }
+                }
+            }
+            foreach($sub in $di.GetDirectories()){
+                $sa = [int]$sub.Attributes
+                if($sa -eq -1 -or (($sa -band 0x400) -ne 0)){ continue }   # never descend reparse points
+                $leaf = $sub.Name.ToLowerInvariant()
+                if($vcsDirs -contains $leaf){ continue }                   # VCS metadata is not counted
+                $inBuild = ([bool]$entry.InBuild) -or ($buildDirs -contains $leaf)
+                [void]$stack.Push(@{ Path=$sub.FullName; InBuild=$inBuild })
+            }
+        } catch { continue }   # stats are informational; the MOVE-time walk (strict) aborts on errors
+    }
+    return [pscustomobject]@{ Files=$files; NonCode=$nonCode; BlockedCount=$blockedCount; BlockedSamples=@($blockedSamples.ToArray()) }
+}
+
 function Invoke-SysOrgSafeMoveFolder {
 <#
 .SYNOPSIS
     Folder primitive for code project folders and migration moves. Never overwrites.
 .DESCRIPTION
-    Same volume: Move-Item (atomic). Cross volume: Copy-Item -Recurse -> verify
-    (file count + total bytes, optional full hash pass disabled for speed) ->
-    only then remove the source; on any mismatch the verified copy is removed and
-    the source is kept. A destination that already exists gets a unique ' (2)' suffix.
+    v2.1.1: BEFORE any move the tree is walked reparse-point-aware; a folder containing
+    any junction or symlink (or one whose tree cannot be fully enumerated) is refused and
+    the source is kept. Same volume: Move-Item (atomic). Cross volume: Copy-Item -Recurse
+    -> verify by PER-FILE SHA256 over matching relative paths (count and byte totals are
+    checked too) -> only then remove the source. Enumeration on either side uses no
+    SilentlyContinue: any enumeration error aborts and keeps the source. The recursive
+    delete is safe because the pre-move walk verified the tree contains no reparse points
+    that a traversal could follow. A destination that already exists gets a unique ' (2)'
+    suffix.
 .EXAMPLE
     Invoke-SysOrgSafeMoveFolder -Source C:\src\repo -Destination D:\org\Documents\Projects\Code\repo -Config $cfg
 #>
@@ -869,6 +990,14 @@ function Invoke-SysOrgSafeMoveFolder {
     $copied = $false
     try{
         if(-not (Test-Path -LiteralPath $Source -PathType Container)){ $result.Message='Source folder not found'; return $result }
+        # v2.1.1: fail closed - refuse folders containing reparse points or trees that
+        # cannot be fully enumerated.
+        $link = Test-SysOrgFolderHasReparsePoint -Path $Source
+        if($link.HasLink){
+            if($link.Error){ $result.Message = ('Folder move refused - the tree could not be safely enumerated ({0}); source kept' -f $link.Error) }
+            else { $result.Message = 'Folder move refused - the folder contains a junction or symlink (reparse point); source kept' }
+            return $result
+        }
         $parent = Split-Path $Destination -Parent
         if(-not (Test-Path -LiteralPath $parent)){ New-Item -ItemType Directory -Path $parent -Force | Out-Null }
         $final = Get-SysOrgUniquePath -Path $Destination
@@ -882,17 +1011,33 @@ function Invoke-SysOrgSafeMoveFolder {
         }
         Copy-Item -LiteralPath $Source -Destination $final -Recurse -Force -ErrorAction Stop
         $copied = $true
-        # Verify: file count and total byte size must match exactly.
-        $srcFiles = @(Get-ChildItem -LiteralPath $Source -Recurse -File -Force -ErrorAction SilentlyContinue)
-        $dstFiles = @(Get-ChildItem -LiteralPath $final -Recurse -File -Force -ErrorAction SilentlyContinue)
+        # v2.1.1: verify by per-file SHA256 over matching relative paths (in addition to
+        # file count and byte totals). No SilentlyContinue on either side: any enumeration
+        # error aborts and keeps the source.
+        $srcFiles = @(Get-ChildItem -LiteralPath $Source -Recurse -File -Force -ErrorAction Stop)
+        $dstFiles = @(Get-ChildItem -LiteralPath $final  -Recurse -File -Force -ErrorAction Stop)
         if($srcFiles.Count -ne $dstFiles.Count){ throw ('File count mismatch after folder copy ({0} vs {1})' -f $srcFiles.Count, $dstFiles.Count) }
-        $sb = [int64]0; if($srcFiles.Count -gt 0){ $sb = [int64]($srcFiles | Measure-Object -Property Length -Sum).Sum }
-        $db = [int64]0; if($dstFiles.Count -gt 0){ $db = [int64]($dstFiles | Measure-Object -Property Length -Sum).Sum }
-        if($sb -ne $db){ throw 'Byte total mismatch after folder copy' }
+        $srcMap = @{}
+        foreach($f in $srcFiles){
+            $rel = $f.FullName.Substring($Source.Length).TrimStart('\','/')
+            $srcMap[$rel.ToLowerInvariant()] = Get-SysOrgFileHash -Path $f.FullName
+        }
+        $dstMap = @{}
+        foreach($f in $dstFiles){
+            $rel = $f.FullName.Substring($final.Length).TrimStart('\','/')
+            $dstMap[$rel.ToLowerInvariant()] = Get-SysOrgFileHash -Path $f.FullName
+        }
+        foreach($k in $srcMap.Keys){
+            if(-not $dstMap.ContainsKey($k)){ throw ("File missing at destination after copy: {0}" -f $k) }
+            if("$($srcMap[$k])" -ne "$($dstMap[$k])"){ throw ("SHA256 mismatch after folder copy: {0}" -f $k) }
+        }
         $result.FilesCopied = $srcFiles.Count
+        $sb = [int64]0; if($srcFiles.Count -gt 0){ $sb = [int64]($srcFiles | Measure-Object -Property Length -Sum).Sum }
         $result.BytesCopied = $sb
         if(Get-SysOrgSetting $Config 'Move.AllowCrossVolume' $true){
             try {
+                # Safe: the pre-move walk verified the tree contains no reparse points,
+                # so a recursive traversal cannot follow links out of the folder.
                 Remove-Item -LiteralPath $Source -Recurse -Force -ErrorAction Stop
                 $result.Status = 'Moved'
             } catch {
@@ -1048,14 +1193,17 @@ function Test-SysOrgReparsePoint {
     Checked via the raw attributes (0x400 ReparsePoint) so it behaves identically on
     Windows PowerShell 5.1 and PowerShell 7. On .NET Core hosts (PowerShell 7 on Linux)
     symlinks do not carry the ReparsePoint attribute, so the LinkTarget property is
-    consulted as well when it exists.
+    consulted as well when it exists. Resolves through the PowerShell provider first,
+    so mixed-separator plan paths resolve on POSIX hosts as well; a missing path is not
+    a reparse point (Attributes=-1 on raw APIs must never be banded as one).
 .EXAMPLE
     Test-SysOrgReparsePoint -Path 'C:\Some\Junction'   # -> True
 #>
     param([Parameter(Mandatory)][string]$Path)
     try{
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        if((([int]$item.Attributes) -band 0x400) -ne 0){ return $true }
+        $attrs = [int]$item.Attributes
+        if(($attrs -ne -1) -and (($attrs -band 0x400) -ne 0)){ return $true }
         if($item.PSObject.Properties['LinkTarget'] -and $item.LinkTarget){ return $true }
     } catch { return $false }
     return $false

@@ -346,3 +346,53 @@ Describe 'Extension map hardening (v2.1.1)' {
         Test-SysOrgMpegTransportStream -Path (Join-Path $root 'missing.ts') | Should -BeFalse
     }
 }
+Describe 'Project folder detection and preview stats (v2.1.1)' {
+    BeforeAll {
+        $script:projCfg = @{ Projects=@{ Enabled=$true; Markers=@() }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                             ExcludeDestinations=$false; TypeMap=@{}; FolderAudit=@{ Enabled=$false } }
+        $script:projProf = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; KnownFolders=@(); DownloadRoots=@() }
+    }
+    It 'a thesis folder with only a Makefile is NOT a project' {
+        $root = Join-Path $TestDrive ('thesis-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path (Join-Path $root 'thesis') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'thesis\Makefile') -Value 'all:'
+        Set-Content -LiteralPath (Join-Path $root 'thesis\chapter1.txt') -Value 'text'
+        @(Get-SysOrgProjectFolders -Roots @($root) -Config $projCfg -DriveProfile $projProf).Count | Should -Be 0
+    }
+    It 'a lone .gitignore or lock file is not a project; two distinct markers are' {
+        $root = Join-Path $TestDrive ('two-m-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path (Join-Path $root 'lone')    -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'lone\.gitignore') -Value ''
+        New-Item -ItemType Directory -Path (Join-Path $root 'real')    -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'real\Makefile')     -Value 'all:'
+        Set-Content -LiteralPath (Join-Path $root 'real\CMakeLists.txt') -Value 'proj()'
+        $found = @(Get-SysOrgProjectFolders -Roots @($root) -Config $projCfg -DriveProfile $projProf)
+        ($found | Where-Object { $_.Name -eq 'lone' }).Count | Should -Be 0
+        ($found | Where-Object { $_.Name -eq 'real' }).Count | Should -Be 1
+    }
+    It 'a VCS marker alone still qualifies (.git)' {
+        $root = Join-Path $TestDrive ('vcs-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path (Join-Path $root 'app\.git') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'app\readme.md') -Value 'r'
+        $found = @(Get-SysOrgProjectFolders -Roots @($root) -Config $projCfg -DriveProfile $projProf)
+        $found.Count | Should -Be 1
+        $found[0].Name | Should -Be 'app'
+    }
+    It 'folder-move preview stats: file count, non-code count, blocked extensions outside build dirs' {
+        $root = Join-Path $TestDrive ('stats-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $repo = Join-Path $root 'app'
+        New-Item -ItemType Directory -Path (Join-Path $repo '.git')    -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $repo 'bin')     -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $repo 'main.py')           -Value 'print(1)'
+        Set-Content -LiteralPath (Join-Path $repo 'readme.md')         -Value 'r'
+        Set-Content -LiteralPath (Join-Path $repo 'native.dll')        -Value 'dll'        # blocked, outside build dirs
+        Set-Content -LiteralPath (Join-Path $repo 'bin\link.dll')      -Value 'dll'        # blocked, INSIDE build dirs
+        $statsCfg = @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); TypeMap=@{}
+                       Policy=@{ DataDrives=@{ BlockedExtensions=@('.dll','.sys') } } }
+        $stats = Get-SysOrgFolderMoveStats -Path $repo -Config $statsCfg -DriveProfile $projProf
+        $stats.Files    | Should -Be 4     # main.py, readme.md, native.dll, bin\link.dll
+        $stats.NonCode  | Should -Be 3     # readme.md + the two .dll files (main.py is Code)
+        $stats.BlockedCount | Should -Be 1 # only native.dll (bin\ is a build-output dir)
+        @($stats.BlockedSamples)[0] | Should -Match 'native\.dll$'
+    }
+}

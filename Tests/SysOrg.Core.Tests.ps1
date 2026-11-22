@@ -426,3 +426,62 @@ Describe 'Execute and undo round trip' {
         Test-Path -LiteralPath $src | Should -BeTrue
     }
 }
+
+Describe 'Folder-move safety (v2.1.1)' {
+    It 'refuses a folder that contains a junction (Windows) or symlink (POSIX) and keeps the source' {
+        $src = Join-Path $TestDrive 'linked\repo'
+        New-Item -ItemType Directory -Path (Join-Path $src 'real') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $src 'real\a.txt') -Value 'a'
+        $created = $false
+        try{
+            if($env:OS -eq 'Windows_NT'){
+                $null = New-Item -ItemType Junction -Path (Join-Path $src 'link') -Target (Join-Path $src 'real') -ErrorAction Stop
+                $created = $true
+            } else {
+                $null = New-Item -ItemType SymbolicLink -Path (Join-Path $src 'linkdir') -Target (Join-Path $src 'real') -ErrorAction Stop
+                $created = $true
+            }
+        } catch {
+            if(-not $created){ Set-ItResult -Inconclusive -Because 'link creation is not permitted on this host'; return }
+        }
+        $dst = Join-Path $TestDrive 'linked\moved\repo'
+        $r = Invoke-SysOrgSafeMoveFolder -Source $src -Destination $dst -Config @{ Move=@{ AllowCrossVolume=$true } }
+        $r.Status | Should -Be 'Failed'
+        $r.Message | Should -Match 'reparse point|junction or symlink'
+        Test-Path -LiteralPath $src | Should -BeTrue                       # source kept
+        Test-Path -LiteralPath $dst | Should -BeFalse                      # nothing moved
+        (Test-SysOrgFolderHasReparsePoint -Path $src).HasLink | Should -BeTrue
+    }
+    It 'moves a clean folder normally (no false positives from the reparse walk)' {
+        $src = Join-Path $TestDrive 'clean\repo'
+        New-Item -ItemType Directory -Path (Join-Path $src 'deep\nested') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $src 'deep\nested\a.txt') -Value 'a'
+        Set-Content -LiteralPath (Join-Path $src 'b.txt') -Value 'b'
+        (Test-SysOrgFolderHasReparsePoint -Path $src).HasLink | Should -BeFalse
+        $r = Invoke-SysOrgSafeMoveFolder -Source $src -Destination (Join-Path $TestDrive 'clean\moved\repo') -Config @{ Move=@{ AllowCrossVolume=$true } }
+        $r.Status | Should -Be 'Moved'
+        Test-Path -LiteralPath (Join-Path $r.Destination 'deep\nested\a.txt') | Should -BeTrue
+    }
+    It 'verification mismatch (mocked) keeps the source on a cross-volume move' -Skip:(-not (Test-Path 'D:\')) {
+        if((Split-Path $TestDrive -Qualifier) -ieq 'D:'){ Set-ItResult -Inconclusive -Because 'no second volume available on this machine'; return }
+        $crossDir = Join-Path 'D:\' ('SysOrgTest-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        try{
+            New-Item -ItemType Directory -Path $crossDir -Force | Out-Null
+            $src = Join-Path $TestDrive 'vfail\repo'
+            New-Item -ItemType Directory -Path $src -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $src 'data.bin') -Value ('V' * 2048)
+            # destination-side hashes are stubbed so verification must fail
+            Mock Get-SysOrgFileHash -ModuleName SysOrg.Core {
+                param($Path)
+                if("$Path" -like "$crossDir*"){ return 'FAKE-DEST-HASH' }
+                return 'REAL-SRC-HASH'
+            }
+            $r = Invoke-SysOrgSafeMoveFolder -Source $src -Destination (Join-Path $crossDir 'repo') -Config @{ Move=@{ AllowCrossVolume=$true } }
+            $r.Status | Should -Be 'Failed'
+            $r.Message | Should -Match 'SHA256 mismatch|count mismatch'
+            Test-Path -LiteralPath (Join-Path $src 'data.bin') | Should -BeTrue   # source kept
+        } finally {
+            if(Test-Path -LiteralPath $crossDir){ Remove-Item -LiteralPath $crossDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
