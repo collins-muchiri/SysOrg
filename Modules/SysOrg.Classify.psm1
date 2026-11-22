@@ -199,7 +199,7 @@ function Invoke-SysOrgClassifyPipeline {
             [void]$d.Signals.Add(('TrueType: content confirms ' + $tt.SignatureType))
         }
     } catch { [void]$d.Signals.Add(('TrueType: failed soft (' + $_.Exception.Message + ')')) }
-    $subtype = Get-SysOrgFindableSubtype -Category $cat -Name $name -Source "$($ctx.Source)"
+    $subtype = Get-SysOrgFindableSubtype -Category $cat -Name $name -Source "$($ctx.Source)" -Extension $ext
     if($ctx.IsMessaging){ $subtype = 'Messaging' }
     elseif($ctx.IsScreenshot -and ($cat -in @('Pictures','Images'))){ $subtype = 'Screenshots' }
     elseif($ctx.IsScreenRecording -and ($cat -in @('Videos'))){ $subtype = 'Screen-Recordings' }

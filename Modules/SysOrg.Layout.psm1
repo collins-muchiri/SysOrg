@@ -66,13 +66,19 @@ function Get-SysOrgFindableSubtype {
     pipeline feeds richer signals into the same contract).
 .DESCRIPTION
     Deterministic token matching on the lowercased stem. 'SKIP' categories and
-    long-path records never reach this function.
+    long-path records never reach this function. Data-type files (csv/xlsx/json/db
+    exports) route to Data via the EXTENSION even though the scanner routes them
+    to the Documents category (the Windows routing set has no Spreadsheets leaf).
 .EXAMPLE
     Get-SysOrgFindableSubtype -Category 'Documents' -Name 'KRA PAYE return 2024.pdf' -Source $null   # -> 'Finance\Tax'
 #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Category,[Parameter(Mandatory)][string]$Name,[string]$Source)
+    param([Parameter(Mandatory)][string]$Category,[Parameter(Mandatory)][string]$Name,[string]$Source,[string]$Extension)
     $stem = ([System.IO.Path]::GetFileNameWithoutExtension("$Name")).ToLowerInvariant()
+    $ext = "$Extension".ToLowerInvariant()
+    if(($Category -eq 'Documents') -and ($ext -in @('.csv','.tsv','.xlsx','.xls','.ods','.db','.sqlite','.json','.mdb','.accdb'))){
+        return 'Data'
+    }
     if($Category -eq 'Pictures'){
         if($stem -match '(^|[^a-z])screenshot'){ return 'Screenshots' }
         if($Source){ return 'Messaging' }
@@ -171,6 +177,7 @@ function Get-SysOrgFindableRelBase {
     }
     if($Subtype -eq 'UntaggedMusic'){ return @{ RelBase='Music\_Untagged'; TakesDate=$true } }
     if($Subtype -eq 'VoiceNote'){ return @{ RelBase='Audio-Recordings'; TakesDate=$true } }
+    if($Category -eq 'Documents' -and $Subtype -eq 'Data'){ return @{ RelBase='Data'; TakesDate=$true } }
     switch($Category){
         'Pictures' {
             if($Subtype -eq 'Messaging'){ return @{ RelBase=('Pictures\Messaging\{0}' -f (Get-SysOrgSafeFolderName -Name "$Source" -MaxLength 40)); TakesDate=$true } }

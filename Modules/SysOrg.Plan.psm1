@@ -479,6 +479,16 @@ function New-SysOrgPlan {
                 $reason = ('Multipart set {0}; {1}' -f $sk, $reason)
             }
             $dest = $destFolder + '\' + $f.Name
+            # v3.0 idempotence (Phase property test): a file that is ALREADY at its
+            # planned destination is never re-planned - moving X to X is not an action.
+            # (On Windows the destination root is excluded at scan time; on portable
+            # hosts and after layout migrations this check is the second line of defence.)
+            $srcN = ("$src").Replace('/','\').TrimEnd('\')
+            $destN = ("$dest").Replace('/','\').TrimEnd('\')
+            if($srcN -ieq $destN){
+                Add-SysOrgPlanSkip -Source $src -Reason 'Already in its destination (idempotent re-plan)'
+                continue
+            }
             # v3.0 Findable: keep every destination inside the character budget with
             # deterministic hash-suffixed shortening (folder segments first, name last).
             if($findable){
