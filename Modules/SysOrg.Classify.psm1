@@ -185,6 +185,15 @@ function Invoke-SysOrgClassifyPipeline {
     # --- stage 4/5: category refinement from context, then true type ---
     $cat = "$Category"
     if(-not $cat){ $cat = 'Other' }
+    try {
+        $tt = Get-SysOrgTrueType -Path $Path -Extension $ext -Category $cat
+        if($tt -and $tt.Matched -and $tt.Corrected){
+            $cat = $tt.Category
+            [void]$d.Signals.Add(('TrueType: content is ' + $tt.SignatureType + '; extension said ' + $tt.ExtensionCategory + ' -> corrected to ' + $cat))
+        } elseif($tt -and $tt.Matched) {
+            [void]$d.Signals.Add(('TrueType: content confirms ' + $tt.SignatureType))
+        }
+    } catch { [void]$d.Signals.Add(('TrueType: failed soft (' + $_.Exception.Message + ')')) }
     $subtype = Get-SysOrgFindableSubtype -Category $cat -Name $name -Source "$($ctx.Source)"
     if($ctx.IsMessaging){ $subtype = 'Messaging' }
     elseif($ctx.IsScreenshot -and ($cat -in @('Pictures','Images'))){ $subtype = 'Screenshots' }
@@ -515,6 +524,125 @@ function Get-SysOrgRuleMatch {
         $setIndex++
     }
     return $null
+}
+
+# ---------------------------------------------------------------------------
+# Stage 5: true type detection (v3.0 Phase 2.3). Extension first, then a
+# magic-byte sniff of the first 512 bytes for missing, unknown or suspect
+# extensions. Every signature maps to exactly ONE routing category (the same
+# single-category rule the extension map follows since v2.1.1).
+# NOTE: sniffing opens the file - callers must have already passed the cloud
+# placeholder and reparse-point gates (the scanner and plan guarantee this).
+# ---------------------------------------------------------------------------
+$script:SysOrgSniffAlways = @('.dat','.bin','.msi','.doc','.xls','.ppt','.docx','.xlsx','.pptx',
+                              '.txt','.md','.csv','.tsv','.log')
+$script:SysOrgZipFamily = @('.zip','.docx','.xlsx','.pptx','.jar','.odt','.ods','.odp','.apk','.ipa')
+
+function Get-SysOrgMagicCategory {
+<#
+.SYNOPSIS
+    Reads at most 512 bytes and matches the built-in magic-byte signature table.
+.DESCRIPTION
+    Returns @{ Matched; SignatureType; Category; Offset } - $null-safe: unreadable,
+    empty or shorter-than-signature files simply do not match (never throws).
+    OLE compound files (D0 CF 11 E0: .msi / legacy .doc / .xls) map by EXTENSION
+    family when present, so an .msi stays an installer and a .doc stays a document;
+    without an extension the OLE signature maps to Documents.
+.EXAMPLE
+    Get-SysOrgMagicCategory -Path 'C:\x\file.bin'   # -> @{ Matched=$true; Category='Pictures'; ... }
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[AllowEmptyString()][string]$Extension)
+    $ext = "$Extension".ToLowerInvariant()
+    try{
+        $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try{
+            if($fs.Length -lt 4){ return [pscustomobject]@{ Matched=$false; SignatureType=''; Category=$null; Offset=0 } }
+            $buf = New-Object byte[] 512
+            $read = 0
+            while($read -lt 512){
+                $n = $fs.Read($buf, $read, 512 - $read)
+                if($n -le 0){ break }
+                $read += $n
+            }
+            if($read -lt 4){ return [pscustomobject]@{ Matched=$false; SignatureType=''; Category=$null; Offset=0 } }
+            function Test-SysOrgMagicAt { param([byte[]]$Buf,[int]$Read,[byte[]]$Magic,[int]$Offset)
+                if(($Offset + $Magic.Count) -gt $Read){ return $false }
+                for($i=0; $i -lt $Magic.Count; $i++){ if($Buf[$Offset + $i] -ne $Magic[$i]){ return $false } }
+                return $true
+            }
+            $ascii = [System.Text.Encoding]::ASCII.GetString($buf, 0, $read)
+            # signature table, checked in order
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0xFF,0xD8,0xFF)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='image/jpeg'; Category='Pictures'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='image/png'; Category='Pictures'; Offset=0 } }
+            if($ascii.StartsWith('GIF8')){ return [pscustomobject]@{ Matched=$true; SignatureType='image/gif'; Category='Pictures'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x42,0x4D)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='image/bmp'; Category='Pictures'; Offset=0 } }
+            if((Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x49,0x49,0x2A,0x00)) -Offset 0) -or
+               (Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x4D,0x4D,0x00,0x2A)) -Offset 0)){ return [pscustomobject]@{ Matched=$true; SignatureType='image/tiff'; Category='Pictures'; Offset=0 } }
+            if($ascii.StartsWith('%PDF')){ return [pscustomobject]@{ Matched=$true; SignatureType='application/pdf'; Category='Documents'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x50,0x4B,0x03,0x04)) -Offset 0){
+                # zip family: the extension decides between Archives and Office containers
+                $cat = 'Archives'
+                if($script:SysOrgZipFamily -contains $ext -and $ext -ne '.zip'){ $cat = 'Documents' }
+                if($ext -eq '.jar'){ $cat = 'Code' }
+                if($ext -eq '.apk'){ $cat = 'Installers' }
+                return [pscustomobject]@{ Matched=$true; SignatureType='application/zip'; Category=$cat; Offset=0 }
+            }
+            if($ascii.StartsWith('Rar!')){ return [pscustomobject]@{ Matched=$true; SignatureType='application/x-rar'; Category='Archives'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x37,0x7A,0xAF,0xBC,0x27,0x1A)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='application/x-7z'; Category='Archives'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x1F,0x8B)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='application/gzip'; Category='Archives'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0xD0,0xCF,0x11,0xE0)) -Offset 0){
+                # OLE compound document: .msi installers, legacy .doc/.xls/.ppt documents
+                $cat = 'Documents'
+                if($ext -eq '.msi'){ $cat = 'Installers' }
+                elseif($ext -eq '.xls'){ $cat = 'Spreadsheets' }
+                elseif($ext -eq '.ppt'){ $cat = 'Documents' }
+                return [pscustomobject]@{ Matched=$true; SignatureType='application/x-ole'; Category=$cat; Offset=0 }
+            }
+            if(($read -ge 12) -and ($ascii.Substring(4,4) -eq 'ftyp')){ return [pscustomobject]@{ Matched=$true; SignatureType='video/mp4'; Category='Videos'; Offset=4 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x1A,0x45,0xDF,0xA3)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='video/x-matroska'; Category='Videos'; Offset=0 } }
+            if($ascii.StartsWith('RIFF') -and ($read -ge 12) -and ($ascii.Substring(8,4) -eq 'WAVE')){ return [pscustomobject]@{ Matched=$true; SignatureType='audio/wav'; Category='Audio'; Offset=0 } }
+            if($ascii.StartsWith('fLaC')){ return [pscustomobject]@{ Matched=$true; SignatureType='audio/flac'; Category='Audio'; Offset=0 } }
+            if($ascii.StartsWith('OggS')){ return [pscustomobject]@{ Matched=$true; SignatureType='audio/ogg'; Category='Audio'; Offset=0 } }
+            if($ascii.StartsWith('ID3')){ return [pscustomobject]@{ Matched=$true; SignatureType='audio/mpeg-id3'; Category='Audio'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0xFF,0xFB)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='audio/mpeg'; Category='Audio'; Offset=0 } }
+            if(Test-SysOrgMagicAt -Buf $buf -Read $read -Magic ([byte[]]@(0x4D,0x5A)) -Offset 0){ return [pscustomobject]@{ Matched=$true; SignatureType='application/x-executable'; Category='Installers'; Offset=0 } }
+            if($ascii.StartsWith('SQLite format 3')){ return [pscustomobject]@{ Matched=$true; SignatureType='application/x-sqlite3'; Category='Databases'; Offset=0 } }
+            return [pscustomobject]@{ Matched=$false; SignatureType=''; Category=$null; Offset=0 }
+        } finally { $fs.Dispose() }
+    } catch { return [pscustomobject]@{ Matched=$false; SignatureType=''; Category=$null; Offset=0 } }
+}
+
+function Get-SysOrgTrueType {
+<#
+.SYNOPSIS
+    Stage 5: resolves the true type of a file - extension first, magic bytes second.
+.DESCRIPTION
+    Sniffs (max 512 bytes) when the extension is missing, when the extension routes
+    to 'Other', or when the extension is in the always-sniff set (legacy Office and
+    container formats whose extensions are frequently wrong). A matched signature
+    that disagrees with the extension's category CORRECTS the category and reports
+    the mismatch; a matching extension is confirmed silently. Nothing is ever
+    renamed on disk - the correction only affects where the file is planned to go.
+.EXAMPLE
+    Get-SysOrgTrueType -Path 'C:\dl\photo.txt' -Extension '.txt' -Category 'Documents'   # PNG content -> Pictures
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[AllowEmptyString()][string]$Extension,[AllowEmptyString()][string]$Category)
+    $ext = "$Extension".ToLowerInvariant()
+    $cat = "$Category"
+    $sniff = $false
+    if([string]::IsNullOrWhiteSpace($ext)){ $sniff = $true }
+    elseif($cat -eq 'Other'){ $sniff = $true }
+    elseif($script:SysOrgSniffAlways -contains $ext){ $sniff = $true }
+    if(-not $sniff){ return $null }
+    $m = Get-SysOrgMagicCategory -Path $Path -Extension $ext
+    if(-not ($m -and $m.Matched)){ return $null }
+    $corrected = ($m.Category -ne $Category)
+    return [pscustomobject]@{
+        Matched=$true; SignatureType=$m.SignatureType; Category=$m.Category
+        Corrected=$corrected; ExtensionCategory=$Category
+    }
 }
 
 function Show-SysOrgDecision {

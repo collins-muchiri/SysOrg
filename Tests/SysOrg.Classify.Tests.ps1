@@ -176,3 +176,73 @@ Describe 'Confidence gating (Phase 2 stage 9)' {
         { Invoke-SysOrgClassifyPipeline -Path 'C:\x\weird file**.txt' -Extension '.txt' -Category 'Documents' -Config $script:cfg } | Should -Not -Throw
     }
 }
+
+Describe 'True type: magic-byte sniffing (Phase 2.3)' {
+
+    It 'corrects a mismatched extension from the content (PNG bytes named .txt)' {
+        $p = Join-Path $TestDrive 'photo.txt'
+        [System.IO.File]::WriteAllBytes($p, [byte[]]@(0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0x00,0x01,0x02,0x03))
+        $tt = Get-SysOrgTrueType -Path $p -Extension '.txt' -Category 'Documents'
+        $tt.Matched | Should -BeTrue
+        $tt.Corrected | Should -BeTrue
+        $tt.Category | Should -Be 'Pictures'
+        $d = Invoke-SysOrgClassifyPipeline -Path $p -Extension '.txt' -Category 'Documents' -Config $script:cfg -DriveProfile $script:prof
+        $d.Category | Should -Be 'Pictures'
+        (@($d.Signals) | Where-Object { $_ -like 'TrueType: content is image/png*' }).Count | Should -Be 1
+    }
+
+    It 'detects a type when the extension is missing (%PDF with no extension)' {
+        $p = Join-Path $TestDrive 'noext'
+        [System.IO.File]::WriteAllText($p, '%PDF-1.4 fake body')
+        $tt = Get-SysOrgTrueType -Path $p -Extension '' -Category 'Other'
+        $tt.Category | Should -Be 'Documents'
+        $d = Invoke-SysOrgClassifyPipeline -Path $p -Extension '' -Category 'Other' -Config $script:cfg -DriveProfile $script:prof
+        $d.Category | Should -Be 'Documents'
+    }
+
+    It 'zip bytes named .dat route to Archives; OLE bytes named .dat stay Documents' {
+        $zip = Join-Path $TestDrive 'thing.dat'
+        [System.IO.File]::WriteAllBytes($zip, [byte[]]@(0x50,0x4B,0x03,0x04,0x00,0x00))
+        (Get-SysOrgTrueType -Path $zip -Extension '.dat' -Category 'Other').Category | Should -Be 'Archives'
+        $ole = Join-Path $TestDrive 'ole.dat'
+        [System.IO.File]::WriteAllBytes($ole, [byte[]]@(0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1,0x00,0x00))
+        (Get-SysOrgTrueType -Path $ole -Extension '.dat' -Category 'Other').Category | Should -Be 'Documents'
+        $msi = Join-Path $TestDrive 'thing.msi'
+        [System.IO.File]::WriteAllBytes($msi, [byte[]]@(0xD0,0xCF,0x11,0xE0,0xA1,0xB1,0x1A,0xE1,0x00,0x00))
+        (Get-SysOrgTrueType -Path $msi -Extension '.msi' -Category 'Installers').Category | Should -Be 'Installers'
+    }
+
+    It 'MZ bytes with no extension route to Installers' {
+        $exe = Join-Path $TestDrive 'prog'
+        [System.IO.File]::WriteAllBytes($exe, [byte[]]@(0x4D,0x5A,0x90,0x00,0x03,0x00))
+        (Get-SysOrgTrueType -Path $exe -Extension '' -Category 'Other').Category | Should -Be 'Installers'
+    }
+
+    It 'matching media extensions are not sniffed (no wasted IO)' {
+        $jpg = Join-Path $TestDrive 'real.jpg'
+        [System.IO.File]::WriteAllBytes($jpg, [byte[]]@(0xFF,0xD8,0xFF,0xE0,0x00,0x10))
+        Get-SysOrgTrueType -Path $jpg -Extension '.jpg' -Category 'Pictures' | Should -BeNullOrEmpty
+        $mp4 = Join-Path $TestDrive 'clip.mp4'
+        [System.IO.File]::WriteAllBytes($mp4, [byte[]]@(0x00,0x00,0x00,0x08) + [System.Text.Encoding]::ASCII.GetBytes('ftyp') + [byte[]]@(0x00,0x00,0x00,0x00,0xFF,0xFF))
+        Get-SysOrgTrueType -Path $mp4 -Extension '.mp4' -Category 'Videos' | Should -BeNullOrEmpty
+    }
+
+    It 'a docx container (zip) does not count as an archive mismatch' {
+        $docx = Join-Path $TestDrive 'doc.docx'
+        [System.IO.File]::WriteAllBytes($docx, [byte[]]@(0x50,0x4B,0x03,0x04,0x00,0x00))
+        $tt = Get-SysOrgTrueType -Path $docx -Extension '.docx' -Category 'Documents'
+        $tt.Corrected | Should -BeFalse
+        $tt.Category | Should -Be 'Documents'
+    }
+
+    It 'empty and unreadable files never match and never throw' {
+        $empty = Join-Path $TestDrive 'empty.dat'
+        [System.IO.File]::WriteAllBytes($empty, [byte[]]@())
+        $r = Get-SysOrgTrueType -Path $empty -Extension '.dat' -Category 'Other'
+        ($null -eq $r -or -not $r.Matched) | Should -BeTrue
+        $short = Join-Path $TestDrive 'short.dat'
+        [System.IO.File]::WriteAllBytes($short, [byte[]]@(0x50,0x4B))
+        ($null -eq (Get-SysOrgTrueType -Path $short -Extension '.dat' -Category 'Other')) | Should -BeTrue
+        { Get-SysOrgTrueType -Path (Join-Path $TestDrive 'does-not-exist.bin') -Extension '.bin' -Category 'Other' } | Should -Not -Throw
+    }
+}
