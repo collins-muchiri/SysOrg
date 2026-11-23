@@ -121,6 +121,11 @@ function New-SysOrgPlan {
             } catch { Write-Verbose ("Learn model unavailable (continuing without it): {0}" -f $_.Exception.Message) }
         }
     }
+    # v3.0.1 C1: the lexicon is loaded ONCE per plan and passed into every pipeline
+    # call (it used to be re-parsed from disk per file - the #1 plan-build hotspot
+    # when a lexicon file exists).
+    $planLexicon = $null
+    try { $planLexicon = Get-SysOrgLexicon -Config $Config -AppRoot $planAppRoot } catch { throw }
     # v3.0 Phase 3.1: metadata through the persistent file-state cache - a fresh hit
     # returns the stored EXIF/ID3/MP4/Office/PDF/text result WITHOUT re-reading the file
     $cachedExtractors = $null
@@ -143,6 +148,13 @@ function New-SysOrgPlan {
     $groupBy      = "$(Get-SysOrgSetting $Config 'Downloads.GroupBy' 'SourceFirst')"
     $useZone      = [bool](Get-SysOrgSetting $Config 'Downloads.UseZoneIdentifier' $true)
     $storeUrls    = [bool](Get-SysOrgSetting $Config 'Privacy.StoreFullUrlsInJournal' $true)
+
+    # v3.0.1 C1/C4: ONE mutability-policy cache and ONE compiled exclusion matcher
+    # per plan build - Test-SysOrgFileMutable was re-resolving 4 dotted-path settings
+    # and looping every exclusion pattern for EVERY file (the #1 plan-build hotspot).
+    $mutPolicyCache = @{}
+    $planExMatcher = $null
+    try { $planExMatcher = New-SysOrgExclusionMatcher -Config $Config } catch { $planExMatcher = $null }
 
     $organizedSet = Get-SysOrgOrganizedDirSet -Inventory $Inventory -Config $Config
     $categoryNames = Get-SysOrgCategoryNames -KnownFolders $KnownFolders
@@ -297,7 +309,7 @@ function New-SysOrgPlan {
             $pres = Test-SysOrgPlanPreservedDir -Directory $parentDir
             if($pres){ Add-SysOrgPlanSkip -Source $src -Reason $pres -Group 'Preserved'; continue }
             # 1) mutability engine (W3)
-            $mut = Test-SysOrgFileMutable -Path $src -Extension "$($f.Extension)" -DriveProfile $DriveProfile -Config $Config
+            $mut = Test-SysOrgFileMutable -Path $src -Extension "$($f.Extension)" -DriveProfile $DriveProfile -Config $Config -PolicyCache $mutPolicyCache -ExMatcher $planExMatcher
             if(-not $mut.Allowed){
                 Add-SysOrgPlanSkip -Source $src -Reason "$($mut.Reason)" -Group 'Protected'
                 continue
@@ -354,7 +366,7 @@ function New-SysOrgPlan {
                 $dec = Invoke-SysOrgClassifyPipeline -Path $src -Extension "$($f.Extension)" -Category "$category" `
                     -Config $Config -DriveProfile $DriveProfile -UrlBucket "$bucket" `
                     -IncludeMetadata -UserRules $userRules -LearnedRules $learnedRules -AppRoot "$planAppRoot" `
-                    -Extractors $cachedExtractors -LearnModel $learnModel
+                    -Extractors $cachedExtractors -LearnModel $learnModel -Lexicon $planLexicon
                 $decOf[$src] = $dec
                 $inReviewMove = $false
                 if($dec.NeedsDecision){
@@ -774,7 +786,7 @@ function New-SysOrgPlan {
                 [void]$needsDecision.Add([pscustomobject]@{ Source=$cp; Confidence=$uc.MajorityRatio; Disposition='collection left in place (low confidence)' })
                 continue
             }
-            $mut2 = Test-SysOrgFileMutable -Path $cp -Extension '' -DriveProfile $DriveProfile -Config $Config -Container
+            $mut2 = Test-SysOrgFileMutable -Path $cp -Extension '' -DriveProfile $DriveProfile -Config $Config -Container -PolicyCache $mutPolicyCache -ExMatcher $planExMatcher
             if(-not $mut2.Allowed){
                 Add-SysOrgPlanSkip -Source $cp -Reason ("User collection not moved: {0}" -f $mut2.Reason) -Group 'Protected'
                 continue
@@ -809,7 +821,7 @@ function New-SysOrgPlan {
     foreach($pf in @($ProjectFolders)){
         if($actions.Count -ge $maxActions){ $capped = $true; break }
         try{
-            $mut = Test-SysOrgFileMutable -Path "$($pf.Path)" -Extension '' -DriveProfile $DriveProfile -Config $Config -Container
+            $mut = Test-SysOrgFileMutable -Path "$($pf.Path)" -Extension '' -DriveProfile $DriveProfile -Config $Config -Container -PolicyCache $mutPolicyCache -ExMatcher $planExMatcher
             if(-not $mut.Allowed){
                 Add-SysOrgPlanSkip -Source "$($pf.Path)" -Reason ("Project folder not moved: {0}" -f $mut.Reason) -Group 'Protected'
                 continue
@@ -1624,6 +1636,10 @@ function Invoke-SysOrgPlan {
         Write-Warning 'This plan predates v2.1.1 (no plan-time size/timestamp snapshot); the changed-since-plan drift check is not available for it.'
     }
     # -----------------------------------------------------------------------------
+    # v3.0.1 C1: one mutability-policy cache + one compiled exclusion matcher per run
+    $execPolicyCache = @{}
+    $execExMatcher = $null
+    try { $execExMatcher = New-SysOrgExclusionMatcher -Config $Config } catch { $execExMatcher = $null }
 
 
     # P1-1: journal is appended and flushed after EVERY row, not written once at the end.
@@ -1759,9 +1775,12 @@ function Invoke-SysOrgPlan {
             if($canonSrc.Error){ $refuse = 'Unsafe source path: ' + $canonSrc.Error }
             elseif($canonDst.Error){ $refuse = 'Unsafe destination path: ' + $canonDst.Error }
             if(-not $refuse){
-                if(Test-SysOrgExcludedPath -Path (Split-Path $canonSrc.Path -Parent) -Config $Config){
+                if($execExMatcher){
+                    if(Test-SysOrgExcludedPathFast -Path (Split-Path $canonSrc.Path -Parent) -Matcher $execExMatcher){ $refuse = 'Source is in a protected/excluded location' }
+                } elseif(Test-SysOrgExcludedPath -Path (Split-Path $canonSrc.Path -Parent) -Config $Config){
                     $refuse = 'Source is in a protected/excluded location'
-                } elseif(Test-Path -LiteralPath $canonSrc.Path){
+                }
+                if(-not $refuse -and (Test-Path -LiteralPath $canonSrc.Path)){
                     if(Test-SysOrgReparsePoint -Path $canonSrc.Path){
                         $refuse = 'Source is a reparse point (junction/symlink)'
                     } elseif(Test-SysOrgCloudPlaceholderAttributes -Attributes ([int](Get-Item -LiteralPath $canonSrc.Path -Force).Attributes)){
@@ -1773,10 +1792,10 @@ function Invoke-SysOrgPlan {
                 $srcQual = Split-Path $canonSrc.Path -Qualifier -ErrorAction SilentlyContinue
                 $prof2 = Get-SysOrgExecutorProfile -Letter ("$srcQual".TrimEnd(':')) -PlanObj $plan
                 if($isContainerAction){
-                    $mut = Test-SysOrgFileMutable -Path $canonSrc.Path -Extension '' -DriveProfile $prof2 -Config $Config -Container
+                    $mut = Test-SysOrgFileMutable -Path $canonSrc.Path -Extension '' -DriveProfile $prof2 -Config $Config -Container -PolicyCache $execPolicyCache -ExMatcher $execExMatcher
                 } else {
                     $ext2 = [System.IO.Path]::GetExtension($canonSrc.Path).ToLowerInvariant()
-                    $mut = Test-SysOrgFileMutable -Path $canonSrc.Path -Extension $ext2 -DriveProfile $prof2 -Config $Config
+                    $mut = Test-SysOrgFileMutable -Path $canonSrc.Path -Extension $ext2 -DriveProfile $prof2 -Config $Config -PolicyCache $execPolicyCache -ExMatcher $execExMatcher
                 }
                 if(-not $mut.Allowed){ $refuse = 'Mutability denied at execution time: ' + $mut.Reason }
             }

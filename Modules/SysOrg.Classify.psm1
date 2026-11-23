@@ -152,7 +152,8 @@ function Invoke-SysOrgClassifyPipeline {
         $UserRules,
         $LearnedRules,
         [string]$AppRoot,
-        [AllowNull()]$LearnModel
+        [AllowNull()]$LearnModel,
+        [AllowNull()]$Lexicon
     )
     $d = New-SysOrgDecision -Path $Path
     $ext = "$Extension".ToLowerInvariant()
@@ -234,7 +235,7 @@ function Invoke-SysOrgClassifyPipeline {
         } catch { [void]$d.Signals.Add(('Date: failed soft (' + $_.Exception.Message + ')')) }
         if($cat -in @('Documents','Other','Spreadsheets','Databases') -and (Get-Command Get-SysOrgDocumentCategory -ErrorAction SilentlyContinue)){
             try {
-                $lex = Get-SysOrgDocumentCategory -Path $Path -Name $name -Metadata $meta -Config $Config -AppRoot $AppRoot
+                $lex = Get-SysOrgDocumentCategory -Path $Path -Name $name -Metadata $meta -Config $Config -AppRoot $AppRoot -Lexicon $Lexicon
                 if($lex -and ($lex.Confidence -gt 0)){
                     $subtype = $lex.Subtype
                     # a WEAK lexicon match never dumps the file into a junk folder:
@@ -382,12 +383,17 @@ function Get-SysOrgRulesFile {
 <#
 .SYNOPSIS
     Loads and validates a rules file. Missing file -> empty; invalid -> THROW (fail closed).
+.DESCRIPTION
+    v3.0.1 C1: cached per (path, mtime) - a rules file is parsed once per run unless
+    it changes on disk.
 .EXAMPLE
     Get-SysOrgRulesFile -Path 'C:\SysOrg\Rules\UserRules.psd1'
 #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$Kind)
     if(-not (Test-Path -LiteralPath $Path)){ return @() }
+    $ck = $Path + '|' + (Get-Item -LiteralPath $Path -Force).LastWriteTimeUtc.Ticks
+    if($script:SysOrgRulesFileCache.ContainsKey($ck)){ return $script:SysOrgRulesFileCache[$ck] }
     $loaded = $null
     try { $loaded = Import-PowerShellDataFile -LiteralPath $Path -ErrorAction Stop }
     catch { throw ("{0} rules file '{1}' could not be parsed: {2}" -f $Kind, $Path, $_.Exception.Message) }
@@ -404,7 +410,9 @@ function Get-SysOrgRulesFile {
         }
         $i++
     }
-    return ($rules | Sort-Object -Property @{e={$_.Priority}}, @{e={$_.Index}})
+    $sorted = @($rules | Sort-Object -Property @{e={$_.Priority}}, @{e={$_.Index}})
+    $script:SysOrgRulesFileCache[$ck] = $sorted
+    return $sorted
 }
 
 function Get-SysOrgUserRules {
@@ -714,10 +722,20 @@ function Get-SysOrgTrueType {
 #   metadata tokens at 1.0x and content tokens at 0.6x weight.
 # ---------------------------------------------------------------------------
 
+# v3.0.1 C1 hotspot fix: the lexicon (and the rules files) were re-parsed from disk
+# for EVERY file; parsing a PSD1 costs milliseconds, which dominated plan-build on
+# real corpora. Both are now cached per (resolved path, file mtime) - a file edit
+# invalidates the cache, so behavior is identical, just not re-parsed per file.
+$script:SysOrgLexiconCache = @{}
+$script:SysOrgRulesFileCache = @{}
+
 function Get-SysOrgLexicon {
 <#
 .SYNOPSIS
     Loads and validates the lexicon (config Rules.LexiconPath, or <AppRoot>\Rules\Lexicon.psd1).
+.DESCRIPTION
+    v3.0.1 C1: cached per (path, mtime) - the lexicon is read ONCE per run unless the
+    file changes on disk.
 .EXAMPLE
     Get-SysOrgLexicon -Config $cfg -AppRoot 'C:\SysOrg'
 #>
@@ -744,12 +762,15 @@ function Get-SysOrgLexicon {
             )
         }
     }
+    $ck = $path + '|' + (Get-Item -LiteralPath $path -Force).LastWriteTimeUtc.Ticks
+    if($script:SysOrgLexiconCache.ContainsKey($ck)){ return $script:SysOrgLexiconCache[$ck] }
     $loaded = $null
     try { $loaded = Import-PowerShellDataFile -LiteralPath $path -ErrorAction Stop }
     catch { throw ("Lexicon file '{0}' could not be parsed: {1} (fix the file or remove it to use the built-in defaults)." -f $path, $_.Exception.Message) }
     if($loaded -isnot [hashtable] -or (-not $loaded.ContainsKey('Entries'))){
         throw ("Lexicon file '{0}' must be a hashtable with an Entries list." -f $path)
     }
+    $script:SysOrgLexiconCache[$ck] = $loaded
     return $loaded
 }
 

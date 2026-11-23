@@ -47,7 +47,8 @@ param(
     [switch]$Score,
     [switch]$Learn,
     [int]$Parallelism = 0,
-    [string]$Root
+    [string]$Root,
+    [switch]$Timing
 )
 $ErrorActionPreference = 'Stop'
 $appRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -279,6 +280,17 @@ function Invoke-SysOrgProfileFlow {
 }
 function Invoke-SysOrgScanFlow {
     param([string]$Letter,[switch]$PreviewOnly,[switch]$WholeDrive,[switch]$NoCacheSwitch)
+    # v3.0.1 C1: per-phase wall times behind -Timing (profile-first speed work)
+    $phaseTimings = @{}
+    function Get-SysOrgPhaseStart { param([string]$Phase)
+        if(-not $Timing){ return $null }
+        return [System.Diagnostics.Stopwatch]::StartNew()
+    }
+    function Stop-SysOrgPhase { param($Sw,[string]$Phase)
+        if($null -eq $Sw){ return }
+        $Sw.Stop()
+        $phaseTimings[$Phase] = [Math]::Round($Sw.Elapsed.TotalSeconds, 2)
+    }
     # W1: no plan is built without a drive profile
     Write-SysOrgLog "Profiling and scanning drive $Letter`: ..." -LogFolder $logFolder
     $profiles = @(Get-SysOrgDriveProfile -Config $Config -Letters $Letter)
@@ -295,7 +307,9 @@ function Invoke-SysOrgScanFlow {
     if($NoCacheSwitch){ $invParams.NoCache = $true }
     if(-not $WholeDrive){ $invParams.DefaultScope = $true }
     # @() collect: the inventory streams records (empty scan emits nothing)
+    $swEnum = Get-SysOrgPhaseStart -Phase 'enumerate'
     $inv = @(Get-SysOrgInventory @invParams)
+    Stop-SysOrgPhase $swEnum 'enumerate'
     if(@($inv).Count -eq 0){
         Write-Host 'Nothing was scanned; no plan was built. Nothing was modified.' -ForegroundColor Yellow
         return
@@ -309,6 +323,13 @@ function Invoke-SysOrgScanFlow {
     $readOnly    = @($trail | Where-Object { $_.Status -eq 'Restricted' })
     Write-Host ("Folders that cannot be altered: {0}   Read-only folders skipped: {1}" -f $cannotAlter.Count, $readOnly.Count) -ForegroundColor Yellow
     foreach($t in @($cannotAlter | Select-Object -First 6)){ Write-Host ('  [cannot alter] ' + $t.Reason + ' -> ' + $t.Path) -ForegroundColor DarkYellow }
+    if($Timing){
+        $summary = Get-SysOrgTimingSummary -Timings $phaseTimings
+        if($summary){
+            Write-Host ''
+            Write-Host $summary -ForegroundColor Cyan
+        }
+    }
     Write-Host ''
     Write-Host 'By routing category:' -ForegroundColor White
     $inv | Group-Object Category | Sort-Object Count -Descending | ForEach-Object {
@@ -324,7 +345,9 @@ function Invoke-SysOrgScanFlow {
     $newCacheEntries = @{}
     $par = Get-SysOrgParallelism -Config $Config -DriveProfile $prof
     if($Parallelism -gt 0){ $par = $Parallelism }
+    $swDups = Get-SysOrgPhaseStart -Phase 'duplicates'
     $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config -FileCache $fileCache -NewEntries $newCacheEntries -Parallelism $par)
+    Stop-SysOrgPhase $swDups 'duplicates'
     Write-Host ("Duplicate groups found: {0}" -f @($dups).Count)
     # v3.0.1 B5: re-download version pairs - report-only, never moved
     $versionPairs = @(Get-SysOrgVersionPairs -Inventory $inv -Config $Config -DupGroups $dups -FileCache $fileCache -NewEntries $newCacheEntries)[0]
@@ -337,7 +360,9 @@ function Invoke-SysOrgScanFlow {
     # ONE unit (structure intact), chosen by the majority classification of contents.
     $collections = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($rootsInfo.Initial) -Config $Config -KnownFolders @($prof.KnownFolders))
     if(@($collections).Count -gt 0){ Write-Host ("User collections detected: {0} (each moves whole, never flattened)" -f @($collections).Count) }
+    $swPlan = Get-SysOrgPhaseStart -Phase 'plan'
     $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries
+    Stop-SysOrgPhase $swPlan 'plan'
     # persist the updated file-state cache (best effort - it is a performance cache)
     foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
     $null = Save-SysOrgFileStateCache -Path $cachePath -Entries $fileCache

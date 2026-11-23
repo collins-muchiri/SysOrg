@@ -223,3 +223,73 @@ Describe 'Duplicate pipeline through the cache (Phase 3.5)' {
         $g3[0].Hash | Should -Be $g2[0].Hash
     }
 }
+
+Describe 'C1 speed work: caching semantics and timing output (v3.0.1)' {
+
+    It 'the mutability policy cache returns verdicts IDENTICAL to the uncached path' {
+        $prof = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='System'; ProposedScope='KnownFolders'
+            KnownFolders=@([pscustomobject]@{ Name='Documents'; Path='C:\Users\t\Documents' })
+            DownloadRoots=@('C:\Users\t\Downloads') }
+        $prof2 = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='System'; ProposedScope='KnownFolders'
+            KnownFolders=@([pscustomobject]@{ Name='Documents'; Path='C:\Users\t\Documents' })
+            DownloadRoots=@('C:\Users\t\Downloads') }
+        $cfg = @{ ExcludedPaths=@('C:\Protected'); ExcludedFilePatterns=@()
+                  Policy=@{ SystemDrive=@{ Scope='KnownFolders'; WritablePaths=@(); BlockedExtensions=@('.dll'); AllowInstallersInDownloads=$true }
+                            DataDrives=@{ Scope='FullDrive' } } }
+        $cases = @(
+            @{ Path='C:\Users\t\Documents\a.txt'; Ext='.txt' }     # allowed
+            @{ Path='C:\Users\t\Documents\b.dll'; Ext='.dll' }     # blocked
+            @{ Path='C:\Loose\c.txt'; Ext='.txt' }                 # outside writable scope
+            @{ Path='C:\Protected\d.txt'; Ext='.txt' }             # excluded path
+            @{ Path='C:\Users\t\Downloads\e.exe'; Ext='.exe' }     # installer in downloads
+            @{ Path='C:\Users\t\Documents\f.exe'; Ext='.exe' }     # installer outside downloads
+        )
+        $cache = @{}
+        foreach($c in $cases){
+            $a = Test-SysOrgFileMutable -Path $c.Path -Extension $c.Ext -DriveProfile $prof -Config $cfg
+            $b = Test-SysOrgFileMutable -Path $c.Path -Extension $c.Ext -DriveProfile $prof2 -Config $cfg -PolicyCache $cache -ExMatcher (New-SysOrgExclusionMatcher -Config $cfg)
+            "$($a.Allowed):$($a.Reason)" | Should -Be "$($b.Allowed):$($b.Reason)"
+        }
+        $cache.Count | Should -BeGreaterOrEqual 1
+    }
+
+    It 'the compiled file-exclusion matcher matches exactly like the -like loop' {
+        $cfg = @{ ExcludedFilePatterns = @('*.tmp','~$*','*.part','*.crdownload','*.partial','desktop.ini','thumbs.db','.DS_Store') }
+        foreach($n in @('a.tmp','x.thumbs.db','~doc.docx','photo.part','setup.crdownload','file.partial','desktop.ini','.DS_Store','keep.txt','photo.jpg')){
+            (Test-SysOrgExcludedFile -Path ("C:\x\" + $n) -Config $cfg) | Should -Be (Test-SysOrgExcludedFileFast -Path ("C:\x\" + $n) -Config $cfg)
+        }
+    }
+
+    It 'the category override map is reference-cached and per-config' {
+        $c1 = @{ TypeMap = @{ '.heic' = 'Pictures' } }
+        $c2 = @{ TypeMap = @{ '.heic' = 'Documents'; '.xyz' = 'Documents' } }   # overrides the built-in mapping
+        (Get-SysOrgCategory -Extension '.heic' -Config $c1) | Should -Be 'Pictures'
+        (Get-SysOrgCategory -Extension '.heic' -Config $c2) | Should -Be 'Documents'   # per-config override wins over the built-in
+        (Get-SysOrgCategory -Extension '.xyz' -Config $c2) | Should -Be 'Documents'
+    }
+
+    It 'the lexicon is cached per file mtime: same file -> same result, edited file -> reloaded' {
+        $app = Join-Path $TestDrive ('c1app-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path (Join-Path $app 'Rules') -Force | Out-Null
+        $lexPath = Join-Path $app 'Rules\Lexicon.psd1'
+        "@{ Version='t1'; Multiplier = @{ Filename = 2.0; Metadata = 1.5; Content = 0.8 }; Confidence = @{ Divider = 1.5 }; Entries = @( @{ Subtype='Work'; Filename=@('alpha'); Content=@() } ) }" |
+            Set-Content -LiteralPath $lexPath -Encoding UTF8
+        $cfg = @{ Rules = @{ LexiconPath = $lexPath } }
+        $l1 = Get-SysOrgLexicon -Config $cfg -AppRoot $app
+        "$($l1.Version)" | Should -Be 't1'
+        $l2 = Get-SysOrgLexicon -Config $cfg -AppRoot $app
+        $l2.Version | Should -Be 't1'                 # cached
+        Start-Sleep -Milliseconds 60
+        "@{ Version='t2'; Multiplier = @{ Filename = 2.0; Metadata = 1.5; Content = 0.8 }; Confidence = @{ Divider = 1.5 }; Entries = @( @{ Subtype='Work'; Filename=@('alpha'); Content=@() } ) }" |
+            Set-Content -LiteralPath $lexPath -Encoding UTF8
+        $l3 = Get-SysOrgLexicon -Config $cfg -AppRoot $app
+        "$($l3.Version)" | Should -Be 't2'            # mtime changed -> reloaded
+    }
+
+    It 'the timing summary is deterministic and alphabetical' {
+        $s = Get-SysOrgTimingSummary -Timings @{ plan=7.19; enumerate=1.99; duplicates=4.58 }
+        $s | Should -Be 'Timing: duplicates 4.58s, enumerate 1.99s, plan 7.19s'
+        (Get-SysOrgTimingSummary -Timings @{}) | Should -BeNullOrEmpty
+        (Get-SysOrgTimingSummary -Timings $null) | Should -BeNullOrEmpty
+    }
+}

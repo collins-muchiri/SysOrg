@@ -748,7 +748,9 @@ function Test-SysOrgExcludedPath {
     Test-SysOrgExcludedPath -Path 'D:\$Recycle.Bin' -Config $cfg   # -> True
 #>
     param([string]$Path,$Config)
-    $p = $Path.TrimEnd('\')
+    # v3.0.1 C1: normalize separators like the compiled fast path - pwsh on non-Windows
+    # hosts normalizes Split-Path output to '/', and the two paths must agree
+    $p = ("$Path").Replace('/','\').TrimEnd('\')
     foreach($pat in @($Config.ExcludedPaths)){
         if([string]::IsNullOrWhiteSpace($pat)){ continue }
         if($pat.Contains('*') -or $pat.Contains('?')){
@@ -862,6 +864,50 @@ function Test-SysOrgExcludedFile {
     $name = Split-Path $Path -Leaf
     foreach($pat in @($Config.ExcludedFilePatterns)){ if($name -like $pat){ return $true } }
     return $false
+}
+
+# v3.0.1 C1/C4: ONE compiled alternation regex for ExcludedFilePatterns, cached per
+# config object and looked up by REFERENCE identity (hashing a large config hashtable
+# per file would itself cost milliseconds). -like semantics per pattern ('*' -> '.*',
+# '?' -> '.', anchored over the file NAME) - identical matching to
+# Test-SysOrgExcludedFile, one compiled regex per run.
+$script:SysOrgExcludedFileRegexCache = @{}
+
+function Get-SysOrgExcludedFileMatcher {
+<#
+.SYNOPSIS
+    The compiled ExcludedFilePatterns regex for a config, cached per config object (v3.0.1 C1/C4).
+.EXAMPLE
+    $rx = Get-SysOrgExcludedFileMatcher -Config $cfg; $rx.IsMatch('a.tmp')   # -> True
+#>
+    [CmdletBinding()]
+    param($Config)
+    foreach($entry in $script:SysOrgExcludedFileRegexCache.Values){
+        if([object]::ReferenceEquals($entry.Config, $Config)){ return $entry.Value }
+    }
+    $patterns = New-Object System.Collections.Generic.List[string]
+    foreach($pat in @($Config.ExcludedFilePatterns)){
+        if([string]::IsNullOrWhiteSpace("$pat")){ continue }
+        [void]$patterns.Add(([regex]::Escape("$pat")).Replace('\*','.*').Replace('\?','.'))
+    }
+    $rx = $null
+    if($patterns.Count -gt 0){
+        try { $rx = [regex]::new('^(' + ($patterns -join '|') + ')$', 'IgnoreCase') } catch { $rx = $null }
+    }
+    $script:SysOrgExcludedFileRegexCache[[guid]::NewGuid().ToString()] = @{ Config=$Config; Value=$rx }
+    return $rx
+}
+
+function Test-SysOrgExcludedFileFast {
+<#
+.SYNOPSIS
+    Compiled-regex fast path of Test-SysOrgExcludedFile (identical semantics, v3.0.1 C1/C4).
+#>
+    [CmdletBinding()]
+    param([string]$Path,$Config)
+    $rx = Get-SysOrgExcludedFileMatcher -Config $Config
+    if(-not $rx){ return $false }
+    return $rx.IsMatch((Split-Path $Path -Leaf))
 }
 
 function ConvertTo-SysOrgPath {
@@ -1004,14 +1050,63 @@ function Test-SysOrgFileMutable {
 #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path,[AllowEmptyString()][string]$Extension,
-          [Parameter(Mandatory)]$DriveProfile,$Config,[switch]$Container)
+          [Parameter(Mandatory)]$DriveProfile,$Config,[switch]$Container,
+          [hashtable]$PolicyCache,[AllowNull()]$ExMatcher)
     $checkPath = if($Container){ $Path.TrimEnd('\') } else { Split-Path $Path -Parent }
-    if(Test-SysOrgExcludedPath -Path $checkPath -Config $Config){
+    if($ExMatcher){
+        if(Test-SysOrgExcludedPathFast -Path $checkPath -Matcher $ExMatcher){
+            return [pscustomobject]@{ Allowed=$false; Reason='Protected path' }
+        }
+    } elseif(Test-SysOrgExcludedPath -Path $checkPath -Config $Config){
         return [pscustomobject]@{ Allowed=$false; Reason='Protected path' }
     }
+    # v3.0.1 C1: policy lookups are the per-file hotspot. When the caller supplies a
+    # -PolicyCache (one per run), the resolved policy is computed ONCE and reused;
+    # the cache key carries the config hash + role so distinct configs never collide
+    # on identical content, and identical content can only produce identical policy.
     $role = "$($DriveProfile.Role)"
-    if($role -ieq 'System'){ $polKey = 'Policy.SystemDrive' } else { $polKey = 'Policy.DataDrives' }
-    $blocked = @(Get-SysOrgSetting $Config ($polKey + '.BlockedExtensions') @())
+    $polKey = ''
+    $blocked = $null
+    $scope = $null
+    $writable = $null
+    $allowInstallers = $null
+    $cacheHit = $false
+    if($PolicyCache){
+        # reference-identity config key: hashing a large config per file costs more
+        # than the lookups it saves
+        $ck = $null
+        foreach($k in $PolicyCache.Keys){
+            $e = $PolicyCache[$k]
+            if([object]::ReferenceEquals($e.Config, $Config) -and "$($e.Letter)" -eq "$($DriveProfile.Letter)" -and "$($e.Role)" -eq $role){
+                $ck = $k; break
+            }
+        }
+        if($ck){
+            $cacheHit = $true
+            $pc = $PolicyCache[$ck]
+            $polKey = $pc.PolKey; $blocked = $pc.Blocked; $scope = $pc.Scope; $writable = $pc.Writable; $allowInstallers = $pc.AllowInstallers
+        } else {
+            $polKey = if($role -ieq 'System'){ 'Policy.SystemDrive' } else { 'Policy.DataDrives' }
+            $blocked = @(Get-SysOrgSetting $Config ($polKey + '.BlockedExtensions') @())
+            $defaultScope = if($role -ieq 'System'){ 'KnownFolders' } else { 'FullDrive' }
+            $scope = "$(Get-SysOrgSetting $Config ($polKey + '.Scope') $defaultScope)"
+            $writable = @()
+            if("$scope" -eq 'KnownFolders'){
+                foreach($k in @($DriveProfile.KnownFolders)){
+                    if($k.Path){ $writable += [string]$k.Path }
+                }
+            }
+            $writable += @(Get-SysOrgSetting $Config ($polKey + '.WritablePaths') @())
+            $allowInstallers = [bool](Get-SysOrgSetting $Config ($polKey + '.AllowInstallersInDownloads') $true)
+            $PolicyCache[[guid]::NewGuid().ToString()] = @{ Config=$Config; Letter="$($DriveProfile.Letter)"; Role=$role
+                PolKey=$polKey; Blocked=$blocked; Scope=$scope; Writable=$writable; AllowInstallers=$allowInstallers }
+        }
+    }
+    if(-not $cacheHit){
+        if($role -ieq 'System'){ $polKey = 'Policy.SystemDrive' } else { $polKey = 'Policy.DataDrives' }
+        $blocked = @(Get-SysOrgSetting $Config ($polKey + '.BlockedExtensions') @())
+        $allowInstallers = [bool](Get-SysOrgSetting $Config ($polKey + '.AllowInstallersInDownloads') $true)
+    }
     if((-not $Container) -and ($blocked -contains $Extension)){
         return [pscustomobject]@{ Allowed=$false; Reason=("Blocked extension {0}" -f $Extension) }
     }
@@ -1026,22 +1121,24 @@ function Test-SysOrgFileMutable {
             $r2 = (("$r").Replace('/','\')).TrimEnd('\')
             if($pathNorm.StartsWith($r2 + '\',[StringComparison]::OrdinalIgnoreCase)){ $inDownloads = $true; break }
         }
-        if((-not $inDownloads) -or (-not (Get-SysOrgSetting $Config ($polKey + '.AllowInstallersInDownloads') $true))){
+        if((-not $inDownloads) -or (-not $allowInstallers)){
             return [pscustomobject]@{ Allowed=$false; Reason='Installer outside download roots' }
         }
     }
-    $defaultScope = if($role -ieq 'System'){ 'KnownFolders' } else { 'FullDrive' }
-    $scope = Get-SysOrgSetting $Config ($polKey + '.Scope') $defaultScope
+    if(-not $cacheHit){
+        $defaultScope = if($role -ieq 'System'){ 'KnownFolders' } else { 'FullDrive' }
+        $scope = Get-SysOrgSetting $Config ($polKey + '.Scope') $defaultScope
+        $writable = @()
+        if("$scope" -eq 'KnownFolders'){
+            foreach($k in @($DriveProfile.KnownFolders)){
+                if($k.Path){ $writable += [string]$k.Path }
+            }
+        }
+        $writable += @(Get-SysOrgSetting $Config ($polKey + '.WritablePaths') @())
+    }
     if("$scope" -eq 'FullDrive'){
         return [pscustomobject]@{ Allowed=$true; Reason='' }
     }
-    $writable = @()
-    if("$scope" -eq 'KnownFolders'){
-        foreach($k in @($DriveProfile.KnownFolders)){
-            if($k.Path){ $writable += [string]$k.Path }
-        }
-    }
-    $writable += @(Get-SysOrgSetting $Config ($polKey + '.WritablePaths') @())
     foreach($w in $writable){
         if([string]::IsNullOrWhiteSpace("$w")){ continue }
         $w2 = ("$w").TrimEnd('\')
@@ -1423,6 +1520,22 @@ function Invoke-SysOrgSafeMoveFolder {
         }
     }
     return $result
+}
+
+function Get-SysOrgTimingSummary {
+<#
+.SYNOPSIS
+    Formats per-phase wall times for the -Timing output (v3.0.1 C1).
+.DESCRIPTION
+    Deterministic: phases are listed alphabetically. Returns 'Timing: duplicates 4.58s, enumerate 1.99s, plan 7.19s'.
+.EXAMPLE
+    Get-SysOrgTimingSummary -Timings @{ enumerate=1.99; plan=7.19 }
+#>
+    [CmdletBinding()]
+    param([AllowNull()][hashtable]$Timings)
+    if(-not $Timings -or $Timings.Count -eq 0){ return $null }
+    $parts = @($Timings.Keys | Sort-Object | ForEach-Object { '{0} {1}s' -f $_, $Timings[$_] })
+    return ('Timing: ' + ($parts -join ', '))
 }
 
 function Format-SysOrgFileSize {

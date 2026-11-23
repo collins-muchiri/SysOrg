@@ -68,6 +68,29 @@ function Get-SysOrgPerceivedSub {
     return $sub
 }
 
+# v3.0.1 C1: the TypeMap/Categories override map is resolved ONCE per config object
+# and looked up by REFERENCE identity (it used to be re-resolved with two dotted-path
+# settings lookups for EVERY scanned file - the scan's biggest per-file cost).
+$script:SysOrgCategoryOverrideCache = @{}
+
+function Get-SysOrgCategoryOverrideMap {
+<#
+.SYNOPSIS
+    The merged TypeMap/Categories override map for a config, cached per config object (v3.0.1 C1).
+.EXAMPLE
+    (Get-SysOrgCategoryOverrideMap -Config $cfg)['.heic']   # -> 'Pictures' when mapped
+#>
+    [CmdletBinding()]
+    param($Config)
+    foreach($entry in $script:SysOrgCategoryOverrideCache.Values){
+        if([object]::ReferenceEquals($entry.Config, $Config)){ return $entry.Value }
+    }
+    $overrides = Get-SysOrgSetting $Config 'TypeMap' $null
+    if(-not ($overrides -is [hashtable])){ $overrides = Get-SysOrgSetting $Config 'Categories' $null }
+    $script:SysOrgCategoryOverrideCache[[guid]::NewGuid().ToString()] = @{ Config=$Config; Value=$overrides }
+    return $overrides
+}
+
 function Get-SysOrgCategory {
 <#
 .SYNOPSIS
@@ -81,8 +104,8 @@ function Get-SysOrgCategory {
 #>
     param([string]$Extension,$Config)
     $ext = $Extension.ToLowerInvariant()
-    $overrides = Get-SysOrgSetting $Config 'TypeMap' $null
-    if(-not ($overrides -is [hashtable])){ $overrides = Get-SysOrgSetting $Config 'Categories' $null }
+    # v3.0.1 C1: override map resolved once per config (identical results)
+    $overrides = Get-SysOrgCategoryOverrideMap -Config $Config
     if($overrides -is [hashtable] -and $overrides.ContainsKey($ext)){
         $v = "$($overrides[$ext])"
         if($script:CategoryToRoute.ContainsKey($v)){ return $script:CategoryToRoute[$v] }
@@ -286,6 +309,12 @@ function Get-SysOrgInventory {
     # v3.0 Phase 3.3: ONE precompiled exclusion matcher for the whole scan
     $exMatcher = $null
     try { $exMatcher = New-SysOrgExclusionMatcher -Config $Config } catch { $exMatcher = $null }
+    # v3.0.1 C1: per-run settings resolved ONCE (were: dotted-path lookups per file/dir)
+    $skipHidden = [bool](Get-SysOrgSetting $Config 'SkipHiddenSystemFiles' $true)
+    $excludeDest = [bool](Get-SysOrgSetting $Config 'ExcludeDestinations' $true)
+    $folderAuditEnabled = [bool](Get-SysOrgSetting $Config 'FolderAudit.Enabled' $true)
+    $fileExRx = $null
+    try { $fileExRx = Get-SysOrgExcludedFileMatcher -Config $Config } catch { $fileExRx = $null }
 
     while($stack.Count -gt 0){
         $dir = [string]$stack.Pop()
@@ -300,10 +329,10 @@ function Get-SysOrgInventory {
         } else {
             if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
         }
-        if((Get-SysOrgSetting $Config 'ExcludeDestinations' $true) -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
+        if($excludeDest -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
 
         # v1.1 folder safety gates: protected (cannot alter) vs restricted (read-only) vs organizable
-        if((Get-SysOrgSetting $Config 'FolderAudit.Enabled' $true) -and ($dir -ine $root)){
+        if($folderAuditEnabled -and ($dir -ine $root)){
             $protectReason = Get-SysOrgFolderProtectionReason -Path $dir -Config $Config -CfaFolders $cfaFolders
             if($protectReason){
                 if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$protectReason }) }
@@ -332,13 +361,16 @@ function Get-SysOrgInventory {
 
         foreach($fi in $files){
             try{
-                if(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
+                # v3.0.1 C1: compiled name-regex fast path (identical semantics)
+                if($fileExRx){
+                    if($fileExRx.IsMatch($fi.Name)){ continue }
+                } elseif(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
                 # Attribute flags are compared as raw ints: on Windows PowerShell 5.1
                 # casting an int like 0x400020 to [System.IO.FileAttributes] throws
                 # (that value is not defined in the .NET Framework enum).
                 # 0x1 ReadOnly | 0x2 Hidden | 0x4 System | 0x400 ReparsePoint | 0x1000 Offline | 0x400000 RecallOnDataAccess
                 $aInt = [int]$fi.Attributes
-                if(Get-SysOrgSetting $Config 'SkipHiddenSystemFiles' $true){
+                if($skipHidden){
                     if((($aInt -band 0x2) -ne 0) -or (($aInt -band 0x4) -ne 0)){ continue }
                 }
                 # P1-5: cloud placeholders - Offline (0x1000) and RecallOnDataAccess (0x400000).
