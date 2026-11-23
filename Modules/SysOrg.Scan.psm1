@@ -329,6 +329,18 @@ function Get-SysOrgInventory {
     $stack = New-Object System.Collections.Stack
     foreach($startDir in $initial){ [void]$stack.Push([string]$startDir) }
     $count = 0
+    # v3.0.2 B2: a scan root that is DROPPED (junction, symlink, access denied,
+    # read-only, excluded...) is never silent - it is reported loudly in the scan
+    # summary and the plan header, and counted in the skip taxonomy.
+    $initialRootSet = New-Object System.Collections.Generic.HashSet[string]
+    foreach($r0 in $initial){ [void]$initialRootSet.Add(("$r0").Replace('/','\').TrimEnd('\').ToLowerInvariant()) }
+    $skippedRoots = New-Object System.Collections.Generic.List[object]
+    function Add-SysOrgSkippedRoot {
+        param([string]$DirPath,[string]$Reason)
+        if($initialRootSet.Contains(("$DirPath").Replace('/','\').TrimEnd('\').ToLowerInvariant())){
+            [void]$skippedRoots.Add([pscustomobject]@{ Path="$DirPath"; Reason="$Reason" })
+        }
+    }
     # v3.0 Phase 3.3: ONE precompiled exclusion matcher for the whole scan
     $exMatcher = $null
     try { $exMatcher = New-SysOrgExclusionMatcher -Config $Config } catch { $exMatcher = $null }
@@ -368,14 +380,15 @@ function Get-SysOrgInventory {
         # P1-8: a .sysorg-ignore marker excludes the WHOLE tree, not just the marker itself
         if(Test-Path -LiteralPath (Join-Path $dir '.sysorg-ignore')){
             Write-Verbose "Marker .sysorg-ignore found; skipping tree: $dir"
+            Add-SysOrgSkippedRoot -DirPath $dir -Reason 'contains a .sysorg-ignore marker'
             continue
         }
         if($exMatcher){
-            if(Test-SysOrgExcludedPathFast -Path $dir -Matcher $exMatcher){ continue }
+            if(Test-SysOrgExcludedPathFast -Path $dir -Matcher $exMatcher){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'Excluded by configuration'; continue }
         } else {
-            if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ continue }
+            if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'Excluded by configuration'; continue }
         }
-        if($excludeDest -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
+        if($excludeDest -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'SysOrg destination root'; continue }
 
         # v3.0.2 B1: reparse points are classified by TAG, not by the attribute alone.
         #   Symlink / Junction / Other -> never followed: recorded, not traversed.
@@ -394,6 +407,7 @@ function Get-SysOrgInventory {
                 # on every Windows profile - skipping them is EXPECTED and must not be
                 # shown as an alarming 'cannot alter' entry.
                 if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Preserved'; Reason='legacy junction (expected)' }) }
+                Add-SysOrgSkippedRoot -DirPath $dir -Reason 'legacy junction (expected)'
                 continue
             }
             $rcReason = switch($reparseClass){
@@ -402,6 +416,7 @@ function Get-SysOrgInventory {
                 default    { 'Reparse point (unsupported tag - never followed)' }
             }
             if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$rcReason }) }
+            Add-SysOrgSkippedRoot -DirPath $dir -Reason $rcReason
             continue
         }
 
@@ -410,15 +425,18 @@ function Get-SysOrgInventory {
             $protectReason = Get-SysOrgFolderProtectionReason -Path $dir -Config $Config -CfaFolders $cfaFolders
             if($protectReason){
                 if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$protectReason }) }
+                Add-SysOrgSkippedRoot -DirPath $dir -Reason $protectReason
                 continue
             }
             $acc = Test-SysOrgDirAccess -Path $dir
             if(-not $acc.Readable){
                 if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=('Access denied reading folder (error {0})' -f $acc.ReadError) }) }
+                Add-SysOrgSkippedRoot -DirPath $dir -Reason ('Access denied reading folder (error {0})' -f $acc.ReadError)
                 continue
             }
             if((-not $acc.Writable) -and (-not (Get-SysOrgSetting $Config 'FolderAudit.IncludeRestrictedInPlans' $false))){
                 if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Restricted'; Reason='No write permission - folder left in place' }) }
+                Add-SysOrgSkippedRoot -DirPath $dir -Reason 'No write permission - folder left in place'
                 continue
             }
         }
@@ -527,6 +545,9 @@ function Get-SysOrgInventory {
     }
     Write-Progress -Activity "Scanning $root" -Completed
     $arr = $records.ToArray()
+
+    # v3.0.2 B2: the caller (scan summary + plan header) reports dropped roots loudly
+    $cacheStats.SkippedRoots = $skippedRoots.ToArray()
 
     if($cacheFile){
         try{

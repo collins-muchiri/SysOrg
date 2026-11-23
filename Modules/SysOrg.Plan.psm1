@@ -66,7 +66,8 @@ function New-SysOrgPlan {
           $UserCollections,
           $VersionPairs,
           $FileCache,
-          [hashtable]$NewCacheEntries)
+          [hashtable]$NewCacheEntries,
+          [AllowEmptyCollection()]$SkippedScanRoots)
 
     if(-not $Config){ throw 'New-SysOrgPlan requires -Config.' }
     if(-not $DriveProfile){ throw 'No drive profile was provided. A plan cannot be built without one (run -ProfileDrives first).' }
@@ -223,6 +224,13 @@ function New-SysOrgPlan {
     $mutAllowed = 0
     $mutDenied = @{}
     $capped = $false
+
+    # v3.0.2 B2: scan roots that were dropped carry into the plan (header + warnings)
+    if(-not $SkippedScanRoots){ $SkippedScanRoots = @() }
+    $SkippedScanRoots = @($SkippedScanRoots)
+    if($SkippedScanRoots.Count -gt 0){
+        [void]$warnings.Add(("{0} scan root(s) were NOT scanned and are NOT part of this plan: {1}" -f $SkippedScanRoots.Count, (($SkippedScanRoots | ForEach-Object { '{0} ({1})' -f (Split-Path "$($_.Path)" -Leaf), "$($_.Reason)" }) -join ', ')))
+    }
 
     # NOTE: this nested helper only MUTATES objects ($skipped list, $mutDenied h[hashtable) -
     # scalar counters would be rebound in the child scope, a classic PowerShell trap.
@@ -932,6 +940,8 @@ function New-SysOrgPlan {
         OneDrive        = [pscustomobject]@{ SyncOut=@($odSyncOut.ToArray()); IntoCloud=@($odIntoCloud.ToArray()) }
         NeedsDecision   = $needsDecision.ToArray()
         Warnings        = @($warnings.ToArray())
+        # v3.0.2 B2: scan roots that were dropped - reported in the plan header
+        SkippedRoots    = $SkippedScanRoots
         Provenance      = @($provRows.ToArray())
         ProvenanceFile  = ''
         # v3.0.1 B5: re-download version pairs - REPORT ONLY (nothing moves)
@@ -1351,6 +1361,14 @@ function Show-SysOrgPlan {
             foreach($d in $tax.OtherRows){
                 Write-Host ('    x{0}  {1}' -f $d.Count, $d.Reason) -ForegroundColor DarkGray
                 Write-Host ('      e.g. {0}' -f $d.Example) -ForegroundColor DarkGray
+            }
+        }
+        # v3.0.2 B2: dropped scan roots are part of the skip taxonomy - the count is
+        # stated explicitly, never silently folded into 'preserved'
+        if($Plan.PSObject.Properties['SkippedRoots'] -and @($Plan.SkippedRoots).Count -gt 0){
+            Write-Host ('  Scan roots NOT scanned: {0}' -f @($Plan.SkippedRoots).Count) -ForegroundColor Yellow
+            foreach($sr in @($Plan.SkippedRoots)){
+                Write-Host ('    {0} was NOT scanned: {1}' -f (Split-Path "$($sr.Path)" -Leaf), "$($sr.Reason)") -ForegroundColor Yellow
             }
         }
     }

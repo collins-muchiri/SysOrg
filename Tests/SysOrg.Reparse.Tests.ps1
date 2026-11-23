@@ -181,3 +181,71 @@ Describe 'name-based system rules are scoped (v3.0.2 B4)' {
         Get-SysOrgFolderProtectionReason -Path $deep -Config @{ FolderAudit=@{ SkipHiddenSystemDirs=$true } } -CfaFolders @() | Should -BeNullOrEmpty
     }
 }
+
+# ---------------------------------------------------------------------------
+# v3.0.2 B2: a scan root that is dropped is NEVER silent - the walk reports it
+# via CacheStats.SkippedRoots, the scan summary and the plan header say so
+# loudly, and the count is part of the skip taxonomy.
+# ---------------------------------------------------------------------------
+Describe 'skipped scan roots are loud (v3.0.2 B2)' {
+
+    It 'the walk records a dropped root with its reason in the cache stats' {
+        $tree = Join-Path $TestDrive ('b2root-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Path (Join-Path $tree 'Junction Root') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $tree 'Junction Root\hidden file.txt') -Value 'x'
+        Set-SysOrgReparseTagMock -Path (Join-Path $tree 'Junction Root') -Tag 0xA0000003
+        $stats = @{}
+        $null = Get-SysOrgInventory -Letter 'X' -Roots @((Join-Path $tree 'Junction Root')) -Config @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); ExcludeDestinations=$true; FolderAudit=@{ Enabled=$true } } -CacheStatsOut $stats
+        $stats.ContainsKey('SkippedRoots') | Should -BeTrue
+        $roots = @($stats.SkippedRoots)
+        @($roots).Count | Should -Be 1
+        "$($roots[0].Reason)" | Should -Match 'junction'
+    }
+
+    It 'a healthy root is not reported' {
+        $tree = Join-Path $TestDrive ('b2ok-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        New-Item -ItemType Directory -Path $tree -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $tree 'fine.txt') -Value 'fine'
+        $stats = @{}
+        $null = Get-SysOrgInventory -Letter 'X' -Roots @($tree) -Config @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); ExcludeDestinations=$true; FolderAudit=@{ Enabled=$true } } -CacheStatsOut $stats
+        if($stats.ContainsKey('SkippedRoots')){ @($stats.SkippedRoots).Count | Should -Be 0 }
+    }
+
+    It 'New-SysOrgPlan carries the dropped roots into the plan and warns' {
+        $inv = @([pscustomobject]@{ FullName='C:\src\note.txt'; Name='note.txt'; Stem='note'; Extension='.txt'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\src'; Category='Documents' })
+        $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $cfg = @{ AppRoot=(Join-Path $TestDrive 'b2app'); OrganizedRoots=@{ '*'='__AUTO__' }
+            Copies=@{ Policy='NumberCopies'; MinFileSizeKB=0 }; Families=@{ Enabled=$false }
+            Downloads=@{ UseZoneIdentifier=$false }; Move=@{ AllowCrossVolume=$true }
+            ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+            PreserveExistingFolders=$false; DateFolders='Year'; FolderAudit=@{ Enabled=$false }; TypeMap=@{} }
+        $plan = New-SysOrgPlan -Letter 'T' -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $cfg -KnownFolders @() `
+            -SkippedScanRoots @([pscustomobject]@{ Path='C:\Users\a\Documents'; Reason='Reparse point (junction - never followed)' })
+        $plan.PSObject.Properties['SkippedRoots'] | Should -Not -BeNullOrEmpty
+        @($plan.SkippedRoots).Count | Should -Be 1
+        $warnLine = @($plan.Warnings | Where-Object { $_ -match 'NOT scanned' })
+        @($warnLine).Count | Should -Be 1
+        "$warnLine" | Should -Match '1 scan root\(s\) were NOT scanned'
+        "$warnLine" | Should -Match 'Documents \(Reparse point \(junction - never followed\)\)' -Because ($warnLine -join ' ')
+    }
+
+    It 'the plan preview states the count in the skip taxonomy' {
+        $inv = @([pscustomobject]@{ FullName='C:\src\note.txt'; Name='note.txt'; Stem='note'; Extension='.txt'
+            Length=5; LastWriteTime=(Get-Date '2026-02-03'); Directory='C:\src'; Category='Documents' })
+        $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $cfg = @{ AppRoot=(Join-Path $TestDrive 'b2app2'); OrganizedRoots=@{ '*'='__AUTO__' }
+            Copies=@{ Policy='NumberCopies'; MinFileSizeKB=0 }; Families=@{ Enabled=$false }
+            Downloads=@{ UseZoneIdentifier=$false }; Move=@{ AllowCrossVolume=$true }
+            ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+            PreserveExistingFolders=$false; DateFolders='Year'; FolderAudit=@{ Enabled=$false }; TypeMap=@{} }
+        $plan = New-SysOrgPlan -Letter 'T' -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $cfg -KnownFolders @() `
+            -SkippedScanRoots @([pscustomobject]@{ Path='C:\Users\a\Documents'; Reason='legacy junction (expected)' })
+        $out = Show-SysOrgPlan -Plan $plan -Config $cfg 2>&1 3>&1 4>&1 5>&1 6>&1
+        $text = (($out | ForEach-Object { "$_" }) -join "`n")
+        $text | Should -Match 'Scan roots NOT scanned: 1'
+        $text | Should -Match 'Documents was NOT scanned: legacy junction \(expected\)'
+    }
+}

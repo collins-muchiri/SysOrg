@@ -415,6 +415,17 @@ function Invoke-SysOrgScanFlow {
     if($cacheStats.FromCache){
         Write-Host ("Inventory cache: age {0}h - {1} file(s) reused, {2} changed since the last scan." -f $cacheStats.AgeHours, $cacheStats.Reused, $cacheStats.Changed) -ForegroundColor DarkGray
     }
+    # v3.0.2 B2: a scan root that was dropped is NEVER silent (the real run's
+    # OneDrive roots vanished into the generic cannot-alter list with no count)
+    $skippedScanRoots = @()
+    if($cacheStats.ContainsKey('SkippedRoots')){ $skippedScanRoots = @($cacheStats.SkippedRoots) }
+    if(@($skippedScanRoots).Count -gt 0){
+        Write-Host ''
+        Write-Host ("{0} scan root(s) were NOT scanned - they are NOT part of this plan:" -f @($skippedScanRoots).Count) -ForegroundColor Yellow
+        foreach($sr in $skippedScanRoots){
+            Write-Host ("  {0} was NOT scanned: {1}" -f (Split-Path "$($sr.Path)" -Leaf), "$($sr.Reason)") -ForegroundColor Yellow
+        }
+    }
     if(@($inv).Count -eq 0){
         Write-Host 'Nothing was scanned; no plan was built. Nothing was modified.' -ForegroundColor Yellow
         return
@@ -517,7 +528,7 @@ function Invoke-SysOrgScanFlow {
     if($reusePlanPath){
         Write-Host ("Reusing existing plan {0} (identical scan inputs - nothing was re-planned)." -f $plan.PlanId) -ForegroundColor Cyan
     } else {
-        $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries
+        $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries -SkippedScanRoots $skippedScanRoots
     }
     Stop-SysOrgPhase $swPlan 'plan'
     # persist the updated file-state cache (best effort - it is a performance cache)
