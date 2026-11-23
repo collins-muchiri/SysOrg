@@ -279,7 +279,12 @@ Describe 'v3.0.2 A2 smoke: child-process SysOrg.ps1 -ScanDrive -ReportOnly (Wind
                 $pwshExe = (Get-Command pwsh -ErrorAction SilentlyContinue)
                 if($pwshExe){ $hosts517 += @{ Exe=$pwshExe.Source; Label='pwsh 7' } }
                 foreach($h in $hosts517){
-                    $out = & $h.Exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $appDir 'SysOrg.ps1') -ScanDrive $letter -ReportOnly -ConfigPath $cfgPath -Timing 2>&1
+                    # v3.0.2 CI: -FullDrive is part of this test's documented design
+                    # (see the file header and the CHANGELOG: '-ScanDrive <subst-drive>
+                    # -ReportOnly -FullDrive'). Without it the real CLI resolves the
+                    # DEFAULT scope - the known folders on the subst drive - and the
+                    # fixture project at the drive root is never scanned.
+                    $out = & $h.Exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $appDir 'SysOrg.ps1') -ScanDrive $letter -ReportOnly -FullDrive -ConfigPath $cfgPath -Timing 2>&1
                     $exit = $LASTEXITCODE
                     $text = (($out | ForEach-Object { "$_" }) -join "`n")
                     $exit | Should -Be 0 -Because ("{0} child run must succeed" -f $h.Label)
