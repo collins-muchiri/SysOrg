@@ -965,11 +965,84 @@ function Invoke-SysOrgSelfTest {
     return $false
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 A4: DIAGNOSTICS BUNDLE. One text file with everything support needs:
+# the real SysOrg version, PowerShell and OS versions, elevation, the config
+# file with its SHA256, the last 200 lines of the newest log, the last recorded
+# error (type, message, script stack trace, position - A1) and the transcript
+# path. Written to Logs\diagnostics-<timestamp>.txt; the path is printed.
+# ---------------------------------------------------------------------------
+function Invoke-SysOrgDiagnosticsBundle {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $stamp = Get-Date
+    $elevated = $false
+    try { $elevated = [bool]$script:SysOrgElevatedSession } catch { }
+    [void]$lines.Add('=== SysOrg diagnostics bundle ===')
+    [void]$lines.Add(('Generated:  {0}' -f $stamp.ToString('yyyy-MM-dd HH:mm:ss')))
+    [void]$lines.Add(('SysOrg version:     {0}' -f "$(Get-SysOrgSetting $Config 'Version' '(config key missing)')"))
+    [void]$lines.Add(('PowerShell:         {0} ({1})' -f $PSVersionTable.PSVersion.ToString(), "$($PSVersionTable.PSEdition)"))
+    $osLine = ''
+    try { $osLine = "$($PSVersionTable.OS)" } catch { }
+    try { $osLine = ('{0} [{1}]' -f $osLine, [System.Environment]::OSVersion.VersionString) } catch { }
+    [void]$lines.Add(('OS:                 {0}' -f $osLine))
+    [void]$lines.Add(('Computer:           {0}' -f "$env:COMPUTERNAME"))
+    [void]$lines.Add(('App folder:         {0}' -f $appRoot))
+    [void]$lines.Add(('Elevated session:   {0}' -f $(if($elevated){ 'YES (Administrator)' } else { 'no' })))
+    $cfgHash = '(config file not found)'
+    try {
+        if($ConfigPath -and (Test-Path -LiteralPath $ConfigPath)){
+            $cfgHash = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash
+        }
+    } catch { $cfgHash = "(hash unavailable: $($_.Exception.Message))" }
+    [void]$lines.Add(('Config file:        {0}' -f "$ConfigPath"))
+    [void]$lines.Add(('Config SHA256:      {0}' -f $cfgHash))
+
+    $tail = Get-SysOrgLogTail -LogFolder $logFolder -Lines 200
+    [void]$lines.Add('')
+    if("$($tail.Path)"){
+        [void]$lines.Add(('--- last {0} log lines ({1}) ---' -f @($tail.Lines).Count, $tail.Path))
+        foreach($l in @($tail.Lines)){ [void]$lines.Add("  $l") }
+    } else {
+        [void]$lines.Add('--- log tail ---   (no log file found yet)')
+    }
+
+    [void]$lines.Add('')
+    $last = Get-SysOrgLastError
+    if($last){
+        [void]$lines.Add('--- last recorded error (this session) ---')
+        [void]$lines.Add(('  When:      {0}   (phase: {1})' -f "$($last.When)", "$($last.Phase)"))
+        [void]$lines.Add(('  Type:      {0}' -f "$($last.Type)"))
+        [void]$lines.Add(('  Message:   {0}' -f "$($last.Message)"))
+        [void]$lines.Add(('  Stack:     {0}' -f "$($last.ScriptStackTrace)"))
+        [void]$lines.Add(('  Position:  {0}' -f "$($last.PositionMessage)"))
+    } else {
+        [void]$lines.Add('--- last recorded error ---   (none recorded in this session)')
+    }
+    $trPath = ''
+    try { $trPath = Join-Path $logFolder 'last-run.txt' } catch { }
+    [void]$lines.Add('')
+    [void]$lines.Add(('Session transcript (if any): {0}' -f $trPath))
+
+    $outPath = Join-Path $logFolder ('diagnostics-{0}.txt' -f $stamp.ToString('yyyyMMdd-HHmmss'))
+    [System.IO.File]::WriteAllLines($outPath, $lines)
+    return $outPath
+}
+
 # ---------------- non-interactive modes ----------------
 # v3.0.2 A1: every CLI entry point runs through Invoke-SysOrgCliStep so a
 # terminating error produces a FULL diagnostic log (type, message, script stack
 # trace, invocation position), a one-line user message pointing at the log and
 # the honest "Nothing was modified." - never a raw red stack dump.
+if($Diagnostics){
+    Invoke-SysOrgCliStep -Step 'Diagnostics' -Action {
+        # v3.0.2 A4: one support file - versions, config hash, last 200 log lines,
+        # last error with stack trace.
+        $diagPath = Invoke-SysOrgDiagnosticsBundle
+        Write-Host ("Diagnostics bundle written: {0}" -f $diagPath) -ForegroundColor Green
+        Write-Host 'Attach this file when asking for support.' -ForegroundColor DarkGray
+    }
+    return
+}
 if($SelfTest){
     Invoke-SysOrgCliStep -Step 'Self-test' -Action {
         # v3.0.2 A3: the whole pipeline on a temporary synthetic tree - PASS/FAIL per
@@ -1221,7 +1294,15 @@ if($ScanDrive){
 }
 
 # ---------------- interactive menu ----------------
+# v3.0.2 A4: every interactive session auto-writes a transcript to
+# Logs\last-run.txt so the user can attach exactly what happened when asking
+# for help. Best effort - hosts that forbid transcripts continue normally.
+$sysTranscriptPath = Start-SysOrgTranscriptCapture -LogFolder $logFolder
+if($sysTranscriptPath){
+    Write-Host ('Session transcript: {0}' -f $sysTranscriptPath) -ForegroundColor DarkGray
+}
 $running = $true
+try {
 while($running){
     # v3.0.2 A1: every menu iteration starts in the preview phase - the catch-all
     # can honestly say "Nothing was modified." until a flow sets the execute phase.
@@ -1239,6 +1320,7 @@ while($running){
     Write-Host ' [9] Find files in the catalog (instant search)'
     Write-Host ' [10] Score the organized tree (findability)'
     Write-Host ' [11] Self-test (whole pipeline on a temporary synthetic tree)'
+    Write-Host ' [12] Diagnostics (support bundle: versions, config hash, log tail, last error)'
     Write-Host ' [0] Exit'
     $choice = Read-Host 'Choose'
     # P2-4: one bad drive or folder never kills the whole app
@@ -1292,6 +1374,11 @@ while($running){
             '9' { $q = Read-Host 'Search (wildcard, e.g. *invoice*)'; $res = @(Find-SysOrgFile -Root (Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config) -Name $q -Config $Config 3>$null); Write-Host ("{0} result(s):" -f $res.Count); $res | Select-Object -First 30 | ForEach-Object { Write-Host ('  ' + $_.CurrentPath + '  [' + $_.Category + ']') } }
             '10' { $sr = Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config; $sc = Get-SysOrgTreeScore -Root $sr -Config $Config; if($sc.Files -eq 0){ Write-Host ''; Write-Host 'No organized tree yet.' -ForegroundColor Yellow; Write-Host ('  Nothing has been organized into {0} so far. Run option 3 (organize a drive) first.' -f $sr) -ForegroundColor Gray } else { Show-SysOrgFindabilityScore -Score $sc -Label $sr -Config $Config -WithTargets } }
             '11' { $null = Invoke-SysOrgSelfTest }
+            '12' {
+                  $diagPath = Invoke-SysOrgDiagnosticsBundle
+                  Write-Host ("Diagnostics bundle written: {0}" -f $diagPath) -ForegroundColor Green
+                  Write-Host 'Attach this file when asking for support.' -ForegroundColor DarkGray
+                }
             '0' { $running = $false }
             default { Write-Host 'Unknown option.' }
         }
@@ -1311,4 +1398,8 @@ while($running){
         # v3.0.2 A1: the next menu iteration always starts in the preview phase.
         $script:SysOrgPhase = 'preview'
     }
+}
+} finally {
+    # v3.0.2 A4: close the transcript even when the session ends abnormally.
+    Stop-SysOrgTranscriptCapture
 }

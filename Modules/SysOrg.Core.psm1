@@ -653,6 +653,63 @@ function Get-SysOrgReparseTag {
     return $null
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 A4: session transcript + support bundle. Every interactive session
+# auto-writes Logs\last-run.txt (PowerShell transcript) so a user asking for
+# help can hand over exactly what happened; -Diagnostics bundles versions,
+# config hash, the last 200 log lines and the last error into one file.
+# ---------------------------------------------------------------------------
+function Start-SysOrgTranscriptCapture {
+<#
+.SYNOPSIS
+    Starts a PowerShell transcript into Logs\last-run.txt (v3.0.2 A4).
+.DESCRIPTION
+    Best effort: when the host forbids transcripts the session continues and ''
+    is returned. A stale transcript from a crashed session is stopped first.
+.EXAMPLE
+    Start-SysOrgTranscriptCapture -LogFolder C:\SysOrg\Logs   # -> the path or ''
+#>
+    param([string]$LogFolder)
+    try{
+        if(-not (Test-Path -LiteralPath $LogFolder)){ New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null }
+        $path = Join-Path $LogFolder 'last-run.txt'
+        try { Stop-Transcript | Out-Null } catch { }   # stale transcript from a crashed session
+        Start-Transcript -Path $path -ErrorAction Stop | Out-Null
+        return $path
+    } catch { Write-Verbose ("Transcript capture unavailable: " + $_.Exception.Message); return '' }
+}
+
+function Stop-SysOrgTranscriptCapture {
+<#
+.SYNOPSIS
+    Stops the session transcript if one is running (v3.0.2 A4). Never throws.
+#>
+    try { Stop-Transcript | Out-Null } catch { }
+}
+
+function Get-SysOrgLogTail {
+<#
+.SYNOPSIS
+    The last N lines of the newest SysOrg log file (v3.0.2 A4).
+.DESCRIPTION
+    Returns the log file path plus its tail. Best effort: an unreadable or
+    missing log yields an empty tail, never a throw.
+.EXAMPLE
+    Get-SysOrgLogTail -LogFolder C:\SysOrg\Logs -Lines 200
+#>
+    param([string]$LogFolder,[int]$Lines=200)
+    $result = @{ Path=''; Lines=@() }
+    try{
+        if([string]::IsNullOrWhiteSpace($LogFolder) -or (-not (Test-Path -LiteralPath $LogFolder))){ return $result }
+        $newest = @(Get-ChildItem -LiteralPath $LogFolder -Filter 'sysorg-*.log' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+        if($newest.Count -eq 0){ return $result }
+        $result.Path = $newest[0].FullName
+        $result.Lines = @(Get-Content -LiteralPath $newest[0].FullName -Tail $Lines -ErrorAction SilentlyContinue)
+    } catch { }
+    return $result
+}
+
 function Get-SysOrgFileHash {
 <#
 .SYNOPSIS
