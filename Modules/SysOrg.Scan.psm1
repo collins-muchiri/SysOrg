@@ -291,6 +291,9 @@ function Get-SysOrgInventory {
     } catch { Write-Verbose "Config-hash cache tag unavailable: $($_.Exception.Message)" }
 
     $cacheFile = $null
+    # v3.0.2 C1: the cache format is versioned - when the scanner or the config
+    # changes, the rebuild is STATED ('cache rebuilt: <reason>'), never silent.
+    $script:SysOrgInventoryCacheVersion = '3.0.2'
     # v3.0.1 C3: the legacy 24-hour whole-inventory cache is VALIDATED, not trusted.
     # The walk always re-enumerates (cheap, streaming); a cached record is reused
     # ONLY when its size and mtime still match the file on disk (2-second tolerance,
@@ -301,6 +304,8 @@ function Get-SysOrgInventory {
     # mutate the CALLER's hashtable (a fresh one here would break the reference)
     $cacheStats = $CacheStatsOut
     if($null -eq $cacheStats){ $cacheStats = @{} }
+    # v3.0.2 C1: the four counters are ALWAYS present and always add up
+    $cacheStats.Reused = 0; $cacheStats.Changed = 0; $cacheStats.New = 0; $cacheStats.Removed = 0
     if($CacheFolder){
         $cacheFile = Join-Path $CacheFolder ('inventory-{0}-{1}{2}.json' -f $Letter, $scope, $cfgTag)
         if(-not $NoCache){
@@ -310,17 +315,46 @@ function Get-SysOrgInventory {
                 if($ageHours -lt $maxAge){
                     $cacheStats.AgeHours = [Math]::Round($ageHours, 1)
                     try{
-                        $cachedRecords = @{}
-                        foreach($r in (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json)){
-                            if($r.PSObject.Properties['FullName']){ $cachedRecords["$($r.FullName)"] = $r }
+                        $loaded = Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json
+                        $rawRecords = $null
+                        if($loaded -is [System.Array]){
+                            # legacy pre-3.0.2 cache: a bare record array
+                            $rawRecords = $loaded
+                            $cacheStats.RebuiltReason = 'scanner version changed (pre-3.0.2 cache format)'
                         }
-                        $cacheStats.FromCache = $true
+                        elseif($loaded.PSObject.Properties['FullName'] -and $loaded.PSObject.Properties['LastWriteTime']){
+                            # a SINGLE legacy record - ConvertFrom-Json unwraps
+                            # one-element arrays, so the bare object is a legacy cache too
+                            $rawRecords = @($loaded)
+                            $cacheStats.RebuiltReason = 'scanner version changed (pre-3.0.2 cache format)'
+                        }
+                        elseif($loaded.PSObject.Properties['ScannerVersion'] -and ("$($loaded.ScannerVersion)" -eq "$script:SysOrgInventoryCacheVersion")){
+                            $rawRecords = $loaded.Records
+                        }
+                        else {
+                            $cacheStats.RebuiltReason = 'scanner version changed (cache written by a different scanner version)'
+                        }
+                        if($null -ne $rawRecords){
+                            $cachedRecords = @{}
+                            foreach($r in @($rawRecords)){
+                                if($r -and $r.PSObject.Properties['FullName']){ $cachedRecords["$($r.FullName)"] = $r }
+                            }
+                            $cacheStats.FromCache = $true
+                        } else {
+                            $cachedRecords = $null
+                            $cacheStats.FromCache = $false
+                        }
                     } catch {
                         Write-Verbose "Inventory cache unreadable, full rescan: $($_.Exception.Message)"
                         $cachedRecords = $null
                         $cacheStats.FromCache = $false
+                        $cacheStats.RebuiltReason = 'cache unreadable - full rescan'
                     }
                 }
+            } elseif($cfgTag){
+                # a cache for a DIFFERENT config exists - the config changed
+                $others = @(Get-ChildItem -LiteralPath $CacheFolder -Filter ('inventory-{0}-{1}-*.json' -f $Letter, $scope) -File -ErrorAction SilentlyContinue)
+                if($others.Count -gt 0){ $cacheStats.RebuiltReason = 'config changed' }
             }
         }
     }
@@ -329,6 +363,9 @@ function Get-SysOrgInventory {
     $stack = New-Object System.Collections.Stack
     foreach($startDir in $initial){ [void]$stack.Push([string]$startDir) }
     $count = 0
+    # v3.0.2 C1: every enumerated-and-accepted file is remembered so Removed counts
+    # exactly the cached records whose file no longer exists
+    $seenAll = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
     # v3.0.2 B2: a scan root that is DROPPED (junction, symlink, access denied,
     # read-only, excluded...) is never silent - it is reported loudly in the scan
     # summary and the plan header, and counted in the skip taxonomy.
@@ -478,27 +515,15 @@ function Get-SysOrgInventory {
 
         foreach($fi in $files){
             try{
+                # v3.0.2 C1: the filters run BEFORE the cache accounting so the stats
+                # describe exactly the files that enter the records - reused + changed
+                # + new always adds up to the files scanned (the real run printed
+                # '1572 changed' for 1,570 scanned files because two placeholder files
+                # were counted as changed and THEN filtered out).
                 # v3.0.1 C1: compiled name-regex fast path (identical semantics)
                 if($fileExRx){
                     if($fileExRx.IsMatch($fi.Name)){ continue }
                 } elseif(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
-                # v3.0.1 C3: reuse a cached record ONLY when size and mtime still match
-                if($null -ne $cachedRecords){
-                    $cr = $cachedRecords[$fi.FullName]
-                    if($cr){
-                        $mtimeDelta = 0.0
-                        try { $mtimeDelta = [Math]::Abs((([datetime]$cr.LastWriteTime) - $fi.LastWriteTime).TotalSeconds) } catch { $mtimeDelta = 9999 }
-                        if(([long]$cr.Length -eq [long]$fi.Length) -and ($mtimeDelta -le 2)){
-                            [void]$records.Add($cr)
-                            $count++
-                            $cacheStats.Reused++
-                            continue
-                        }
-                        $cacheStats.Changed++    # size or mtime changed since the cached scan
-                    } else {
-                        $cacheStats.Changed++    # a NEW file the cached scan never saw
-                    }
-                }
                 # Attribute flags are compared as raw ints: on Windows PowerShell 5.1
                 # casting an int like 0x400020 to [System.IO.FileAttributes] throws
                 # (that value is not defined in the .NET Framework enum).
@@ -512,6 +537,32 @@ function Get-SysOrgInventory {
                 if(Test-SysOrgCloudPlaceholderAttributes -Attributes $aInt){ continue }
                 # P2-5: never follow file reparse points
                 if(($aInt -band 0x400) -ne 0){ continue }
+
+                [void]$seenAll.Add("$($fi.FullName)")
+
+                # v3.0.1 C3: reuse a cached record ONLY when size and mtime still match
+                # v3.0.2 C1: the accounting ALWAYS runs - a fresh scan counts every
+                # file as 'new' (the real run's blank Reused came from counters that
+                # only ran when a cache existed)
+                if($null -ne $cachedRecords){
+                    $cr = $cachedRecords[$fi.FullName]
+                    if($cr){
+                        $mtimeDelta = 0.0
+                        try { $mtimeDelta = [Math]::Abs((([datetime]$cr.LastWriteTime) - $fi.LastWriteTime).TotalSeconds) } catch { $mtimeDelta = 9999 }
+                        if(([long]$cr.Length -eq [long]$fi.Length) -and ($mtimeDelta -le 2)){
+                            [void]$records.Add($cr)
+                            $count++
+                            $cacheStats.Reused++
+                            if($count % 200 -eq 0){ Write-Progress -Activity "Scanning $root" -Status "$count files (in: $dir)" }
+                            continue
+                        }
+                        $cacheStats.Changed++    # size or mtime changed since the cached scan
+                    } else {
+                        $cacheStats.New++        # a file the cached scan never saw
+                    }
+                } else {
+                    $cacheStats.New++            # no cache yet: every file is new
+                }
                 # P2-5: long paths are recorded, not planned (PS 5.1 cannot address them reliably)
                 if($fi.FullName.Length -ge 260){
                     $records.Add([pscustomobject]@{ FullName=$fi.FullName; Name=$fi.Name; Stem=$fi.BaseName
@@ -546,13 +597,25 @@ function Get-SysOrgInventory {
     Write-Progress -Activity "Scanning $root" -Completed
     $arr = $records.ToArray()
 
+    # v3.0.2 C1: Removed = cached records whose file no longer exists (pre-filter:
+    # a file that became hidden still exists and is not 'removed')
+    if($null -ne $cachedRecords){
+        $removedCount = 0
+        foreach($k in $cachedRecords.Keys){
+            if(-not $seenAll.Contains("$k")){ $removedCount++ }
+        }
+        $cacheStats.Removed = $removedCount
+    }
+    # v3.0.2 C1: the counters describe exactly the recorded files
+    $cacheStats.Scanned = $arr.Count
+
     # v3.0.2 B2: the caller (scan summary + plan header) reports dropped roots loudly
     $cacheStats.SkippedRoots = $skippedRoots.ToArray()
 
     if($cacheFile){
         try{
             if(-not (Test-Path -LiteralPath $CacheFolder)){ New-Item -ItemType Directory -Path $CacheFolder -Force | Out-Null }
-            $arr | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
+            @{ ScannerVersion = "$script:SysOrgInventoryCacheVersion"; Records = $arr } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $cacheFile -Encoding UTF8
         } catch { Write-Warning "Inventory cache could not be written: $($_.Exception.Message)" }
     }
     # Stream the records: an empty scan emits nothing, and callers collect with @().

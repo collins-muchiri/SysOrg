@@ -860,8 +860,12 @@ Describe 'Inventory cache freshness validation (v3.0.1 C3)' {
         $inv2 = @(Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @($root) -CacheFolder $cacheDir -CacheStatsOut $stats2)
         $stats2.FromCache | Should -BeTrue
         $stats2.AgeHours | Should -BeGreaterOrEqual 0
-        $stats2.Changed | Should -Be 3          # f1, f2 touched + f7 is new since the cached scan
-        ($stats2.Reused + $stats2.Changed) | Should -Be 6   # f3..f5 reused + 3 changed; f6 vanished, f7 unseen
+        # v3.0.2 C1: changed and new are counted SEPARATELY (new files no longer
+        # lump into Changed, and the counters sum to the files scanned)
+        $stats2.Changed | Should -Be 2          # f1, f2 touched since the cached scan
+        $stats2.New | Should -Be 1              # f7 is new since the cached scan
+        $stats2.Removed | Should -Be 1          # f6 vanished since the cached scan
+        ($stats2.Reused + $stats2.Changed + $stats2.New) | Should -Be 6   # f3..f5 reused + 2 changed + 1 new
         # the walk always re-enumerates: the vanished file is gone, the new file is present
         $names = @($inv2 | ForEach-Object { $_.Name })
         $names | Should -Not -Contain 'f6.txt'
@@ -1038,3 +1042,4 @@ Describe 'App folder inside scan root + empty-tree scoring (v3.0.1 D4/D5)' {
         $sc.Score | Should -BeGreaterOrEqual 0
     }
 }
+

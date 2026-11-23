@@ -411,9 +411,14 @@ function Invoke-SysOrgScanFlow {
     $swEnum = Get-SysOrgPhaseStart -Phase 'enumerate'
     $inv = @(Get-SysOrgInventory @invParams)
     Stop-SysOrgPhase $swEnum 'enumerate'
-    # v3.0.1 C3: the preview states the cache age and how many files changed
+    # v3.0.2 C1: the cache statistics are honest and complete - reused / changed /
+    # new / removed always add up to the files scanned; a rebuild is STATED.
+    if($cacheStats.ContainsKey('RebuiltReason') -and "$($cacheStats.RebuiltReason)"){
+        Write-Host ("cache rebuilt: {0}" -f "$($cacheStats.RebuiltReason)") -ForegroundColor DarkGray
+    }
     if($cacheStats.FromCache){
-        Write-Host ("Inventory cache: age {0}h - {1} file(s) reused, {2} changed since the last scan." -f $cacheStats.AgeHours, $cacheStats.Reused, $cacheStats.Changed) -ForegroundColor DarkGray
+        Write-Host ("Inventory cache: age {0}h - {1} reused, {2} changed, {3} new, {4} removed (scanned {5} files)." -f `
+            $cacheStats.AgeHours, $cacheStats.Reused, $cacheStats.Changed, $cacheStats.New, $cacheStats.Removed, @($inv).Count) -ForegroundColor DarkGray
     }
     # v3.0.2 B2: a scan root that was dropped is NEVER silent (the real run's
     # OneDrive roots vanished into the generic cannot-alter list with no count)
