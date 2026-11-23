@@ -898,7 +898,7 @@ Describe 'User collections: one unit, structure intact (v3.0.1 B2)' {
         New-Item -ItemType Directory -Path (Join-Path $srcRoot 'Mixed') -Force | Out-Null
         $inv = @()
         foreach($i in 1..5){
-            $p = Join-Path $srcRoot 'Mixed' ("doc$i.docx"); Set-Content -LiteralPath $p -Value 'd'
+            $p = Join-Path (Join-Path $srcRoot 'Mixed') ("doc$i.docx"); Set-Content -LiteralPath $p -Value 'd'
             $inv += [pscustomobject]@{ FullName=$p; Name="doc$i.docx"; Stem="doc$i"; Extension='.docx'
                 Length=[long]5; LastWriteTime=(Get-Date '2026-01-05'); Directory=(Join-Path $srcRoot 'Mixed'); Category='Documents' }
         }
