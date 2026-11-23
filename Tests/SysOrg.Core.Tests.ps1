@@ -10,6 +10,19 @@ BeforeAll {
     Import-Module (Join-Path $repo 'Modules\SysOrg.Plan.psm1') -Force
 }
 
+AfterAll {
+    # v3.0.2 CI: remove fixture junctions BEFORE Pester tears down TestDrive -
+    # pwsh 7's .NET fails a recursive TestDrive delete on junctions with
+    # 'The parameter is incorrect' (CI evidence, pwsh 7 leg). A NON-recursive
+    # Directory.Delete removes the junction itself and never touches its target.
+    if($env:OS -eq 'Windows_NT'){
+        $junks = @(Get-ChildItem -LiteralPath $TestDrive -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
+        foreach($j in $junks){
+            try { if($j.PSIsContainer){ [System.IO.Directory]::Delete($j.FullName, $false) } else { [System.IO.File]::Delete($j.FullName) } } catch { }
+        }
+    }
+}
+
 Describe 'Merge-SysOrgHashtable' {
     It 'merges nested h[hashtables without losing sibling keys' {
         $base = @{ Copies = @{ Policy='NumberCopies'; MinFileSizeKB=256 }; DateFolders='Year' }

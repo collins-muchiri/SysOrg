@@ -33,6 +33,19 @@ BeforeAll {
     $script:letter = if($env:OS -eq 'Windows_NT'){ (Split-Path $TestDrive -Qualifier).TrimEnd(':').ToUpper() } else { 'S' }
 }
 
+AfterAll {
+    # v3.0.2 CI: remove fixture junctions BEFORE Pester tears down TestDrive -
+    # pwsh 7's .NET fails a recursive TestDrive delete on junctions with
+    # 'The parameter is incorrect' (CI evidence, pwsh 7 leg). A NON-recursive
+    # Directory.Delete removes the junction itself and never touches its target.
+    if($env:OS -eq 'Windows_NT'){
+        $junks = @(Get-ChildItem -LiteralPath $TestDrive -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
+        foreach($j in $junks){
+            try { if($j.PSIsContainer){ [System.IO.Directory]::Delete($j.FullName, $false) } else { [System.IO.File]::Delete($j.FullName) } } catch { }
+        }
+    }
+}
+
 Describe 'Get-SysOrgInventory exclusions' {
     It 'a .sysorg-ignore marker excludes its entire tree (P1-8)' {
         $root = Join-Path $TestDrive ('marker-' + [guid]::NewGuid().ToString('N').Substring(0,6))

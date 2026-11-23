@@ -167,6 +167,18 @@ BeforeAll {
 
 AfterAll {
     Clear-SysOrgReparseTagMocks
+    # v3.0.2 CI: remove fixture junctions BEFORE Pester tears down TestDrive.
+    # pwsh 7's .NET fails a recursive TestDrive delete on junctions with
+    # 'The parameter is incorrect' (CI evidence, pwsh 7 leg); .NET Framework
+    # (the 5.1 leg) handles them. A NON-recursive Directory.Delete removes the
+    # junction itself and never touches its target. Collect first, then delete,
+    # so the enumeration never races the removal.
+    if($env:OS -eq 'Windows_NT'){
+        $junks = @(Get-ChildItem -LiteralPath $TestDrive -Recurse -Force -Attributes ReparsePoint -ErrorAction SilentlyContinue)
+        foreach($j in $junks){
+            try { if($j.PSIsContainer){ [System.IO.Directory]::Delete($j.FullName, $false) } else { [System.IO.File]::Delete($j.FullName) } } catch { }
+        }
+    }
 }
 
 Describe 'v3.0.2 A2 smoke: the menu-option-3 scan flow over the crash fixture' {
