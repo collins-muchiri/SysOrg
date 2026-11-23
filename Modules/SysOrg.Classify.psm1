@@ -290,9 +290,15 @@ function Invoke-SysOrgClassifyPipeline {
                         $d.Confidence = $modelConf
                         $d.RuleId = if($lex){ 'lexicon+model' } else { 'model' }
                     }
-                    if(($d.Category -in @('Documents','Spreadsheets','Databases')) -and ($script:SysOrgLearnDocSubtypes -contains "$($pred.Label)")){
-                        $subtype = "$($pred.Label)"
-                        $d.Subtype = $subtype
+                    # v3.0.1 fixture fix: model labels are the user's folder names and are
+                    # keyed lowercased in the model - adopt the CANONICAL casing of the
+                    # subtype table via a case-insensitive match ('work' -> 'Work')
+                    if($d.Category -in @('Documents','Spreadsheets','Databases')){
+                        $canonical = @($script:SysOrgLearnDocSubtypes | Where-Object { $_ -ieq "$($pred.Label)" } | Select-Object -First 1)
+                        if($canonical){
+                            $subtype = "$canonical"
+                            $d.Subtype = $subtype
+                        }
                     }
                 }
             }
