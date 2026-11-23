@@ -1288,6 +1288,77 @@ function Get-SysOrgSkipTaxonomy {
     }
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 D3: duplicate and version-pair REPORTS are grouped by folder pair and
+# the FULL lists go to a report file - the preview never prints 41 raw pairs.
+# ---------------------------------------------------------------------------
+function Get-SysOrgFolderPairGroups {
+<#
+.SYNOPSIS
+    Groups items by an (A-folder, B-folder) pair and returns the largest groups.
+.EXAMPLE
+    Get-SysOrgFolderPairGroups -Items $pairs -KeyA { param($v) Split-Path $v.Original -Parent } -KeyB { param($v) Split-Path $v.Copy -Parent } -Top 5
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()]$Items,
+          [Parameter(Mandatory)][scriptblock]$KeyA,[Parameter(Mandatory)][scriptblock]$KeyB,
+          [int]$Top=5)
+    $groups = @{}
+    foreach($it in @($Items)){
+        if(-not $it){ continue }
+        $a = (& $KeyA $it); $b = (& $KeyB $it)
+        $k = ("$a") + '|' + ("$b")
+        if(-not $groups.ContainsKey($k)){ $groups[$k] = @{ A="$a"; B="$b"; Count=0; Items=@() } }
+        $groups[$k].Count++
+        $groups[$k].Items += $it
+    }
+    return @($groups.Values | Sort-Object { $_.Count } -Descending | Select-Object -First $Top)
+}
+
+function Write-SysOrgDuplicateReportFile {
+<#
+.SYNOPSIS
+    Writes the FULL duplicate-group and version-pair list to Reports\ (v3.0.2 D3).
+.DESCRIPTION
+    The preview prints grouped summaries only; this file carries every row.
+    Best effort: returns '' when the file could not be written. Report-only.
+.EXAMPLE
+    Write-SysOrgDuplicateReportFile -ReportFolder C:\SysOrg\Reports -PlanId $p.PlanId -CopiesGroups $p.Copies.Groups -VersionPairs $p.VersionPairs.Versions
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ReportFolder,[Parameter(Mandatory)][string]$PlanId,
+          [AllowEmptyCollection()]$CopiesGroups,[AllowEmptyCollection()]$VersionPairs)
+    try{
+        if(-not (Test-Path -LiteralPath $ReportFolder)){ New-Item -ItemType Directory -Path $ReportFolder -Force | Out-Null }
+        $file = Join-Path $ReportFolder ('SysOrg-DuplicateReport-{0}.txt' -f $PlanId)
+        $lines = New-Object System.Collections.Generic.List[string]
+        [void]$lines.Add("SysOrg duplicate report - plan $PlanId - $(Get-Date)")
+        [void]$lines.Add('Report only: nothing is ever moved, renamed or deleted by this file.')
+        if($CopiesGroups -and @($CopiesGroups).Count -gt 0){
+            [void]$lines.Add('')
+            [void]$lines.Add('--- duplicate groups (keeper + numbered/quarantined/reported copies) ---')
+            foreach($g in @($CopiesGroups)){
+                [void]$lines.Add(('GROUP keeper={0} hash={1}' -f "$($g.Keeper)", "$($g.Hash)"))
+                foreach($cp in @($g.Copies)){ [void]$lines.Add("  copy: $($cp.Source) -> $($cp.Assigned)") }
+                foreach($q in @($g.Quarantined)){ [void]$lines.Add("  quarantined: $q") }
+                foreach($r in @($g.Reported)){ [void]$lines.Add("  reported: $r") }
+            }
+        }
+        if($VersionPairs -and @($VersionPairs).Count -gt 0){
+            [void]$lines.Add('')
+            [void]$lines.Add('--- possible newer-version pairs (browser re-download signal; report only) ---')
+            foreach($v in @($VersionPairs)){
+                $newer = ''
+                if($v.PSObject.Properties['CopyLooksNewer'] -and $v.CopyLooksNewer){ $newer = '  [copy looks newer]' }
+                [void]$lines.Add(('{0}  ({1} bytes, modified {2})' -f $v.Original, $v.OriginalSize, $v.OriginalLastWrite))
+                [void]$lines.Add(('  vs {0}  ({1} bytes, modified {2}){3}' -f $v.Copy, $v.CopySize, $v.CopyLastWrite, $newer))
+            }
+        }
+        [System.IO.File]::WriteAllLines($file, $lines)
+        return $file
+    } catch { return '' }
+}
+
 function Show-SysOrgPlan {
 <#
 .SYNOPSIS
@@ -1393,10 +1464,14 @@ function Show-SysOrgPlan {
         Write-Host ("Copies policy: {0}" -f $c.Policy) -ForegroundColor White
         if("$($c.Policy)" -eq 'NumberCopies' -and ([int]$c.Numbered -gt 0)){
             Write-Host ("  Numbered copies: {0}" -f $c.Numbered)
-            foreach($g in (@($c.Groups) | Where-Object { @($_.Copies).Count -gt 0 } | Select-Object -First 10)){
-                $names = @(@($g.Copies) | ForEach-Object { '{0} -> {1}' -f (Split-Path $_.Source -Leaf), $_.Assigned })
-                Write-Host ("  keeper: {0}  |  {1}" -f (Split-Path $g.Keeper -Leaf), ($names -join '; ')) -ForegroundColor Gray
+            # v3.0.2 D3: grouped by folder pair (keeper folder vs copy folder) - the
+            # top 5 pairs are printed, the full list lands in the duplicate report file
+            $flatCopies = @()
+            foreach($g in @($c.Groups)){ foreach($cp in @($g.Copies)){ $flatCopies += [pscustomobject]@{ Keeper="$($g.Keeper)"; Source="$($cp.Source)"; Assigned="$($cp.Assigned)" } } }
+            foreach($p in (Get-SysOrgFolderPairGroups -Items $flatCopies -KeyA { param($x) Split-Path "$($x.Keeper)" -Parent } -KeyB { param($x) Split-Path "$($x.Source)" -Parent } -Top 5)){
+                Write-Host ('  {0}  vs  {1}: {2} numbered copy(ies)' -f $p.A, $p.B, $p.Count) -ForegroundColor Gray
             }
+            if(@($flatCopies).Count -gt 5){ Write-Host '  ... (full list in the duplicate report file)' -ForegroundColor DarkGray }
         }
         if("$($c.Policy)" -eq 'Quarantine' -and ([int]$c.Quarantined -gt 0)){
             Write-Host ("  Quarantined duplicates: {0}" -f $c.Quarantined)
@@ -1412,12 +1487,13 @@ function Show-SysOrgPlan {
         if($vpVersions.Count -gt 0){
             Write-Host ''
             Write-Host ("Possible newer versions (report-only, nothing moves): {0}" -f $vpVersions.Count) -ForegroundColor Yellow
-            foreach($v in ($vpVersions | Select-Object -First 10)){
-                Write-Host ('  ' + $v.Original + ('  ({0} bytes, modified {1})' -f $v.OriginalSize, $v.OriginalLastWrite)) -ForegroundColor Gray
-                $tag = ''
-                if($v.PSObject.Properties['CopyLooksNewer'] -and $v.CopyLooksNewer){ $tag = '   <- looks NEWER' }
-                Write-Host ('    vs ' + $v.Copy + ('  ({0} bytes, modified {1}){2}' -f $v.CopySize, $v.CopyLastWrite, $tag)) -ForegroundColor DarkYellow
+            # v3.0.2 D3: grouped by folder pair (original folder vs copy folder) - the
+            # top 5 pairs are printed ('A(1)\x vs A\x: 38 files'), the full list goes
+            # to the duplicate report file. Never 41 raw pairs in the console.
+            foreach($p in (Get-SysOrgFolderPairGroups -Items $vpVersions -KeyA { param($v) Split-Path "$($v.Original)" -Parent } -KeyB { param($v) Split-Path "$($v.Copy)" -Parent } -Top 5)){
+                Write-Host ('  {0}  vs  {1}: {2} file(s)' -f $p.A, $p.B, $p.Count) -ForegroundColor Yellow
             }
+            if($vpVersions.Count -gt 5){ Write-Host '  ... (full list in the duplicate report file)' -ForegroundColor DarkGray }
             Write-Host '  Decide which version to keep yourself - SysOrg never deletes either file.' -ForegroundColor DarkGray
         }
     }
@@ -1524,6 +1600,30 @@ function Show-SysOrgPlan {
 
     $deniedTotal = 0
     if($Plan.PSObject.Properties['Mutability'] -and $Plan.Mutability){ $deniedTotal = [int]$Plan.Mutability.DeniedTotal }
+
+    # v3.0.2 D3: the FULL duplicate/version-pair list always lands in the report file
+    $dupHasContent = $false
+    try {
+        $dupHasContent = (($Plan.PSObject.Properties['VersionPairs'] -and $Plan.VersionPairs -and @($Plan.VersionPairs.Versions).Count -gt 0) -or
+                          ($Plan.PSObject.Properties['Copies'] -and $Plan.Copies -and (([int]$Plan.Copies.Numbered -gt 0) -or ([int]$Plan.Copies.Quarantined -gt 0) -or ([int]$Plan.Copies.Reported -gt 0))))
+    } catch { $dupHasContent = $false }
+    if($dupHasContent){
+        $dupReportFolder = ''
+        try {
+            $dupAppRoot = "$(Get-SysOrgSetting $Config 'AppRoot' '')"
+            if(-not [string]::IsNullOrWhiteSpace($dupAppRoot)){ $dupReportFolder = Join-Path $dupAppRoot 'Reports' }
+        } catch { }
+        if(-not [string]::IsNullOrWhiteSpace($dupReportFolder)){
+            # the report writer creates the Reports folder on demand; a preview without
+            # an app root (unit tests) gets the grouped summary without the file
+            $cg = @(); $vp = @()
+            try { if($Plan.PSObject.Properties['Copies'] -and $Plan.Copies){ $cg = @($Plan.Copies.Groups) } } catch { }
+            try { if($Plan.PSObject.Properties['VersionPairs'] -and $Plan.VersionPairs){ $vp = @($Plan.VersionPairs.Versions) } } catch { }
+            $dupReportPath = Write-SysOrgDuplicateReportFile -ReportFolder $dupReportFolder -PlanId "$($Plan.PlanId)" -CopiesGroups $cg -VersionPairs $vp
+            if("$dupReportPath"){ Write-Host ("Duplicate report (full list): {0}" -f $dupReportPath) -ForegroundColor DarkGray }
+        }
+    }
+
     return [pscustomobject]@{
         Moves=$fileMoves.Count; FolderMoves=$folderMoves.Count; Quarantines=$quars.Count; Bytes=$bytes
         DeniedTotal=$deniedTotal; OneDriveSyncOut=$syncOutCount; OneDriveIntoCloud=$intoCount

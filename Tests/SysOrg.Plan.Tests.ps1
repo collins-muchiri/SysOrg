@@ -1103,3 +1103,80 @@ Describe 'Plan picker and identical-scan reuse (v3.0.1 D1)' {
         (Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv4 -Config $cfg -DriveProfile $prof) | Should -Not -Be $f1
     }
 }
+
+# ---------------------------------------------------------------------------
+# v3.0.2 D3: duplicate and version-pair reports are grouped by folder pair
+# (top 5 printed), and the FULL list goes to the duplicate report file - the
+# preview never prints 41 raw pairs.
+# ---------------------------------------------------------------------------
+Describe 'duplicate reports grouped by folder pair (v3.0.2 D3)' {
+
+    It 'Get-SysOrgFolderPairGroups orders by count and honors -Top' {
+        $items = @()
+        foreach($i in 1..6){ $items += [pscustomobject]@{ Original="C:\A\orig $i.txt"; Copy="C:\A (1)\copy $i.txt" } }
+        foreach($i in 1..3){ $items += [pscustomobject]@{ Original="C:\B\orig $i.txt"; Copy="C:\B (1)\copy $i.txt" } }
+        $items += [pscustomobject]@{ Original="C:\C\orig 1.txt"; Copy="C:\C (1)\copy 1.txt" }
+        $g = Get-SysOrgFolderPairGroups -Items $items -KeyA { param($v) Split-Path $v.Original -Parent } -KeyB { param($v) Split-Path $v.Copy -Parent } -Top 2
+        @($g).Count | Should -Be 2
+        $g[0].Count | Should -Be 6
+        # separator-agnostic (portable hosts normalize Split-Path output to '/')
+        "$($g[0].A)" | Should -Match '^C:[\\/]A$'
+        $g[1].Count | Should -Be 3
+    }
+
+    It 'a preview with many version pairs prints folder-pair groups, never all raw pairs, and writes the full report' {
+        $app = Join-Path $TestDrive 'd3app'
+        $items = @()
+        foreach($i in 1..30){ $items += [pscustomobject]@{ Original="C:\dl\pair file $i.pdf"; Copy="C:\dl\pair file $i (1).pdf"
+            OriginalSize=[long]10; CopySize=[long]12; OriginalLastWrite='2026-01-01T00:00:00'; CopyLastWrite='2026-01-02T00:00:00'; CopyLooksNewer=$true } }
+        foreach($i in 1..11){ $items += [pscustomobject]@{ Original="C:\pics\Photo $i.jpg"; Copy="C:\pics\Photo $i (1).jpg"
+            OriginalSize=[long]10; CopySize=[long]12; OriginalLastWrite='2026-01-01T00:00:00'; CopyLastWrite='2026-01-02T00:00:00'; CopyLooksNewer=$false } }
+        $plan = [pscustomobject]@{ PlanId='plan-20260101-093000-003'; Drive='C:'; DestinationRoot='C:\Organized'; DestinationStyle='OrganizedRoot'
+            Actions=@(); Skipped=@(); Warnings=@(); Mutability=$null
+            VersionPairs=[pscustomobject]@{ Identical=0; Versions=$items } }
+        $cfg = @{ OrganizedRoots=@{ 'C'='C:\Organized' }; AppRoot=$app }
+        $out = Show-SysOrgPlan -Plan $plan -Config $cfg 2>&1 3>&1 4>&1 5>&1 6>&1
+        $text = (($out | ForEach-Object { "$_" }) -join "`n")
+        $text | Should -Match 'Possible newer versions \(report-only, nothing moves\): 41'
+        $text | Should -Match 'C:[\\/]dl  vs  C:[\\/]dl: 30 file\(s\)'
+        $text | Should -Match 'C:[\\/]pics  vs  C:[\\/]pics: 11 file\(s\)'
+        $text | Should -Not -Match 'pair file 7\.pdf' -Because 'raw pairs are never printed'
+        $text | Should -Match 'Duplicate report \(full list\):'
+        $repFile = @(Get-ChildItem -LiteralPath (Join-Path $app 'Reports') -Filter 'SysOrg-DuplicateReport-*.json*' -ErrorAction SilentlyContinue)
+        $repFile2 = @(Get-ChildItem -LiteralPath (Join-Path $app 'Reports') -Filter 'SysOrg-DuplicateReport-*.txt' -ErrorAction SilentlyContinue)
+        @($repFile2).Count | Should -Be 1
+        $rep = Get-Content -LiteralPath $repFile2[0].FullName -Raw
+        $rep | Should -Match 'possible newer-version pairs'
+        ([regex]::Matches($rep, [regex]::Escape('  vs '))).Count | Should -Be 41 -Because 'the report file carries EVERY pair'
+    }
+
+    It 'a preview with numbered copies groups them by folder pair in the summary' {
+        $app2 = Join-Path $TestDrive 'd3app2'
+        $copies = @()
+        foreach($i in 1..8){ $copies += [pscustomobject]@{ Source="C:\dl\copy $i.pdf"; Assigned='report.pdf' } }
+        $plan2 = [pscustomobject]@{ PlanId='plan-20260101-093000-004'; Drive='C:'; DestinationRoot='C:\Organized'; DestinationStyle='OrganizedRoot'
+            Actions=@(); Skipped=@(); Warnings=@(); Mutability=$null
+            Copies=[pscustomobject]@{ Policy='NumberCopies'; Numbered=8; Quarantined=0; Reported=0
+                Groups=@([pscustomobject]@{ Keeper='C:\org\keeper.pdf'; Hash='abc'; Copies=$copies; Quarantined=@(); Reported=@() }) } }
+        $cfg2 = @{ OrganizedRoots=@{ 'C'='C:\Organized' }; AppRoot=$app2 }
+        $out2 = Show-SysOrgPlan -Plan $plan2 -Config $cfg2 2>&1 3>&1 4>&1 5>&1 6>&1
+        $text2 = (($out2 | ForEach-Object { "$_" }) -join "`n")
+        $text2 | Should -Match 'Numbered copies: 8'
+        $text2 | Should -Match 'C:[\\/]org  vs  C:[\\/]dl: 8 numbered copy\(ies\)'
+        $text2 | Should -Not -Match 'copy 7\.pdf' -Because 'raw copies are never printed'
+        $rep2 = Get-Content -LiteralPath (@(Get-ChildItem -LiteralPath (Join-Path $app2 'Reports') -Filter 'SysOrg-DuplicateReport-*.txt')[0].FullName) -Raw
+        $rep2 | Should -Match 'GROUP keeper=C:[\\/]org[\\/]keeper\.pdf'
+        ([regex]::Matches($rep2, '  copy: ')).Count | Should -Be 8
+    }
+
+    It 'a preview without duplicate content writes no report file' {
+        $app3 = Join-Path $TestDrive 'd3app3'
+        New-Item -ItemType Directory -Path $app3 -Force | Out-Null
+        $plan3 = [pscustomobject]@{ PlanId='plan-20260101-093000-005'; Drive='C:'; DestinationRoot='C:\Organized'; DestinationStyle='OrganizedRoot'
+            Actions=@(); Skipped=@(); Warnings=@(); Mutability=$null
+            Copies=[pscustomobject]@{ Policy='NumberCopies'; Numbered=0; Quarantined=0; Reported=0; Groups=@() }
+            VersionPairs=[pscustomobject]@{ Identical=0; Versions=@() } }
+        $null = Show-SysOrgPlan -Plan $plan3 -Config @{ OrganizedRoots=@{ 'C'='C:\Organized' }; AppRoot=$app3 } 2>&1 | Out-Null
+        Test-Path -LiteralPath (Join-Path $app3 'Reports') | Should -BeFalse -Because 'no duplicate content, no report file'
+    }
+}
