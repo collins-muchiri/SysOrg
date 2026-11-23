@@ -866,7 +866,7 @@ Describe 'User collections: one unit, structure intact (v3.0.1 B2)' {
                     Folders=@{ PreserveUserCollections=$true; MaxFiles=200; MaxDepth=3; MinMajorityRatio=0.6 } }
         Import-Module (Join-Path $PSScriptRoot '..\Modules\SysOrg.Scan.psm1') -Force
         $cols = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($srcRoot) -Config $b2Cfg -KnownFolders @())
-        ($cols | Where-Object Name -eq 'UNDP').Count | Should -Be 1 -Because ("detected collections: [" + (($cols | ForEach-Object { "$($_.Name) files=$($_.Files) ratio=$($_.MajorityRatio)" }) -join '; ') + "]")
+        @($cols | Where-Object Name -eq 'UNDP').Count | Should -Be 1 -Because ("detected collections: [" + (($cols | ForEach-Object { "$($_.Name) files=$($_.Files) ratio=$($_.MajorityRatio)" }) -join '; ') + "]")
         $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $b2Cfg -KnownFolders @() -UserCollections $cols
         # ONE folder action for the collection; its files are never planned individually
         $folderActs = @($plan.Actions | Where-Object { "$($_.Kind)" -eq 'Folder' })

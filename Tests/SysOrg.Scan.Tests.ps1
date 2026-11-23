@@ -606,11 +606,11 @@ Describe 'User collections detection (v3.0.1 B2)' {
         # a folder at depth 2 within the bound IS a unit even under excluded ancestors
         $mid = @(); foreach($i in 1..5){ $mid += New-SysOrgB2Record -Dir "$root\New folder\2024\UNDP" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
         $c = @(Get-SysOrgUserCollections -Inventory $mid -Roots @($root) -Config @{} -KnownFolders @())
-        ($c | Where-Object Name -eq 'UNDP').Count | Should -Be 1 -Because ("detected collections: [" + (($c | ForEach-Object { "$($_.Name) files=$($_.Files) depth=$($_.Depth)" }) -join '; ') + "]")
+        @($c | Where-Object Name -eq 'UNDP').Count | Should -Be 1 -Because ("detected collections: [" + (($c | ForEach-Object { "$($_.Name) files=$($_.Files) depth=$($_.Depth)" }) -join '; ') + "]")
         # a folder containing ONLY subfolders is still the outer unit (structure intact)
         $nested = @(); foreach($i in 1..5){ $nested += New-SysOrgB2Record -Dir "$root\Programme X\Workshop" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
         $c2 = @(Get-SysOrgUserCollections -Inventory $nested -Roots @($root) -Config @{} -KnownFolders @())
-        ($c2 | Where-Object Name -eq 'Programme X').Count | Should -Be 1
+        @($c2 | Where-Object Name -eq 'Programme X').Count | Should -Be 1
     }
 
     It 'reports mixed-content candidates with their honest majority ratio' {
