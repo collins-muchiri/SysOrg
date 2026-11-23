@@ -17,6 +17,16 @@ $script:SystemFolderNames = @(
     'onedrivetemp','intel','drivers','dell','hp','appdata'
 )
 
+# v3.0.2 B4: name-based system rules apply ONLY at drive-root level (X:\windows,
+# X:\dell - OEM folders live at data-drive roots) or under these KNOWN ABSOLUTE
+# system parents - never deep inside user or project trees (the real run flagged
+# '...\deploy\windows' inside a project as 'System location (never alter)'
+# purely by its leaf name).
+$script:SystemFolderParents = @(
+    'c:\windows','c:\windows\system32','c:\windows\syswow64',
+    'c:\program files','c:\program files (x86)','c:\programdata','c:\perflogs'
+)
+
 function Initialize-SysOrgDirProbe {
 <#
 .SYNOPSIS
@@ -149,8 +159,21 @@ function Get-SysOrgFolderProtectionReason {
     $leaf = (Split-Path $p -Leaf).ToLowerInvariant()
     $qual = Split-Path $p -Qualifier -ErrorAction SilentlyContinue
     $letter = if($qual){ $qual.TrimEnd(':').ToUpper() } else { $null }
-    if(($letter -eq 'C') -and ($script:SystemFolderNames -contains $leaf)){ return 'System location (never alter)' }
-    if($script:SystemFolderNames -contains $leaf){ return 'Protected folder name (never alter)' }
+    # v3.0.2 B4: the leaf NAME protects only at drive-root level (parent == 'X:') or
+    # under a known absolute system parent. 'proj\deploy\windows' inside a user or
+    # project tree is a normal folder; 'C:\Windows' and 'X:\dell' stay protected.
+    if($script:SystemFolderNames -contains $leaf){
+        $parent = Split-Path $p -Parent -ErrorAction SilentlyContinue
+        # separator-agnostic (portable hosts normalize Split-Path output to '/')
+        $parentNorm = ("$parent").Replace('/','\').TrimEnd('\').ToLowerInvariant()
+        $parentQual = Split-Path ("$parent") -Qualifier -ErrorAction SilentlyContinue
+        $qualNorm = ("$parentQual").Replace('/','\').TrimEnd('\')
+        $isRootLevel = ($parentNorm -ieq ($qualNorm.ToLowerInvariant()))
+        if($isRootLevel -or ($script:SystemFolderParents -contains $parentNorm)){
+            if($letter -eq 'C'){ return 'System location (never alter)' }
+            return 'Protected folder name (never alter)'
+        }
+    }
 
     if($CfaFolders){
         foreach($c in $CfaFolders){

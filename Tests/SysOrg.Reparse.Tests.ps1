@@ -137,3 +137,47 @@ Describe 'real reparse tags through FindFirstFileW (v3.0.2 B1, Windows)' -Skip:(
         Get-SysOrgReparseClassification -Path (Join-Path $root 'target') | Should -Be 'None'
     }
 }
+
+# ---------------------------------------------------------------------------
+# v3.0.2 B4: name-based system rules apply ONLY at drive-root level or under
+# known absolute system parents - never deep inside user or project trees.
+# The real run flagged '...\deploy\windows' inside a project as 'System
+# location (never alter)' purely by its leaf name.
+# ---------------------------------------------------------------------------
+Describe 'name-based system rules are scoped (v3.0.2 B4)' {
+
+    It 'C:\Windows stays System location (never alter)' {
+        Get-SysOrgFolderProtectionReason -Path 'C:\Windows' -Config @{} -CfaFolders $null | Should -Be 'System location (never alter)'
+    }
+
+    It 'C:\Program Files\Intel stays protected through its known absolute parent' {
+        Get-SysOrgFolderProtectionReason -Path 'C:\Program Files\Intel' -Config @{} -CfaFolders $null | Should -Be 'System location (never alter)'
+    }
+
+    It 'X:\dell at a data-drive root stays protected' {
+        Get-SysOrgFolderProtectionReason -Path 'X:\dell' -Config @{} -CfaFolders $null | Should -Be 'Protected folder name (never alter)'
+    }
+
+    It 'proj\deploy\windows deep inside a project tree is NOT protected by its name' {
+        $proj = Join-Path $TestDrive ('b4proj-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $deploy = Join-Path $proj 'deploy\windows'
+        New-Item -ItemType Directory -Path $deploy -Force | Out-Null
+        Get-SysOrgFolderProtectionReason -Path $deploy -Config @{ FolderAudit=@{ SkipHiddenSystemDirs=$true } } -CfaFolders @() | Should -BeNullOrEmpty
+    }
+
+    It 'the deep-in-project windows folder is scannable by the walk' {
+        $proj = Join-Path $TestDrive ('b4walk-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $deploy = Join-Path $proj 'deploy\windows'
+        New-Item -ItemType Directory -Path $deploy -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $deploy 'deploy tool (x86).exe') -Value 'binary'
+        $inv = @(Get-SysOrgInventory -Letter 'X' -Roots @($proj) -Config @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); ExcludeDestinations=$true; FolderAudit=@{ Enabled=$true }; Move=@{ AllowInstallersInDownloads=$true } })
+        @($inv | Where-Object { "$($_.Name)" -eq 'deploy tool (x86).exe' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'a system name two levels deep under a user tree is not protected either' {
+        $user = Join-Path $TestDrive ('b4user-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $deep = Join-Path $user 'backup\intel'
+        New-Item -ItemType Directory -Path $deep -Force | Out-Null
+        Get-SysOrgFolderProtectionReason -Path $deep -Config @{ FolderAudit=@{ SkipHiddenSystemDirs=$true } } -CfaFolders @() | Should -BeNullOrEmpty
+    }
+}
