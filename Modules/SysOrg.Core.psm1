@@ -538,6 +538,121 @@ function Write-SysOrgLog {
     Write-Host $line -ForegroundColor $color
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 A2/B1: reparse-point TAG resolution. The 0x400 ReparsePoint ATTRIBUTE
+# alone conflates junctions and symlinks with OneDrive cloud folders - which is
+# how the real run's OneDrive Documents/Pictures/Desktop got skipped as
+# 'cannot alter'. Get-SysOrgReparseTag reads the actual reparse TAG:
+#   - in-process test mocks first (Set-SysOrgReparseTagMock),
+#   - then the SYSORG_REPARSE_MOCK environment variable ('path=0xTag;...') so a
+#     CHILD-PROCESS smoke run (real menu/CLI code path) can simulate cloud
+#     folders on any machine,
+#   - then the true tag from WIN32_FIND_DATA.dwReserved0 (FindFirstFileW).
+# Tag constants are the documented Windows values (winnt.h / 'Reparse Point
+# Tags' on Microsoft Learn): MOUNT_POINT 0xA0000003 (junction), SYMLINK
+# 0xA000000C, and the cloud family 0x90000000-0x9000F001 (OneDrive cloud files).
+# ---------------------------------------------------------------------------
+$script:SysOrgReparseTagMocks = @{}
+
+if(-not ('SysOrg.NativeFind' -as [type])){
+    try{
+        Add-Type -Namespace SysOrg -Name NativeFind -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct WIN32_FIND_DATAW {
+    public uint dwFileAttributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ftCreationTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ftLastAccessTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME ftLastWriteTime;
+    public uint nFileSizeHigh;
+    public uint nFileSizeLow;
+    public uint dwReserved0;
+    public uint dwReserved1;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+    public string cFileName;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 14)]
+    public string cAlternateFileName;
+}
+[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern IntPtr FindFirstFileW(string lpFileName, out WIN32_FIND_DATAW lpFindFileData);
+[DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool FindClose(IntPtr hFindFile);
+'@
+    } catch { Write-Verbose "Native find P/Invoke unavailable: $($_.Exception.Message)" }
+}
+
+function Set-SysOrgReparseTagMock {
+<#
+.SYNOPSIS
+    Registers an in-process reparse-tag mock for one path (v3.0.2 test seam).
+.EXAMPLE
+    Set-SysOrgReparseTagMock -Path 'C:\Users\a\Documents' -Tag 0x90000001   # OneDrive cloud
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)]$Tag)
+    $key = ("$Path").TrimEnd('\').TrimEnd('/').ToLowerInvariant()
+    # 0x90000001-class literals parse as negative INTs in PowerShell - normalize
+    # through long before the uint32 cast
+    $script:SysOrgReparseTagMocks[$key] = [uint32]([long]$Tag -band 0xFFFFFFFFL)
+}
+
+function Clear-SysOrgReparseTagMocks {
+<#
+.SYNOPSIS
+    Removes every in-process reparse-tag mock (v3.0.2 test seam).
+#>
+    $script:SysOrgReparseTagMocks = @{}
+}
+
+function Get-SysOrgReparseTag {
+<#
+.SYNOPSIS
+    The reparse TAG of a path: uint32 tag, 0 for 'not a reparse point', $null when
+    unknowable (non-Windows host without a mock). Never follows the link.
+.DESCRIPTION
+    Resolution order: in-process mocks, the SYSORG_REPARSE_MOCK env var
+    ('path=0x90000001;path2=0xA0000003', case-insensitive on the path, values hex
+    or decimal), then the true dwReserved0 via FindFirstFileW on Windows hosts.
+.EXAMPLE
+    Get-SysOrgReparseTag -Path 'C:\Users\a\Documents'   # -> 0x90000001 (cloud) / 0 / $null
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $key = ("$Path").TrimEnd('\').TrimEnd('/').ToLowerInvariant()
+    # 1) in-process mocks (unit tests)
+    if($script:SysOrgReparseTagMocks.ContainsKey($key)){ return [uint32]$script:SysOrgReparseTagMocks[$key] }
+    # 2) environment mocks (child-process smoke runs)
+    $envMock = $env:SYSORG_REPARSE_MOCK
+    if(-not [string]::IsNullOrWhiteSpace($envMock)){
+        foreach($pair in ($envMock -split ';')){
+            if([string]::IsNullOrWhiteSpace("$pair")){ continue }
+            $idx = "$pair".LastIndexOf('=')
+            if($idx -lt 1){ continue }
+            $mp = ("$pair".Substring(0,$idx)).Trim().TrimEnd('\').TrimEnd('/').ToLowerInvariant()
+            if($mp -ieq $key){
+                $raw = ("$pair".Substring($idx+1)).Trim()
+                try {
+                    if($raw -match '^(?i:0x)?([0-9A-Fa-f]{1,8})$'){ return [uint32][Convert]::ToUInt32($Matches[1], 16) }
+                    return [uint32][Convert]::ToUInt32($raw)
+                } catch { return $null }
+            }
+        }
+    }
+    # 3) the real tag (Windows only)
+    if(($env:OS -eq 'Windows_NT') -and ('SysOrg.NativeFind' -as [type])){
+        try{
+            $fd = New-Object SysOrg.NativeFind+WIN32_FIND_DATAW
+            $h = [SysOrg.NativeFind]::FindFirstFileW("$Path", [ref]$fd)
+            if($h -eq [IntPtr](-1)){ return 0 }
+            try {
+                $tag = [uint32]$fd.dwReserved0
+                if(([int]$fd.dwFileAttributes -band 0x400) -eq 0){ return 0 }
+                return $tag
+            } finally { [void][SysOrg.NativeFind]::FindClose($h) }
+        } catch { return $null }
+    }
+    return $null
+}
+
 function Get-SysOrgFileHash {
 <#
 .SYNOPSIS

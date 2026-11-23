@@ -357,6 +357,12 @@ function Invoke-SysOrgScanFlow {
             }
         }
     }
+    elseif($rememberedRoots -and (@($rememberedRoots).Count -gt 0) -and $WholeDrive){
+        # v3.0.2 A2: remembered scan roots are USED, not only remembered - before this
+        # fix they merely suppressed the picker prompt while the walk re-resolved the
+        # scope from the config, silently scanning folders the user had deselected.
+        $rootsOverride = @(@($rememberedRoots) | ForEach-Object { "$_" })
+    }
     # v3.0.1 C1: per-phase wall times behind -Timing (profile-first speed work)
     $phaseTimings = @{}
     function Get-SysOrgPhaseStart { param([string]$Phase)
@@ -392,6 +398,13 @@ function Invoke-SysOrgScanFlow {
     $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail; KnownFolders=@($prof.KnownFolders); ProjectFoldersOut=$walkProjects; PreservedOut=$walkPreserved; CacheStatsOut=$cacheStats }
     if($NoCacheSwitch){ $invParams.NoCache = $true }
     if(-not $WholeDrive){ $invParams.DefaultScope = $true }
+    # v3.0.2 A2: a user-chosen scope (picker choice or remembered roots) must reach
+    # the WALK - previously the walk re-resolved roots from the config and scanned
+    # folders the user had deselected. Default-scope and FullDrive runs keep the
+    # inventory's own resolution so their cache keys and behaviour are unchanged.
+    if($rootsOverride -and @($rootsOverride).Count -gt 0){
+        $invParams.Roots = @(@($rootsOverride) | ForEach-Object { "$_" })
+    }
     # @() collect: the inventory streams records (empty scan emits nothing)
     $swEnum = Get-SysOrgPhaseStart -Phase 'enumerate'
     $inv = @(Get-SysOrgInventory @invParams)
@@ -452,9 +465,21 @@ function Invoke-SysOrgScanFlow {
         $projects = @(Get-SysOrgProjectFolders -Roots @($rootsInfo.Initial) -Config $Config -DriveProfile $prof -KnownFolders @($prof.KnownFolders))
     }
     if(@($projects).Count -gt 0){ Write-Host ("Code project folders detected: {0} (moved whole, .git intact)" -f @($projects).Count) }
-    if(@($walkPreserved).Count -gt 0){
-        $depCount = @(@($walkPreserved) | Where-Object { $_.Kind -eq 'Dependency' }).Count
-        $projCount = @(@($walkPreserved) | Where-Object { $_.Kind -eq 'Project' }).Count
+    # v3.0.2 A2: THE PLAN-BUILD CRASH FIX. $walkPreserved is a New-Object-created
+    # System.Collections.Generic.List[object] that the walk fills through the
+    # PreservedOut out-parameter. Collecting it with @() hits the PowerShell
+    # engine's PSToObjectArrayBinder -> PSEnumerableBinder.MaybeDebase, which
+    # builds an Expression.Condition with mismatched branch types and throws
+    # 'ArgumentException: Argument types do not match' - exactly the option-3
+    # crash observed on the real Windows run (the line only executes when the
+    # walk preserved at least one dependency/project folder, which is why a run
+    # with 0 projects and 0 duplicates built a plan fine). Normalize with
+    # .ToArray() FIRST - the same pattern the v2.1.1 CI leg established for
+    # New-SysOrgPlan, Get-SysOrgNameFamilies and the multipart sets.
+    $walkPreservedItems = $walkPreserved.ToArray()
+    if($walkPreservedItems.Count -gt 0){
+        $depCount = @($walkPreservedItems | Where-Object { $_.Kind -eq 'Dependency' }).Count
+        $projCount = @($walkPreservedItems | Where-Object { $_.Kind -eq 'Project' }).Count
         Write-Host ("Preserved without enumeration: {0} dependency folder(s), {1} project folder(s)" -f $depCount, $projCount) -ForegroundColor DarkGray
     }
     # v3.0.1 D4: the app folder itself inside a scan root - recommend moving it
