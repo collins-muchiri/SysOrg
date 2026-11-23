@@ -49,7 +49,14 @@ Describe 'Get-SysOrgReparseClassification (v3.0.2 B1)' {
     It 'reports Unknown when the tag is unknowable (portable host, no mock)' {
         $p = Join-Path $TestDrive ('unknowable-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $p -Force | Out-Null
-        Get-SysOrgReparseClassification -Path $p | Should -Be 'Unknown'
+        if($env:OS -eq 'Windows_NT'){
+            # v3.0.2 CI: on Windows the REAL FindFirstFileW resolver CAN read the
+            # tag, so a plain folder is not a reparse point -> 'None'. 'Unknown'
+            # is the portable-host contract (non-Windows host without a mock).
+            Get-SysOrgReparseClassification -Path $p | Should -Be 'None'
+        } else {
+            Get-SysOrgReparseClassification -Path $p | Should -Be 'Unknown'
+        }
     }
 }
 

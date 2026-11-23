@@ -67,6 +67,17 @@ function Test-SysOrgDirAccess {
     Initialize-SysOrgDirProbe
 
     $p = $Path.TrimEnd('\')
+    # v3.0.2 CI: collapse DOUBLED separators before the \\?\ prefix. The device
+    # namespace performs NO path normalization, so a remembered root stored as
+    # 'C:\\Users\\...' (e.g. a hand-edited ScanRoots.json) is refused with
+    # ERROR_INVALID_NAME (123) here while every plain-API caller happily
+    # collapses it - the probe must agree with the enumeration that follows.
+    # A leading UNC '\\' is preserved.
+    if($p.Length -ge 2 -and $p.StartsWith('\\')){
+        $p = '\\' + [regex]::Replace($p.Substring(2), '\\{2,}', '\')
+    } else {
+        $p = [regex]::Replace($p, '\\{2,}', '\')
+    }
     if($p -match '^[A-Za-z]:$'){ $np = '\\?\' + $p + '\' }
     elseif($p -like '\\?\*'){ $np = $p }
     elseif($p -like '\\*\*'){ $np = '\\?\UNC\' + $p.Substring(2) }

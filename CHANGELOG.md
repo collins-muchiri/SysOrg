@@ -121,6 +121,30 @@ idempotent plans.
   cache-statistics suite, menu suite. The v3.0.1 C3 cache test's Changed
   assertion was updated to the honest changed/new split.
 
+### Fixed (CI - the first real Windows CI leg)
+- The Windows PowerShell 5.1 leg failed with 7 tests (432 passed / 7 failed); all
+  seven were fixture/portability defects, proven against the CI log, none weakened:
+  - **The smoke harness doubled every separator** in the remembered scan roots:
+    `-replace '\\','\\'` writes TWO literal backslashes per match (the `-replace`
+    replacement string is not escape-processed), so `C:\Users\...` became
+    `C:\\Users\\...`, reached the walk via `ScanRoots.json`, and the `\\?\`
+    access probe - which performs NO normalization - refused it with
+    `ERROR_INVALID_NAME` (123); the whole fixture collapsed to "Nothing was
+    scanned". Paths are now written verbatim (ConvertTo-Json does the escaping).
+  - **The Win32 access probe collapses doubled separators** before building the
+    `\\?\` path (a leading UNC `\\` is preserved), so a hand-edited
+    `ScanRoots.json` can never again wedge the probe into error 123.
+  - **The child-process fixture config satisfied no config validator:**
+    `ReviewConfidence=0.0` violates the shipped contract (MinConfidence must be
+    below ReviewConfidence; 0.70 is the default) - the fixture now uses 0.70.
+  - **The "uncreatable folder" fixtures were creatable** on a clean runner
+    (`C:\definitely\missing\...` did not exist yet); they now place the path
+    under a real FILE, which is uncreatable on every host.
+  - **The reparse `Unknown` assertion was portable-host-only:** on Windows the
+    real resolver CAN read the tag of a plain folder, so the correct answer is
+    `None` there; `Unknown` stays the non-Windows contract. The test now asserts
+    each platform's exact deterministic outcome.
+
 ## [3.0.1] - 2026-11-23 - Defects from a real run; classification that fits real usage
 
 Driven by a real Windows 11 run (C: system NVMe + A: data NVMe, 9,579 files) whose

@@ -125,8 +125,14 @@ BeforeAll {
     $script:smokeFolders = New-SysOrgAppFolders -AppRoot $script:smokeApp
     # remembered scan roots (v3.0.1 D2): the flow adopts them for -WholeDrive runs
     # (v3.0.2 A2: they now REACH the walk instead of only suppressing the prompt)
+    # NOTE: the path is written verbatim - ConvertTo-Json performs the JSON
+    # escaping. A manual -replace '\\','\\' here DOUBLES every separator
+    # (the -replace replacement string is not escape-processed, so '\\' means
+    # two literal backslashes); the doubled path reaches the remembered roots,
+    # the \\?\ access probe refuses it with ERROR_INVALID_NAME (123) and the
+    # whole fixture scan collapses to "Nothing was scanned" on Windows.
     New-Item -ItemType Directory -Path (Join-Path $script:smokeApp 'Config') -Force | Out-Null
-    @{ 'X' = @(("$script:smokeRoot" -replace '\\','\\')) } | ConvertTo-Json |
+    @{ 'X' = @("$script:smokeRoot") } | ConvertTo-Json |
         Set-Content -LiteralPath (Join-Path $script:smokeApp 'Config\ScanRoots.json') -Encoding UTF8
     $script:smokeConfig = @{
         AppRoot        = $script:smokeApp
@@ -251,7 +257,9 @@ Describe 'v3.0.2 A2 smoke: child-process SysOrg.ps1 -ScanDrive -ReportOnly (Wind
                 "    AppRoot        = '$appDir'"
                 "    OrganizedRoots = @{ '*' = '$letter`:\_Organized' }"
                 "    Copies         = @{ Policy='NumberCopies'; MinFileSizeKB=0; DocMinFileSizeKB=0; HeaderHashKB=64 }"
-                "    Classify       = @{ MinConfidence=0.40; ReviewConfidence=0.0 }"
+                # v3.0.2 CI: ReviewConfidence must be ABOVE MinConfidence (the config
+                # validator rejects Min >= Review; 0.70 is the shipped default).
+                "    Classify       = @{ MinConfidence=0.40; ReviewConfidence=0.70 }"
                 "    Review         = @{ Mode='Report' }"
                 "    Learn          = @{ Enabled=`$false }"
                 "    Families       = @{ Enabled=`$false }"
