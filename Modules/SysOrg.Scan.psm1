@@ -377,6 +377,34 @@ function Get-SysOrgInventory {
         }
         if($excludeDest -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
 
+        # v3.0.2 B1: reparse points are classified by TAG, not by the attribute alone.
+        #   Symlink / Junction / Other -> never followed: recorded, not traversed.
+        #   Cloud (OneDrive cloud files) -> a NORMAL folder: traversed and listed;
+        #     placeholder FILES are still refused later (Test-SysOrgCloudPlaceholder-
+        #     Attributes) so opening/hashing never hydrates the cloud library.
+        #   None / Unknown -> normal folder (Unknown keeps the old attribute behaviour
+        #     via the protection reason for hosts where the tag is unknowable).
+        # The real run skipped Documents/Pictures/Desktop as 'cannot alter' purely on
+        # the attribute - the scanned file count fell 9,579 -> 1,570.
+        $reparseClass = 'None'
+        try { $reparseClass = Get-SysOrgReparseClassification -Path $dir } catch { $reparseClass = 'Unknown' }
+        if($reparseClass -in @('Symlink','Junction','Other')){
+            if(($reparseClass -eq 'Junction') -and (Test-SysOrgLegacyJunctionName -Name (Split-Path $dir -Leaf))){
+                # v3.0.2 B3: Documents\My Pictures / My Videos / My Music junctions exist
+                # on every Windows profile - skipping them is EXPECTED and must not be
+                # shown as an alarming 'cannot alter' entry.
+                if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Preserved'; Reason='legacy junction (expected)' }) }
+                continue
+            }
+            $rcReason = switch($reparseClass){
+                'Symlink'  { 'Reparse point (symlink - never followed)' }
+                'Junction' { 'Reparse point (junction - never followed)' }
+                default    { 'Reparse point (unsupported tag - never followed)' }
+            }
+            if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$rcReason }) }
+            continue
+        }
+
         # v1.1 folder safety gates: protected (cannot alter) vs restricted (read-only) vs organizable
         if($folderAuditEnabled -and ($dir -ine $root)){
             $protectReason = Get-SysOrgFolderProtectionReason -Path $dir -Config $Config -CfaFolders $cfaFolders
@@ -398,7 +426,6 @@ function Get-SysOrgInventory {
         $subDirs = @(); $files = @()
         try{
             $di = New-Object System.IO.DirectoryInfo($dir)
-            if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ continue }
             try { $subDirs = $di.GetDirectories() } catch { Write-Verbose "Directory enumeration failed: $dir - $($_.Exception.Message)" }
             try { $files   = $di.GetFiles() } catch { Write-Verbose "File enumeration failed: $dir - $($_.Exception.Message)" }
         } catch { Write-Verbose "Folder skipped: $dir - $($_.Exception.Message)"; continue }
@@ -1265,7 +1292,12 @@ function Get-SysOrgSimilarFolders {
         if($folderCount -ge $MaxFolders){ break }
         try{
             $di = New-Object System.IO.DirectoryInfo($dir)
-            if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ continue }
+            # v3.0.2 B1: tag-based - cloud (OneDrive) folders are fingerprinted like
+            # any folder; links and unsupported tags are never followed.
+            $sfRc = 'None'
+            try { $sfRc = Get-SysOrgReparseClassification -Path $dir } catch { }
+            if($sfRc -in @('Symlink','Junction','Other')){ continue }
+            if(($sfRc -eq 'Unknown') -and (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)){ continue }
             if(($di.Attributes -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden){ continue }
         } catch { continue }
         # fingerprint THIS folder (its direct files only; subfolders get their own)
@@ -1421,7 +1453,12 @@ function Get-SysOrgProjectFolders {
         if((Get-SysOrgSetting $Config 'ExcludeDestinations' $true) -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ continue }
         try{
             $di = New-Object System.IO.DirectoryInfo($dir)
-            if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ continue }
+            # v3.0.2 B1: tag-based - cloud (OneDrive) folders are listed like any
+            # folder; links and unsupported tags are never followed.
+            $optRc = 'None'
+            try { $optRc = Get-SysOrgReparseClassification -Path $dir } catch { }
+            if($optRc -in @('Symlink','Junction','Other')){ continue }
+            if(($optRc -eq 'Unknown') -and (($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint)){ continue }
             if((Get-SysOrgSetting $Config 'FolderAudit.SkipHiddenSystemDirs' $true) -and
                ((($di.Attributes -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden) -or
                 (($di.Attributes -band [System.IO.FileAttributes]::System) -eq [System.IO.FileAttributes]::System))){ continue }

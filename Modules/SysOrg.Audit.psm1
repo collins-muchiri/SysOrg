@@ -163,7 +163,21 @@ function Get-SysOrgFolderProtectionReason {
     }
     try{
         $di = New-Object System.IO.DirectoryInfo($p)
-        if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ return 'Reparse point (junction/symlink/OneDrive)' }
+        # v3.0.2 B1: the ReparsePoint ATTRIBUTE alone conflated junctions and symlinks
+        # with OneDrive cloud folders - the real run skipped Documents/Pictures/Desktop
+        # as 'cannot alter' purely for the attribute and the scanned file count fell
+        # 9,579 -> 1,570. The TAG decides: links are protected, cloud folders are
+        # normal folders. Tag values are the documented Windows constants.
+        $rc = 'Unknown'
+        try { $rc = Get-SysOrgReparseClassification -Path $p } catch { $rc = 'Unknown' }
+        if($rc -eq 'Symlink'){ return 'Reparse point (symlink - never followed)' }
+        if($rc -eq 'Junction'){ return 'Reparse point (junction - never followed)' }
+        if($rc -eq 'Other'){ return 'Reparse point (unsupported tag - never followed)' }
+        if($rc -eq 'Unknown'){
+            # tag unknowable (portable host): keep the honest attribute fallback
+            if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ return 'Reparse point (junction/symlink/OneDrive)' }
+        }
+        # 'Cloud' and 'None': NOT protected by the reparse check - traversed normally.
         if((Get-SysOrgSetting $Config 'FolderAudit.SkipHiddenSystemDirs' $true) -and
            ((($di.Attributes -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden) -or
             (($di.Attributes -band [System.IO.FileAttributes]::System)  -eq [System.IO.FileAttributes]::System))){ return 'Hidden or system folder' }

@@ -710,6 +710,61 @@ function Get-SysOrgLogTail {
     return $result
 }
 
+function Get-SysOrgReparseClassification {
+<#
+.SYNOPSIS
+    Classifies a path's reparse point by its TAG, not by the attribute alone.
+.DESCRIPTION
+    Returns one of:
+      'None'     - not a reparse point (or the tag could not be read on Windows)
+      'Symlink'  - IO_REPARSE_TAG_SYMLINK (0xA000000C) - never followed
+      'Junction' - IO_REPARSE_TAG_MOUNT_POINT (0xA0000003) - never followed
+      'Cloud'    - the cloud-files family (0x90000000-0x9000F001, OneDrive) - a
+                   NORMAL folder: traversed, listed, planned like any other;
+                   placeholder FILES are handled separately via
+                   Test-SysOrgCloudPlaceholderAttributes and are never opened
+      'Other'    - any other tag (APPEXECLINK etc.) - never followed
+      'Unknown'  - the tag is unknowable (non-Windows host without a mock);
+                   callers fall back to the attribute check
+    Tag values are the documented Windows constants (winnt.h / 'Reparse Point
+    Tags', Microsoft Learn) - never invented.
+.EXAMPLE
+    Get-SysOrgReparseClassification -Path 'C:\Users\a\Documents'   # -> Cloud
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $tag = Get-SysOrgReparseTag -Path $Path
+    if($null -eq $tag){ return 'Unknown' }
+    if($tag -eq 0){ return 'None' }
+    # 0xA000000C / 0xA0000003 / 0xF0000000 / 0x90000000 as uint32 (hex literals of
+    # this size parse as negative ints in PowerShell)
+    $tagSymlink  = [uint32][Convert]::ToUInt32('A000000C',16)   # IO_REPARSE_TAG_SYMLINK
+    $tagJunction = [uint32][Convert]::ToUInt32('A0000003',16)   # IO_REPARSE_TAG_MOUNT_POINT
+    if($tag -eq $tagSymlink){ return 'Symlink' }
+    if($tag -eq $tagJunction){ return 'Junction' }
+    $tagFlagsMask = [uint32][Convert]::ToUInt32('F0000000',16)
+    $tagCloudBase = [uint32]2415919104                          # 0x90000000 (cloud family)
+    if((([long]$tag -band [long]$tagFlagsMask)) -eq [long]$tagCloudBase){ return 'Cloud' }
+    return 'Other'
+}
+
+function Test-SysOrgLegacyJunctionName {
+<#
+.SYNOPSIS
+    True for the legacy Windows junction names My Pictures / My Videos / My Music.
+.DESCRIPTION
+    These junctions exist on every Windows profile since XP; skipping them is
+    EXPECTED behaviour and must not be reported as an alarming 'cannot alter'
+    entry (v3.0.2 B3).
+.EXAMPLE
+    Test-SysOrgLegacyJunctionName -Name 'My Pictures'   # -> True
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name)
+    $n = "$Name".ToLowerInvariant()
+    return ($n -in @('my pictures','my videos','my music'))
+}
+
 function Get-SysOrgFileHash {
 <#
 .SYNOPSIS
