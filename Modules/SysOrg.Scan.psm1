@@ -256,7 +256,8 @@ function Get-SysOrgInventory {
         [object[]]$KnownFolders,
         [System.Collections.Generic.List[object]]$AuditTrail,
         [System.Collections.Generic.List[object]]$ProjectFoldersOut,
-        [System.Collections.Generic.List[object]]$PreservedOut
+        [System.Collections.Generic.List[object]]$PreservedOut,
+        [hashtable]$CacheStatsOut
     )
     $root = ('{0}:\' -f $Letter)
     if(-not ($Roots -and @($Roots).Count -gt 0) -and (-not $DefaultScope)){
@@ -290,6 +291,16 @@ function Get-SysOrgInventory {
     } catch { Write-Verbose "Config-hash cache tag unavailable: $($_.Exception.Message)" }
 
     $cacheFile = $null
+    # v3.0.1 C3: the legacy 24-hour whole-inventory cache is VALIDATED, not trusted.
+    # The walk always re-enumerates (cheap, streaming); a cached record is reused
+    # ONLY when its size and mtime still match the file on disk (2-second tolerance,
+    # the same drift tolerance the executor uses). Files that vanished from disk
+    # can never reach a plan, because plans are built from what the walk actually
+    # saw. The caller receives the cache age and the changed count via -CacheStatsOut.
+    $cachedRecords = $null
+    # mutate the CALLER's hashtable (a fresh one here would break the reference)
+    $cacheStats = $CacheStatsOut
+    if($null -eq $cacheStats){ $cacheStats = @{} }
     if($CacheFolder){
         $cacheFile = Join-Path $CacheFolder ('inventory-{0}-{1}{2}.json' -f $Letter, $scope, $cfgTag)
         if(-not $NoCache){
@@ -297,8 +308,18 @@ function Get-SysOrgInventory {
                 $ageHours = ((Get-Date) - (Get-Item -LiteralPath $cacheFile).LastWriteTime).TotalHours
                 $maxAge = Get-SysOrgSetting $Config 'InventoryCacheHours' 24
                 if($ageHours -lt $maxAge){
-                    Write-Host ("Using cached inventory ({0}; pass -NoCache to force a rescan)." -f (Get-Item -LiteralPath $cacheFile).LastWriteTime)
-                    return @((Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json))
+                    $cacheStats.AgeHours = [Math]::Round($ageHours, 1)
+                    try{
+                        $cachedRecords = @{}
+                        foreach($r in (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json)){
+                            if($r.PSObject.Properties['FullName']){ $cachedRecords["$($r.FullName)"] = $r }
+                        }
+                        $cacheStats.FromCache = $true
+                    } catch {
+                        Write-Verbose "Inventory cache unreadable, full rescan: $($_.Exception.Message)"
+                        $cachedRecords = $null
+                        $cacheStats.FromCache = $false
+                    }
                 }
             }
         }
@@ -416,6 +437,23 @@ function Get-SysOrgInventory {
                 if($fileExRx){
                     if($fileExRx.IsMatch($fi.Name)){ continue }
                 } elseif(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
+                # v3.0.1 C3: reuse a cached record ONLY when size and mtime still match
+                if($null -ne $cachedRecords){
+                    $cr = $cachedRecords[$fi.FullName]
+                    if($cr){
+                        $mtimeDelta = 0.0
+                        try { $mtimeDelta = [Math]::Abs((([datetime]$cr.LastWriteTime) - $fi.LastWriteTime).TotalSeconds) } catch { $mtimeDelta = 9999 }
+                        if(([long]$cr.Length -eq [long]$fi.Length) -and ($mtimeDelta -le 2)){
+                            [void]$records.Add($cr)
+                            $count++
+                            $cacheStats.Reused++
+                            continue
+                        }
+                        $cacheStats.Changed++    # size or mtime changed since the cached scan
+                    } else {
+                        $cacheStats.Changed++    # a NEW file the cached scan never saw
+                    }
+                }
                 # Attribute flags are compared as raw ints: on Windows PowerShell 5.1
                 # casting an int like 0x400020 to [System.IO.FileAttributes] throws
                 # (that value is not defined in the .NET Framework enum).

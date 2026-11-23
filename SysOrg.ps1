@@ -306,13 +306,18 @@ function Invoke-SysOrgScanFlow {
     $walkProjects = New-Object System.Collections.Generic.List[object]
     $walkPreserved = New-Object System.Collections.Generic.List[object]
     $rootsInfo = Get-SysOrgScanRoots -Letter $Letter -Config $Config -DefaultScope:(-not $WholeDrive) -KnownFolders @($prof.KnownFolders)
-    $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail; KnownFolders=@($prof.KnownFolders); ProjectFoldersOut=$walkProjects; PreservedOut=$walkPreserved }
+    $cacheStats = @{}
+    $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail; KnownFolders=@($prof.KnownFolders); ProjectFoldersOut=$walkProjects; PreservedOut=$walkPreserved; CacheStatsOut=$cacheStats }
     if($NoCacheSwitch){ $invParams.NoCache = $true }
     if(-not $WholeDrive){ $invParams.DefaultScope = $true }
     # @() collect: the inventory streams records (empty scan emits nothing)
     $swEnum = Get-SysOrgPhaseStart -Phase 'enumerate'
     $inv = @(Get-SysOrgInventory @invParams)
     Stop-SysOrgPhase $swEnum 'enumerate'
+    # v3.0.1 C3: the preview states the cache age and how many files changed
+    if($cacheStats.FromCache){
+        Write-Host ("Inventory cache: age {0}h - {1} file(s) reused, {2} changed since the last scan." -f $cacheStats.AgeHours, $cacheStats.Reused, $cacheStats.Changed) -ForegroundColor DarkGray
+    }
     if(@($inv).Count -eq 0){
         Write-Host 'Nothing was scanned; no plan was built. Nothing was modified.' -ForegroundColor Yellow
         return

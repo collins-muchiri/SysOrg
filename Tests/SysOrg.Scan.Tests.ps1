@@ -819,3 +819,79 @@ Describe 'Prune walk and in-walk project detection (v3.0.1 C2)' {
         $projectsOut[0].SafeName | Should -Match 'src \([0-9a-f]{8}\)'
     }
 }
+
+Describe 'Inventory cache freshness validation (v3.0.1 C3)' {
+
+    It 'reuses only unchanged files, reports changed count, and never keeps vanished files' {
+        $root = Join-Path $TestDrive ('c3-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        # the cache folder sits OUTSIDE the scanned root - exactly like the real CLI,
+        # whose Cache folder lives in the protected app root (a cache inside the scan
+        # root would itself appear as a new file on the second scan)
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $cacheDir = Join-Path $TestDrive ('c3cache-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        foreach($i in 1..6){ Set-Content -LiteralPath (Join-Path $root ("f$i.txt")) -Value ("v$i") }
+        $cfg = @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+                  OrganizedRoots=@{ '*'='__AUTO__' }; FolderAudit=@{ Enabled=$false }; TypeMap=@{}
+                  Prune=@{ Enabled=$false; DirectoryNames=@() } }
+        # first scan writes the cache
+        $stats1 = @{}
+        $inv1 = @(Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @($root) -CacheFolder $cacheDir -CacheStatsOut $stats1)
+        $inv1.Count | Should -Be 6
+        $stats1.FromCache | Should -BeFalse
+        Test-Path -LiteralPath (Get-ChildItem -LiteralPath $cacheDir -File | Select-Object -First 1).FullName | Should -BeTrue
+        # mutate: touch 2 files (new mtime), delete 1, add 1
+        Start-Sleep -Milliseconds 60
+        Set-Content -LiteralPath (Join-Path $root 'f1.txt') -Value 'changed'
+        Set-Content -LiteralPath (Join-Path $root 'f2.txt') -Value 'changed too'
+        Remove-Item -LiteralPath (Join-Path $root 'f6.txt') -Force
+        Set-Content -LiteralPath (Join-Path $root 'f7.txt') -Value 'new file'
+        # second scan: VALIDATED cache
+        $stats2 = @{}
+        $inv2 = @(Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @($root) -CacheFolder $cacheDir -CacheStatsOut $stats2)
+        $stats2.FromCache | Should -BeTrue
+        $stats2.AgeHours | Should -BeGreaterOrEqual 0
+        $stats2.Changed | Should -Be 3          # f1, f2 touched + f7 is new since the cached scan
+        ($stats2.Reused + $stats2.Changed) | Should -Be 6   # f3..f5 reused + 3 changed; f6 vanished, f7 unseen
+        # the walk always re-enumerates: the vanished file is gone, the new file is present
+        $names = @($inv2 | ForEach-Object { $_.Name })
+        $names | Should -Not -Contain 'f6.txt'
+        $names | Should -Contain 'f7.txt'
+        $inv2.Count | Should -Be 6
+    }
+
+    It 'a corrupt cache file degrades to a full rescan' {
+        $root = Join-Path $TestDrive ('c3bad-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $cacheDir = Join-Path $root 'cache'
+        New-Item -ItemType Directory -Path (Join-Path $root 'data') -Force | Out-Null
+        New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'data\a.txt') -Value 'x'
+        # discover the cache file name via a first scan, then corrupt it
+        $cfg = @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+                  OrganizedRoots=@{ '*'='__AUTO__' }; FolderAudit=@{ Enabled=$false }; TypeMap=@{}
+                  Prune=@{ Enabled=$false; DirectoryNames=@() } }
+        $stats1 = @{}
+        $null = Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @(Join-Path $root 'data') -CacheFolder $cacheDir -CacheStatsOut $stats1
+        $cacheFile = (Get-ChildItem -LiteralPath $cacheDir -File | Select-Object -First 1).FullName
+        Set-Content -LiteralPath $cacheFile -Value 'this is not json at all {{{'
+        $stats2 = @{}
+        $inv = @(Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @(Join-Path $root 'data') -CacheFolder $cacheDir -CacheStatsOut $stats2)
+        $stats2.FromCache | Should -BeFalse      # corrupt -> full rescan, never a crash
+        $inv.Count | Should -Be 1
+    }
+
+    It 'InventoryCacheHours is honored: a too-old cache is not used at all' {
+        $root = Join-Path $TestDrive ('c3old-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $cacheDir = Join-Path $root 'cache'
+        New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'a.txt') -Value 'x'
+        $cfg = @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
+                  OrganizedRoots=@{ '*'='__AUTO__' }; FolderAudit=@{ Enabled=$false }; TypeMap=@{}
+                  Prune=@{ Enabled=$false; DirectoryNames=@() }; InventoryCacheHours = 0 }
+        $stats = @{}
+        $null = Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @($root) -CacheFolder $cacheDir -CacheStatsOut $stats
+        $stats2 = @{}
+        $null = Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @($root) -CacheFolder $cacheDir -CacheStatsOut $stats2
+        $stats2.FromCache | Should -BeFalse      # max age 0 -> the cache is never trusted
+    }
+}
