@@ -1,9 +1,11 @@
 @{
-    # v3.0.1: honest scoring/skip taxonomy, provenance-as-metadata, user collections,
-    # self-supervised learning (-Learn), NGO/MEAL lexicon, small-doc duplicates, the
-    # review experience, -Timing, the pruning walk, cache validation, the plan and
-    # scan-root pickers, and the similar-folder report. See CHANGELOG.md.
-    Version = '3.0.1'
+    # v3.0.2: the plan-build crash and the OneDrive regression from the real run -
+    # reparse points classified by TAG (OneDrive folders are folders again), dropped
+    # scan roots reported loudly, cache statistics that add up, -SelfTest,
+    # -Diagnostics, the plan picker's honest empty state, the real version in the
+    # menu header, grouped duplicate reports, and the diagnostics-first failure
+    # experience. See CHANGELOG.md.
+    Version = '3.0.2'
 
     # v3.0 layout profile - the new Findable layout organizes EVERY file type into a
     # fast-to-browse tree (max depth 4 below the root, max 10 routing roots, adaptive

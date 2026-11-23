@@ -4,10 +4,25 @@ Preview-first, zero-dependency file organizer for Windows 10/11, built entirely 
 Windows PowerShell 5.1+. Nothing is installed and nothing runs in the background.
 Licensed under the MIT license (see `LICENSE`).
 
-**Version 3.0.1** is the current release: the v3.0 engine (chooseable layout
-profile `Windows | Compact4 | Findable`, scored classification pipeline, persistent
-file-state cache, searchable offline catalog) hardened and sharpened by a real
-Windows 11 run — honest skip taxonomy and score verdicts, provenance-as-metadata
+**Version 3.0.2** is the current release: the crash and the OneDrive regression
+from a real Windows PowerShell 5.1 run, fixed and made impossible to miss again.
+The plan-build crash ('Argument types do not match', option 3 failing right
+after 'Code project folders detected') is root-caused, reproduced in CI and
+covered by an end-to-end smoke test that runs the REAL scan flow over a fixture
+combining every trigger — duplicates, nested projects, version pairs, user
+collections, junctions, a mocked cloud folder and parentheses names — on both
+PowerShell 5.1 and 7. OneDrive Documents/Pictures/Desktop are scanned again
+(reparse points are classified by TAG, not by the attribute alone); a dropped
+scan root is reported loudly in the summary and the plan header; cache
+statistics add up (reused / changed / new / removed); `-SelfTest` runs the whole
+pipeline on a temporary tree with a PASS/FAIL verdict per step; `-Diagnostics`
+bundles versions, config hash, the log tail and the last error for support;
+option 5 explains an empty plans folder; the menu header shows the real version;
+duplicate/version-pair reports are grouped by folder pair with the full list in
+a report file. See `CHANGELOG.md` for the full list.
+
+**Version 3.0.1** hardened and sharpened the v3.0 engine by a real Windows 11
+run — honest skip taxonomy and score verdicts, provenance-as-metadata
 (Downloads route by CONTENT under Findable), respect for user collections (moved
 whole, never flattened), self-supervised classification from your OWN folder
 structure (`-Learn`), NGO/MEAL + CV lexicon with logged weights, small-document
@@ -80,6 +95,8 @@ and the undo journal survives a power cut (WriteThrough + Pending/Done rows).
       .\SysOrg.ps1 -Find '.*\.pdf$' -Type Documents  (regex via module)
       .\SysOrg.ps1 -Learn                            (what the model learned from your own folders)
       .\SysOrg.ps1 -SimilarFolders 'D:\Projects'     (report-only similar-folder pairs)
+      .\SysOrg.ps1 -SelfTest                         (v3.0.2: whole pipeline on a temporary tree, PASS/FAIL per step)
+      .\SysOrg.ps1 -Diagnostics                      (v3.0.2: support bundle - versions, config hash, log tail, last error)
 
   `_Index\Index.html` is a static offline browse page; `_Index\README.txt`
   explains the folder.
@@ -153,7 +170,7 @@ additionally requires typing `yes`.
 
 ## Quick start
 
-1. Download `SysOrg-3.0.1.zip` from the [Releases page](../../releases/latest) and verify the
+1. Download `SysOrg-3.0.2.zip` from the [Releases page](../../releases/latest) and verify the
    published `SHA256SUMS` entry before extracting.
 2. Right-click the ZIP → Properties → **Unblock** → extract.
 3. In the extracted folder run in PowerShell:

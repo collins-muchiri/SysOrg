@@ -2,6 +2,125 @@
 
 All notable changes to SysOrg. Versions follow [SemVer](https://semver.org/).
 
+## [3.0.2] - 2026-11-23 - The plan-build crash and the OneDrive regression, found in a real run
+
+Driven by a real Windows 11 run on Windows PowerShell 5.1: option 3 failed twice,
+identically, right after 'Code project folders detected: 3' with
+'[ERROR] Menu action failed: Argument types do not match'; OneDrive
+Documents/Pictures/Desktop were skipped as 'cannot alter' and the scanned file
+count fell from 9,579 to 1,570; the cache printed ' file(s) reused' (blank) with
+'1572 changed' for 1,570 scanned files; `proj\deploy\windows` was flagged
+'System location (never alter)' purely by its folder name; option 5 asked for a
+plan with no list; and the whole session produced nothing a supporter could read.
+Every v3.0 guarantee is preserved: preview first, never overwrite, never delete,
+crash-safe undo, protected paths and mutability always win, deterministic and
+idempotent plans.
+
+### Fixed (Phase A - the crash)
+- **A2 THE PLAN-BUILD CRASH, root-caused and reproduced:** `@()` collecting the
+  walk's `New-Object`-created `System.Collections.Generic.List[object]`
+  (`$walkPreserved`, filled through the C2 `PreservedOut` out-parameter) throws
+  `ArgumentException: Argument types do not match` - the engine's
+  `PSToObjectArrayBinder` -> `PSEnumerableBinder.MaybeDebase` builds an
+  `Expression.Condition` whose branch types do not match. The site lived in the
+  menu/CLI scan FLOW, which no module-level test executed - the suite stayed
+  green while option 3 crashed. Reproduced END-TO-END through the real flow with
+  the new smoke test (the reverted code fails with exactly that message), fixed
+  by `.ToArray()` before collection, and an AST audit over the whole repo proved
+  these were the only three remaining sites. While wiring the harness a second
+  hand-off defect fell out: the D2 picker's chosen roots and the remembered scan
+  roots never reached the walk - the inventory re-resolved the scope from the
+  config and silently scanned folders the user had deselected; chosen/remembered
+  roots now reach the walk via `-Roots`.
+- **A1 failures are diagnosable:** the menu catch-all and every CLI entry point
+  log the exception TYPE, message, `ScriptStackTrace` and
+  `InvocationInfo.PositionMessage` to the log file (Write-SysOrgErrorDiagnostic),
+  print a one-line message pointing at the log and the honest phase verdict -
+  'Nothing was modified.' before execution, the undo-journal warning during it
+  (a script-scope phase flag set only around mutating calls). The last error is
+  kept for -Diagnostics.
+- **A3 `-SelfTest` (menu option 11):** builds a fresh `SysOrgSelfTest-<guid>`
+  tree under the system temp area and runs the WHOLE pipeline exactly as a real
+  run would - fixture, inventory walk, duplicate detection, project detection,
+  plan build, preview, save, execute into the temporary destination, undo,
+  byte-for-byte restore check - with a [PASS]/[FAIL] verdict per step; a failure
+  logs the full diagnostic, prints the stack head and KEEPS the tree for
+  inspection. Real user folders are never touched.
+- **A4 support-friendly diagnostics:** every interactive session auto-writes a
+  transcript to `Logs\last-run.txt`; `.\SysOrg.ps1 -Diagnostics` (menu option 12)
+  bundles the real version, PowerShell and OS versions, elevation, the config
+  file with its SHA256, the last 200 log lines and the last error with its stack
+  into `Logs\diagnostics-<timestamp>.txt`.
+
+### Fixed (Phase B - OneDrive and reparse points)
+- **B1 reparse points are classified by TAG, not the attribute:** the 0x400
+  ReparsePoint attribute alone conflated junctions and symlinks with OneDrive
+  cloud folders. `Get-SysOrgReparseTag` reads the actual tag
+  (`WIN32_FIND_DATA.dwReserved0` via FindFirstFileW; constants from the
+  documented Windows set: SYMLINK 0xA000000C, MOUNT_POINT 0xA0000003, cloud
+  family 0x90000000-0x9000F001) through a test seam (in-process mock +
+  `SYSORG_REPARSE_MOCK` env). Symlinks, junctions and unknown tags are never
+  followed; cloud folders are NORMAL folders - traversed, listed, planned - while
+  placeholder FILES (Offline / RecallOnDataAccess) are still never opened or
+  hashed. The inventory walk, the folder audit, the similar-folder walk and the
+  scan-root options walk all classify by tag now. OneDrive roots are scanned
+  again.
+- **B2 a dropped scan root is never silent:** the walk records every dropped
+  INITIAL root with its reason; the scan summary prints
+  'N scan root(s) were NOT scanned - they are NOT part of this plan:' with
+  'Documents was NOT scanned: <reason>' lines, and the plan header carries the
+  count in the skip taxonomy plus a WARNING naming each root.
+- **B3 legacy junctions skip quietly:** `Documents\My Pictures / My Videos /
+  My Music` (on every Windows profile) are PRESERVED entries with reason
+  'legacy junction (expected)' - no longer alarming 'cannot alter' rows.
+- **B4 name-based system rules are scoped:** 'windows', 'intel', 'drivers',
+  'dell', 'hp', 'appdata', ... protect only drive-root level (`X:\windows`,
+  `X:\dell`) or known absolute system parents (C:\Windows, C:\Program Files,
+  C:\ProgramData, ...). `proj\deploy\windows` inside a project tree is a normal,
+  scannable folder; `C:\Windows` stays protected.
+
+### Fixed (Phase C - cache honesty and speed)
+- **C1 cache statistics add up:** the four counters (reused / changed / new /
+  removed) are ALWAYS present, the filters run BEFORE the accounting so
+  reused + changed + new == the files scanned (the real run's '1572 changed' for
+  1,570 scanned files came from counting placeholders that were then filtered
+  out), 'Removed' counts cache records whose file no longer exists, the summary
+  prints all four plus the scanned count, and a rebuild is STATED
+  ('cache rebuilt: scanner version changed / config changed / cache unreadable')
+  now that the cache format is versioned ({ScannerVersion, Records}).
+- **C2 profile-first throughput:** profiled on a deterministic 6,301-file corpus
+  - enumerate+classify already ran at ~5,000-6,300 files/s on the profiling host
+  (target >= 1,000; the real run's ~90 files/s covered the whole flow). The top
+  three measured hotspots fixed: per-file Get-SysOrgCategory (41.7 us x files,
+  ~21% of the walk) now memoizes per DISTINCT extension; per-file/per-directory
+  exclusion matcher calls are skipped entirely when the config has no rules; the
+  reparse-tag env mock is parsed once per distinct value instead of per call.
+
+### Added (Phase D - usability)
+- **D1 option 5 explains itself:** the 10 newest plans are listed before the
+  prompt; an empty or missing plans folder prints 'No saved plans in <folder>.'
+  with the pointer to option 3 instead of silently asking for input that cannot
+  match. The prompt still accepts a number, id, full path or folder.
+- **D2 the menu header shows the real version** from the config - the hardcoded
+  'rev 2.1' survived the whole 3.x line.
+- **D3 duplicate reports are grouped by folder pair:** the preview prints the
+  top 5 groups with counts ('C:\dl vs C:\dl: 30 file(s)') instead of 41 raw
+  pairs, for BOTH the version pairs and the numbered copies; the full list of
+  every group row and pair goes to `Reports\SysOrg-DuplicateReport-<PlanId>.txt`
+  (created on demand; report-only).
+- **D4 a plan that cannot be built** reports the cause in one line plus the log
+  path and OFFERS the -Diagnostics bundle right there; 'Nothing was modified.'
+  is always part of the message.
+
+### Internal
+- New test files: the end-to-end smoke suite (real `Invoke-SysOrgScanFlow` over
+  the crash fixture; Windows CI legs additionally run the real child process
+  `SysOrg.ps1 -ScanDrive <subst-drive> -ReportOnly -FullDrive` on Windows
+  PowerShell 5.1 AND pwsh 7 over a subst-mapped fixture with a real junction and
+  a mocked cloud tag), self-test suite, diagnostics suite, reparse/tag suite,
+  cache-statistics suite, menu suite. The v3.0.1 C3 cache test's Changed
+  assertion was updated to the honest changed/new split.
+
 ## [3.0.1] - 2026-11-23 - Defects from a real run; classification that fits real usage
 
 Driven by a real Windows 11 run (C: system NVMe + A: data NVMe, 9,579 files) whose
