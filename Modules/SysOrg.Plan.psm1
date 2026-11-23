@@ -73,6 +73,12 @@ function New-SysOrgPlan {
     if(-not $Inventory){ throw 'New-SysOrgPlan requires an inventory (run a scan first).' }
     if(-not $KnownFolders -or @($KnownFolders).Count -eq 0){ $KnownFolders = @(Get-SysOrgKnownFolders) }
     if(-not $ProjectFolders){ $ProjectFolders = @() }
+    # v3.0.2 A1: test hook - SYSORG_FAULT_PLANBUILD forces a synthetic plan-build
+    # failure through the REAL code path so the diagnostics fixtures (log carries a
+    # stack trace, the user sees "Nothing was modified.") run on any machine, any host.
+    if($env:SYSORG_FAULT_PLANBUILD){
+        throw ("Synthetic plan-build fault (SYSORG_FAULT_PLANBUILD={0})." -f $env:SYSORG_FAULT_PLANBUILD)
+    }
 
     # v2.1.1: millisecond suffix - two plans planned within the same second no longer collide
     $stamp = Get-Date

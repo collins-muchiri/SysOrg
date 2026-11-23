@@ -100,6 +100,34 @@ function Confirm-SysOrgElevated {
     return (Confirm-SysOrgStrict -Prompt 'ELEVATED SESSION: confirm this execute/undo with admin rights')
 }
 
+# v3.0.2 A1: the phase flag tells the catch-alls whether the failure happened
+# BEFORE anything moved ('preview' -> "Nothing was modified.") or DURING
+# execution ('execute' -> point at the undo journal). Every menu iteration
+# resets it to 'preview'; flows set it to 'execute' only around mutating calls.
+$script:SysOrgPhase = 'preview'
+
+# v3.0.2 A1: one shared handler for every CLI entry point. Logs the FULL
+# exception (type, message, script stack trace, invocation position) to the
+# log file, prints a one-line message pointing at the log and prints the
+# honest "Nothing was modified." (or the execute-phase warning).
+function Invoke-SysOrgCliStep {
+    param([Parameter(Mandatory)][string]$Step,[Parameter(Mandatory)][scriptblock]$Action)
+    try {
+        & $Action
+    } catch {
+        $logPath = Write-SysOrgErrorDiagnostic -ErrorRecord $_ -LogFolder $logFolder -Phase $script:SysOrgPhase
+        if($script:SysOrgPhase -eq 'preview'){
+            Write-Host ("{0} failed: {1}  Nothing was modified." -f $Step, $_.Exception.Message) -ForegroundColor Red
+        } else {
+            Write-Host ("{0} failed DURING EXECUTION: {1}  A partial move may have happened - the undo journal restores it." -f $Step, $_.Exception.Message) -ForegroundColor Red
+        }
+        if($logPath){ Write-Host ("  Full diagnostics: {0}   (run .\SysOrg.ps1 -Diagnostics for a support bundle)" -f $logPath) -ForegroundColor DarkYellow }
+        else { Write-Host '  Full diagnostics: log write failed - see Logs folder permissions.' -ForegroundColor DarkYellow }
+    } finally {
+        $script:SysOrgPhase = 'preview'
+    }
+}
+
 # -WritablePath extends the writable scope on any drive (design section 5.1).
 # v2.1.1: the input is resolved to a FULL CANONICAL path first - a relative path used to
 # be stored raw and never matched any absolute path at mutability-check time.
@@ -518,7 +546,10 @@ function Invoke-SysOrgScanFlow {
             return
         }
     }
+    # v3.0.2 A1: from here on a failure means moves may have happened
+    $script:SysOrgPhase = 'execute'
     $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $Config -AppRoot $appRoot
+    $script:SysOrgPhase = 'preview'
     Write-Host ''
     Write-Host ("Done. Moved={0} (numbered copies={1})  Copied={2}  Folders={3}  Quarantined={4}  Failed={5}" -f `
         $res.Summary.Moved, $res.Summary.Numbered, $res.Summary.Copied, $res.Summary.FolderMoves, $res.Summary.Quarantined, $res.Summary.Failed) -ForegroundColor Green
@@ -560,7 +591,10 @@ function Invoke-SysOrgMigrationFlow {
             Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
             return
         }
+        # v3.0.2 A1: from here on a failure means moves may have happened
+        $script:SysOrgPhase = 'execute'
         $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $Config -AppRoot $appRoot
+        $script:SysOrgPhase = 'preview'
         Write-Host ''
         Write-Host ("Layout migration done. Moved={0}  Folders={1}  Failed={2}" -f $res.Summary.Moved, $res.Summary.FolderMoves, $res.Summary.Failed) -ForegroundColor Green
         Write-Host ("Undo journal: {0}" -f $res.UndoFile)
@@ -596,7 +630,10 @@ function Invoke-SysOrgMigrationFlow {
         Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
         return
     }
+    # v3.0.2 A1: from here on a failure means moves may have happened
+    $script:SysOrgPhase = 'execute'
     $res = Invoke-SysOrgPlan -PlanPath $planPath -Config $Config -AppRoot $appRoot
+    $script:SysOrgPhase = 'preview'
     Write-Host ''
     Write-Host ("Migration done. Moved={0}  Folders={1}  Failed={2}" -f $res.Summary.Moved, $res.Summary.FolderMoves, $res.Summary.Failed) -ForegroundColor Green
     Write-Host ("Undo journal: {0}" -f $res.UndoFile)
@@ -628,7 +665,10 @@ function Invoke-SysOrgPlanFile {
             Write-Host 'Second confirmation declined. Nothing was modified.' -ForegroundColor Yellow; return
         }
     }
+    # v3.0.2 A1: from here on a failure means moves may have happened
+    $script:SysOrgPhase = 'execute'
     $res = Invoke-SysOrgPlan -PlanPath $Path -Config $Config -AppRoot $appRoot -Force:$Force
+    $script:SysOrgPhase = 'preview'
     Write-Host ("Done. Moved={0} (numbered copies={1})  Copied={2}  Folders={3}  Quarantined={4}  Failed={5}" -f `
         $res.Summary.Moved, $res.Summary.Numbered, $res.Summary.Copied, $res.Summary.FolderMoves, $res.Summary.Quarantined, $res.Summary.Failed) -ForegroundColor Green
     Write-Host ("Undo journal: {0}" -f $res.UndoFile)
@@ -754,217 +794,247 @@ function Invoke-SysOrgBenchmarkFlow {
 }
 
 # ---------------- non-interactive modes ----------------
+# v3.0.2 A1: every CLI entry point runs through Invoke-SysOrgCliStep so a
+# terminating error produces a FULL diagnostic log (type, message, script stack
+# trace, invocation position), a one-line user message pointing at the log and
+# the honest "Nothing was modified." - never a raw red stack dump.
 if($ProfileDrives){
-    [void](Invoke-SysOrgProfileFlow -Letters $null)
+    Invoke-SysOrgCliStep -Step 'Drive profiling' -Action { [void](Invoke-SysOrgProfileFlow -Letters $null) }
     return
 }
 if($DetectDrives){
-    $drives = @(Get-SysOrgDrive)
-    $drives | Format-Table Drive,Label,FileSystem,SizeGB,FreeGB,MediaType,BusType,Location,Confidence,DetectionBasis -AutoSize | Out-Host
-    foreach($d in $drives){
-        Write-SysOrgLog ("Drive {0} [{1} / {2} / {3}] confidence={4}: {5}" -f $d.Drive,$d.MediaType,$d.BusType,$d.Location,$d.Confidence,$d.DetectionBasis) -LogFolder $logFolder
+    Invoke-SysOrgCliStep -Step 'Drive detection' -Action {
+        $drives = @(Get-SysOrgDrive)
+        $drives | Format-Table Drive,Label,FileSystem,SizeGB,FreeGB,MediaType,BusType,Location,Confidence,DetectionBasis -AutoSize | Out-Host
+        foreach($d in $drives){
+            Write-SysOrgLog ("Drive {0} [{1} / {2} / {3}] confidence={4}: {5}" -f $d.Drive,$d.MediaType,$d.BusType,$d.Location,$d.Confidence,$d.DetectionBasis) -LogFolder $logFolder
+        }
     }
     return
 }
 if($ScheduledReport){
-    # P0-4: Get-SysOrgDrive exposes the letter as 'Drive' (formatted 'C:'), not 'Letter'
-    $letters = @(Get-SysOrgSetting $Config 'ScheduledDrives' @('*'))
-    foreach($d in @(Get-SysOrgDrive)){
-        $letter = $d.Drive.TrimEnd(':')
-        if(($letters -contains '*') -or ($letters -contains $letter)){
-            # v2.1.1: the '*' default covers fixed, NON-REMOVABLE drives only - no scheduled
-            # reports for USB sticks or card readers. Explicitly listed letters are honored.
-            if(($letters -contains '*') -and ("$($d.Location)" -ne 'Internal')){ continue }
-            try {
-                [void](New-SysOrgScanReport -Letter $letter -Config $Config -AppRoot $appRoot)
-            } catch {
-                Write-SysOrgLog "Scheduled report failed for $letter`: $($_.Exception.Message)" -Level ERROR -LogFolder $logFolder
+    Invoke-SysOrgCliStep -Step 'Scheduled report' -Action {
+        # P0-4: Get-SysOrgDrive exposes the letter as 'Drive' (formatted 'C:'), not 'Letter'
+        $letters = @(Get-SysOrgSetting $Config 'ScheduledDrives' @('*'))
+        foreach($d in @(Get-SysOrgDrive)){
+            $letter = $d.Drive.TrimEnd(':')
+            if(($letters -contains '*') -or ($letters -contains $letter)){
+                # v2.1.1: the '*' default covers fixed, NON-REMOVABLE drives only - no scheduled
+                # reports for USB sticks or card readers. Explicitly listed letters are honored.
+                if(($letters -contains '*') -and ("$($d.Location)" -ne 'Internal')){ continue }
+                try {
+                    [void](New-SysOrgScanReport -Letter $letter -Config $Config -AppRoot $appRoot)
+                } catch {
+                    Write-SysOrgLog "Scheduled report failed for $letter`: $($_.Exception.Message)" -Level ERROR -LogFolder $logFolder
+                }
             }
         }
     }
     return
 }
 if($AuditDrive){
-    foreach($l in $AuditDrive){
-        $ll = $l.Trim().TrimEnd(':').ToUpper()
-        Invoke-SysOrgFolderAuditFlow -Letter $ll
+    Invoke-SysOrgCliStep -Step 'Folder audit' -Action {
+        foreach($l in $AuditDrive){
+            $ll = $l.Trim().TrimEnd(':').ToUpper()
+            Invoke-SysOrgFolderAuditFlow -Letter $ll
+        }
     }
     return
 }
 if($Benchmark){
-    Invoke-SysOrgBenchmarkFlow -Corpus $BenchmarkCorpus -Files $BenchmarkFiles -BenchSeed $BenchmarkSeed
+    Invoke-SysOrgCliStep -Step 'Benchmark' -Action { Invoke-SysOrgBenchmarkFlow -Corpus $BenchmarkCorpus -Files $BenchmarkFiles -BenchSeed $BenchmarkSeed }
     return
 }
 if($Score){
-    # v3.0 Phase 5: score an existing organized tree and check it against the targets
-    $scoreRoot = $null
-    if($Root){ $scoreRoot = $Root }
-    else {
-        $scoreLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
-        try { $scoreRoot = Get-SysOrgDestinationRoot -Letter $scoreLetter -Config $Config } catch { $scoreRoot = ('{0}:\_Organized' -f $scoreLetter) }
+    Invoke-SysOrgCliStep -Step 'Findability score' -Action {
+        # v3.0 Phase 5: score an existing organized tree and check it against the targets
+        $scoreRoot = $null
+        if($Root){ $scoreRoot = $Root }
+        else {
+            $scoreLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
+            try { $scoreRoot = Get-SysOrgDestinationRoot -Letter $scoreLetter -Config $Config } catch { $scoreRoot = ('{0}:\_Organized' -f $scoreLetter) }
+        }
+        $s = Get-SysOrgTreeScore -Root $scoreRoot -Config $Config
+        if($s.Files -eq 0){
+            # v3.0.1 D5: an empty tree is not a score
+            Write-Host ''
+            Write-Host 'No organized tree yet.' -ForegroundColor Yellow
+            Write-Host ('  Nothing has been organized into {0} so far. Run -ScanDrive with execute to fill it.' -f $scoreRoot) -ForegroundColor Gray
+            return
+        }
+        Show-SysOrgFindabilityScore -Score $s -Label ('organized tree ' + $scoreRoot) -Config $Config -WithTargets
     }
-    $s = Get-SysOrgTreeScore -Root $scoreRoot -Config $Config
-    if($s.Files -eq 0){
-        # v3.0.1 D5: an empty tree is not a score
-        Write-Host ''
-        Write-Host 'No organized tree yet.' -ForegroundColor Yellow
-        Write-Host ('  Nothing has been organized into {0} so far. Run -ScanDrive with execute to fill it.' -f $scoreRoot) -ForegroundColor Gray
-        return
-    }
-    Show-SysOrgFindabilityScore -Score $s -Label ('organized tree ' + $scoreRoot) -Config $Config -WithTargets
     return
 }
 if($SimilarFolders){
-    # v3.0.1 D3: similar-folder report - fingerprint folders by their file-hash sets,
-    # list pairs with >= 80% overlap. REPORT ONLY: nothing is ever moved or merged.
-    $sfRoot = $SimilarFolders
-    if(-not (Test-Path -LiteralPath $sfRoot)){ Write-Host ("Folder not found: {0}" -f $sfRoot) -ForegroundColor Red; return }
-    Write-Host ("Fingerprinting folders under {0} (report only - nothing moves) ..." -f $sfRoot) -ForegroundColor White
-    $rep = Get-SysOrgSimilarFolders -Roots @($sfRoot) -Config $Config
-    Write-Host ("Folders fingerprinted: {0}   similar pairs (>= {1}): {2}" -f $rep.FoldersCompared, 0.80, @($rep.Pairs).Count) -ForegroundColor White
-    foreach($p2 in ($rep.Pairs | Select-Object -First 20)){
-        Write-Host ('  {0}  ({1} file(s), {2}, {3})' -f $p2.FolderA, $p2.FilesA, (Format-SysOrgFileSize $p2.BytesA), $p2.LastWriteA) -ForegroundColor Gray
-        Write-Host ('  {0}  ({1} file(s), {2}, {3})' -f $p2.FolderB, $p2.FilesB, (Format-SysOrgFileSize $p2.BytesB), $p2.LastWriteB) -ForegroundColor Gray
-        Write-Host ('    overlap {0} ({1} identical file(s)) - decide yourself which copy to keep; SysOrg never merges.' -f $p2.Overlap, $p2.Common) -ForegroundColor Yellow
+    Invoke-SysOrgCliStep -Step 'Similar-folder report' -Action {
+        # v3.0.1 D3: similar-folder report - fingerprint folders by their file-hash sets,
+        # list pairs with >= 80% overlap. REPORT ONLY: nothing is ever moved or merged.
+        $sfRoot = $SimilarFolders
+        if(-not (Test-Path -LiteralPath $sfRoot)){ Write-Host ("Folder not found: {0}" -f $sfRoot) -ForegroundColor Red; return }
+        Write-Host ("Fingerprinting folders under {0} (report only - nothing moves) ..." -f $sfRoot) -ForegroundColor White
+        $rep = Get-SysOrgSimilarFolders -Roots @($sfRoot) -Config $Config
+        Write-Host ("Folders fingerprinted: {0}   similar pairs (>= {1}): {2}" -f $rep.FoldersCompared, 0.80, @($rep.Pairs).Count) -ForegroundColor White
+        foreach($p2 in ($rep.Pairs | Select-Object -First 20)){
+            Write-Host ('  {0}  ({1} file(s), {2}, {3})' -f $p2.FolderA, $p2.FilesA, (Format-SysOrgFileSize $p2.BytesA), $p2.LastWriteA) -ForegroundColor Gray
+            Write-Host ('  {0}  ({1} file(s), {2}, {3})' -f $p2.FolderB, $p2.FilesB, (Format-SysOrgFileSize $p2.BytesB), $p2.LastWriteB) -ForegroundColor Gray
+            Write-Host ('    overlap {0} ({1} identical file(s)) - decide yourself which copy to keep; SysOrg never merges.' -f $p2.Overlap, $p2.Common) -ForegroundColor Yellow
+        }
+        if(@($rep.Pairs).Count -eq 0){ Write-Host 'No similar folder pairs found.' -ForegroundColor Gray }
     }
-    if(@($rep.Pairs).Count -eq 0){ Write-Host 'No similar folder pairs found.' -ForegroundColor Gray }
     return
 }
 if($Learn){
-    # v3.0.1 B3: build (or refresh) the self-supervised model from the user's own
-    # curated folders and print what it learned and the labels it trusts.
-    $learnRoot = $null
-    if($Root){ $learnRoot = $Root }
-    else {
-        $learnLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
-        try { $learnRoot = Get-SysOrgDestinationRoot -Letter $learnLetter -Config $Config } catch { $learnRoot = ('{0}:\_Organized' -f $learnLetter) }
-    }
-    Write-Host ("Building the learn model from your own folder structure (model: {0}\_Index\model.json) ..." -f $learnRoot) -ForegroundColor White
-    try { $lm = New-SysOrgLearnModel -Config $Config -DestinationRoot $learnRoot }
-    catch { Write-Host ("Learn failed: {0}" -f $_.Exception.Message) -ForegroundColor Red; return }
-    if($lm -and $lm.Model){
-        $minFiles = [int](Get-SysOrgSetting $Config 'Learn.MinFilesPerLabel' 5)
-        $labelNames = @(Get-SysOrgLearnLabelNames -Model $lm.Model)
-        Write-Host ("Learned {0} trusted label(s):" -f $labelNames.Count) -ForegroundColor Green
-        foreach($ll in $labelNames){
-            $L = Get-SysOrgLearnLabel -Model $lm.Model -Name $ll
-            $topTokens = @()
-            if($L.Tokens -is [hashtable] -or $L.Tokens -is [System.Collections.Specialized.OrderedDictionary]){
-                $topTokens = @($L.Tokens.Keys | Sort-Object { -[int]$L.Tokens[$_] }, { $_ } | Select-Object -First 8)
-            }
-            else { $topTokens = @($L.Tokens.PSObject.Properties | Sort-Object { -[int]$_.Value }, { $_.Name } | Select-Object -First 8 | ForEach-Object { $_.Name }) }
-            $trust = 'trusted'
-            if([int]$L.Files -lt $minFiles){ $trust = 'NOT trusted (too few files)' }
-            Write-Host ("  {0}: {1} training file(s) [{2}]" -f $ll, $L.Files, $trust)
-            Write-Host ("    top signals: {0}" -f ($topTokens -join ', ')) -ForegroundColor Gray
+    Invoke-SysOrgCliStep -Step 'Learn' -Action {
+        # v3.0.1 B3: build (or refresh) the self-supervised model from the user's own
+        # curated folders and print what it learned and the labels it trusts.
+        $learnRoot = $null
+        if($Root){ $learnRoot = $Root }
+        else {
+            $learnLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
+            try { $learnRoot = Get-SysOrgDestinationRoot -Letter $learnLetter -Config $Config } catch { $learnRoot = ('{0}:\_Organized' -f $learnLetter) }
         }
-        Write-Host ("Model fingerprint {0} ({1})." -f $lm.Fingerprint.Substring(0,12), $(if($lm.Rebuilt){ 'rebuilt' } else { 'unchanged - reused' })) -ForegroundColor Gray
-        Write-Host 'The model never moves anything by itself - it sharpens confidence and appears in -Explain.' -ForegroundColor DarkGray
-    }
-    else {
-        Write-Host 'No trusted labels yet: the model needs folders with at least 5 files each' -ForegroundColor Yellow
-        Write-Host '(e.g. existing subfolders of Documents like Documents\Work or Documents\Personal).' -ForegroundColor Yellow
+        Write-Host ("Building the learn model from your own folder structure (model: {0}\_Index\model.json) ..." -f $learnRoot) -ForegroundColor White
+        try { $lm = New-SysOrgLearnModel -Config $Config -DestinationRoot $learnRoot }
+        catch { Write-Host ("Learn failed: {0}" -f $_.Exception.Message) -ForegroundColor Red; return }
+        if($lm -and $lm.Model){
+            $minFiles = [int](Get-SysOrgSetting $Config 'Learn.MinFilesPerLabel' 5)
+            $labelNames = @(Get-SysOrgLearnLabelNames -Model $lm.Model)
+            Write-Host ("Learned {0} trusted label(s):" -f $labelNames.Count) -ForegroundColor Green
+            foreach($ll in $labelNames){
+                $L = Get-SysOrgLearnLabel -Model $lm.Model -Name $ll
+                $topTokens = @()
+                if($L.Tokens -is [hashtable] -or $L.Tokens -is [System.Collections.Specialized.OrderedDictionary]){
+                    $topTokens = @($L.Tokens.Keys | Sort-Object { -[int]$L.Tokens[$_] }, { $_ } | Select-Object -First 8)
+                }
+                else { $topTokens = @($L.Tokens.PSObject.Properties | Sort-Object { -[int]$_.Value }, { $_.Name } | Select-Object -First 8 | ForEach-Object { $_.Name }) }
+                $trust = 'trusted'
+                if([int]$L.Files -lt $minFiles){ $trust = 'NOT trusted (too few files)' }
+                Write-Host ("  {0}: {1} training file(s) [{2}]" -f $ll, $L.Files, $trust)
+                Write-Host ("    top signals: {0}" -f ($topTokens -join ', ')) -ForegroundColor Gray
+            }
+            Write-Host ("Model fingerprint {0} ({1})." -f $lm.Fingerprint.Substring(0,12), $(if($lm.Rebuilt){ 'rebuilt' } else { 'unchanged - reused' })) -ForegroundColor Gray
+            Write-Host 'The model never moves anything by itself - it sharpens confidence and appears in -Explain.' -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host 'No trusted labels yet: the model needs folders with at least 5 files each' -ForegroundColor Yellow
+            Write-Host '(e.g. existing subfolders of Documents like Documents\Work or Documents\Personal).' -ForegroundColor Yellow
+        }
     }
     return
 }
 if($PSBoundParameters.ContainsKey('Find')){
-    # v3.0 Phase 4.2: instant search over the catalog (falls back to a live scan)
-    if([string]::IsNullOrWhiteSpace($Find)){ $Find = '*' }
-    $findRoot = $null
-    if($Root){ $findRoot = $Root }
-    else {
-        $findLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
-        try { $findRoot = Get-SysOrgDestinationRoot -Letter $findLetter -Config $Config } catch { $findRoot = ('{0}:\_Organized' -f $findLetter) }
+    Invoke-SysOrgCliStep -Step 'Find' -Action {
+        # v3.0 Phase 4.2: instant search over the catalog (falls back to a live scan)
+        if([string]::IsNullOrWhiteSpace($Find)){ $Find = '*' }
+        $findRoot = $null
+        if($Root){ $findRoot = $Root }
+        else {
+            $findLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
+            try { $findRoot = Get-SysOrgDestinationRoot -Letter $findLetter -Config $Config } catch { $findRoot = ('{0}:\_Organized' -f $findLetter) }
+        }
+        $results = @(Find-SysOrgFile -Root $findRoot -Name $Find -Config $Config)
+        Write-Host ("{0} result(s):" -f $results.Count) -ForegroundColor White
+        foreach($r in ($results | Select-Object -First 40)){
+            Write-Host ('  ' + $r.CurrentPath + '  [' + $r.Category + $(if($r.Family){ ' | family ' + $r.Family }) + ']')
+        }
+        if($results.Count -gt 40){ Write-Host ('  ... and {0} more' -f ($results.Count - 40)) -ForegroundColor DarkGray }
     }
-    $results = @(Find-SysOrgFile -Root $findRoot -Name $Find -Config $Config)
-    Write-Host ("{0} result(s):" -f $results.Count) -ForegroundColor White
-    foreach($r in ($results | Select-Object -First 40)){
-        Write-Host ('  ' + $r.CurrentPath + '  [' + $r.Category + $(if($r.Family){ ' | family ' + $r.Family }) + ']')
-    }
-    if($results.Count -gt 40){ Write-Host ('  ... and {0} more' -f ($results.Count - 40)) -ForegroundColor DarkGray }
     return
 }
 if($Explain){
-    # v3.0 Phase 2.9: the full Decision for ONE file - every signal, rule and the
-    # confidence math. Read-only: nothing is moved, nothing is planned.
-    if(-not (Test-Path -LiteralPath $Explain)){
-        Write-Host ("File not found: {0}" -f $Explain) -ForegroundColor Red
-        return
+    Invoke-SysOrgCliStep -Step 'Explain' -Action {
+        # v3.0 Phase 2.9: the full Decision for ONE file - every signal, rule and the
+        # confidence math. Read-only: nothing is moved, nothing is planned.
+        if(-not (Test-Path -LiteralPath $Explain)){
+            Write-Host ("File not found: {0}" -f $Explain) -ForegroundColor Red
+            return
+        }
+        $ext = [System.IO.Path]::GetExtension($Explain).ToLowerInvariant()
+        try { $cat = Get-SysOrgCategory -Extension $ext -Config $Config } catch { $cat = 'Other' }
+        $profX = $null
+        if($env:OS -eq 'Windows_NT'){
+            try { $profX = @(Get-SysOrgDriveProfile -Config $Config -Letters 'C')[0] } catch { $profX = $null }
+        } else {
+            # portable host: no real drive profile - a synthetic Data profile keeps the
+            # mutability stage out of the way for this read-only explanation
+            $profX = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; ProposedScope='FullDrive'
+                KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        }
+        $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata
+        # v3.0.1 B3: -Explain includes the structure-model signal when a model exists
+        if(Get-SysOrgSetting $Config 'Learn.Enabled' $true){
+            try{
+                $explainRoot = $null
+                try { $explainRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $explainRoot = 'C:\_Organized' }
+                $lmX = New-SysOrgLearnModel -Config $Config -DestinationRoot $explainRoot
+                if($lmX -and $lmX.Model){ $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata -LearnModel $lmX.Model }
+            } catch { }
+        }
+        Show-SysOrgDecision -Decision $dec
     }
-    $ext = [System.IO.Path]::GetExtension($Explain).ToLowerInvariant()
-    try { $cat = Get-SysOrgCategory -Extension $ext -Config $Config } catch { $cat = 'Other' }
-    $profX = $null
-    if($env:OS -eq 'Windows_NT'){
-        try { $profX = @(Get-SysOrgDriveProfile -Config $Config -Letters 'C')[0] } catch { $profX = $null }
-    } else {
-        # portable host: no real drive profile - a synthetic Data profile keeps the
-        # mutability stage out of the way for this read-only explanation
-        $profX = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; ProposedScope='FullDrive'
-            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
-    }
-    $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata
-    # v3.0.1 B3: -Explain includes the structure-model signal when a model exists
-    if(Get-SysOrgSetting $Config 'Learn.Enabled' $true){
-        try{
-            $explainRoot = $null
-            try { $explainRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $explainRoot = 'C:\_Organized' }
-            $lmX = New-SysOrgLearnModel -Config $Config -DestinationRoot $explainRoot
-            if($lmX -and $lmX.Model){ $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata -LearnModel $lmX.Model }
-        } catch { }
-    }
-    Show-SysOrgDecision -Decision $dec
     return
 }
 if($UndoPlan){
-    # v2.1.1: elevated sessions must type 'yes' before any undo.
-    if(-not (Confirm-SysOrgElevated)){
-        Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
-        return
+    Invoke-SysOrgCliStep -Step 'Undo' -Action {
+        # v2.1.1: elevated sessions must type 'yes' before any undo.
+        if(-not (Confirm-SysOrgElevated)){
+            Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
+            return
+        }
+        $script:SysOrgPhase = 'execute'
+        $res = Undo-SysOrgPlan -PlanId $UndoPlan -AppRoot $appRoot -Config $Config
+        $script:SysOrgPhase = 'preview'
+        Write-Host ("Undo complete. Restored={0}  Failed={1}  SkippedMissing={2}  SkippedChanged={3}" -f $res.Restored, $res.Failed, $res.SkippedMissing, $res.SkippedChanged)
+        # v3.0 Phase 4.1: point catalog entries back at the original locations
+        $planJsonPath = Join-Path $folders.Plans ("{0}.json" -f $UndoPlan)
+        $undoRoot = $null
+        if(Test-Path -LiteralPath $planJsonPath){
+            try { $undoRoot = ((Get-Content -LiteralPath $planJsonPath -Raw | ConvertFrom-Json).DestinationRoot) } catch { $undoRoot = $null }
+        }
+        if($undoRoot){ $null = Update-SysOrgCatalogOnUndo -PlanId $UndoPlan -AppRoot $appRoot -Root $undoRoot }
     }
-    $res = Undo-SysOrgPlan -PlanId $UndoPlan -AppRoot $appRoot -Config $Config
-    Write-Host ("Undo complete. Restored={0}  Failed={1}  SkippedMissing={2}  SkippedChanged={3}" -f $res.Restored, $res.Failed, $res.SkippedMissing, $res.SkippedChanged)
-    # v3.0 Phase 4.1: point catalog entries back at the original locations
-    $planJsonPath = Join-Path $folders.Plans ("{0}.json" -f $UndoPlan)
-    $undoRoot = $null
-    if(Test-Path -LiteralPath $planJsonPath){
-        try { $undoRoot = ((Get-Content -LiteralPath $planJsonPath -Raw | ConvertFrom-Json).DestinationRoot) } catch { $undoRoot = $null }
-    }
-    if($undoRoot){ $null = Update-SysOrgCatalogOnUndo -PlanId $UndoPlan -AppRoot $appRoot -Root $undoRoot }
     return
 }
 if($ExecutePlan){
-    Invoke-SysOrgPlanFile -Path $ExecutePlan
+    Invoke-SysOrgCliStep -Step 'Execute plan' -Action { Invoke-SysOrgPlanFile -Path $ExecutePlan }
     return
 }
 if($MigrateProfile){
-    # v3.0 Phase 6: migrate an existing v2.1 organized tree to the Findable layout
-    if("$MigrateProfile" -ine 'Findable'){
-        Write-Host ("Unknown layout profile '{0}' - only 'Findable' is supported as a migration target." -f $MigrateProfile) -ForegroundColor Yellow
-        return
-    }
-    $migLetters = @()
-    if($Migrate -and @($Migrate).Count -gt 0){ $migLetters = @($Migrate) }
-    else { $migLetters = @('C') }
-    foreach($l in $migLetters){
-        Invoke-SysOrgMigrationFlow -Letter ($l.Trim().TrimEnd(':').ToUpper()) -TargetProfile 'Findable'
+    Invoke-SysOrgCliStep -Step 'Layout migration' -Action {
+        # v3.0 Phase 6: migrate an existing v2.1 organized tree to the Findable layout
+        if("$MigrateProfile" -ine 'Findable'){
+            Write-Host ("Unknown layout profile '{0}' - only 'Findable' is supported as a migration target." -f $MigrateProfile) -ForegroundColor Yellow
+            return
+        }
+        $migLetters = @()
+        if($Migrate -and @($Migrate).Count -gt 0){ $migLetters = @($Migrate) }
+        else { $migLetters = @('C') }
+        foreach($l in $migLetters){
+            Invoke-SysOrgMigrationFlow -Letter ($l.Trim().TrimEnd(':').ToUpper()) -TargetProfile 'Findable'
+        }
     }
     return
 }
 if($Migrate){
-    if(@($Migrate).Count -gt 0){
-        foreach($l in $Migrate){ Invoke-SysOrgMigrationFlow -Letter ($l.Trim().TrimEnd(':').ToUpper()) }
-    } else {
-        foreach($d in @(Get-SysOrgDrive)){
-            Invoke-SysOrgMigrationFlow -Letter ($d.Drive.TrimEnd(':'))
+    Invoke-SysOrgCliStep -Step 'Migration' -Action {
+        if(@($Migrate).Count -gt 0){
+            foreach($l in $Migrate){ Invoke-SysOrgMigrationFlow -Letter ($l.Trim().TrimEnd(':').ToUpper()) }
+        } else {
+            foreach($d in @(Get-SysOrgDrive)){
+                Invoke-SysOrgMigrationFlow -Letter ($d.Drive.TrimEnd(':'))
+            }
         }
     }
     return
 }
 if($ScanDrive){
-    foreach($l in $ScanDrive){
-        $ll = $l.Trim().TrimEnd(':').ToUpper()
-        if($ReportOnly){ Invoke-SysOrgScanFlow -Letter $ll -PreviewOnly -WholeDrive:$FullDrive -NoCacheSwitch:$NoCache }
-        else { Invoke-SysOrgScanFlow -Letter $ll -WholeDrive:$FullDrive -NoCacheSwitch:$NoCache }
+    Invoke-SysOrgCliStep -Step 'Scan' -Action {
+        foreach($l in $ScanDrive){
+            $ll = $l.Trim().TrimEnd(':').ToUpper()
+            if($ReportOnly){ Invoke-SysOrgScanFlow -Letter $ll -PreviewOnly -WholeDrive:$FullDrive -NoCacheSwitch:$NoCache }
+            else { Invoke-SysOrgScanFlow -Letter $ll -WholeDrive:$FullDrive -NoCacheSwitch:$NoCache }
+        }
     }
     return
 }
@@ -972,8 +1042,11 @@ if($ScanDrive){
 # ---------------- interactive menu ----------------
 $running = $true
 while($running){
+    # v3.0.2 A1: every menu iteration starts in the preview phase - the catch-all
+    # can honestly say "Nothing was modified." until a flow sets the execute phase.
+    $script:SysOrgPhase = 'preview'
     Write-Host ''
-    Write-Host '==== SysOrg - portable file organizer (rev 2.1, preview-first) ====' -ForegroundColor White
+    Write-Host '==== SysOrg - portable file organizer (preview-first) ====' -ForegroundColor White
     Write-Host ' [1] Profile drives (role, protected artifacts, known folders, writable scope)'
     Write-Host ' [2] Audit folders: which can / cannot be altered (safety map)'
     Write-Host ' [3] Organize a drive (profile -> scan -> plan -> preview -> optional execute)'
@@ -1027,7 +1100,9 @@ while($running){
                       Write-Host 'Elevated confirmation declined. Nothing was modified.' -ForegroundColor Yellow
                       continue
                   }
+                  $script:SysOrgPhase = 'execute'
                   $res = Undo-SysOrgPlan -PlanId $id -AppRoot $appRoot -Config $Config
+                  $script:SysOrgPhase = 'preview'
                   Write-Host ("Restored={0}  Failed={1}  SkippedMissing={2}  SkippedChanged={3}" -f $res.Restored, $res.Failed, $res.SkippedMissing, $res.SkippedChanged)
                 }
             '7' { $l = Get-SysOrgLetterInput -Prompt 'Drive letter to migrate'; Invoke-SysOrgMigrationFlow -Letter $l }
@@ -1038,6 +1113,19 @@ while($running){
             default { Write-Host 'Unknown option.' }
         }
     } catch {
-        Write-SysOrgLog "Menu action failed: $($_.Exception.Message)" -Level ERROR -LogFolder $logFolder
+        # v3.0.2 A1: the full diagnostic (exception type, message, script stack
+        # trace, invocation position) goes to the log file; the user gets a
+        # one-line message pointing at the log and the honest phase verdict.
+        $logPath = Write-SysOrgErrorDiagnostic -ErrorRecord $_ -LogFolder $logFolder -Phase $script:SysOrgPhase
+        Write-SysOrgLog ("Menu action failed: {0}" -f $_.Exception.Message) -Level ERROR -LogFolder $logFolder
+        if($script:SysOrgPhase -eq 'preview'){
+            Write-Host ("Menu action failed: {0}  Nothing was modified." -f $_.Exception.Message) -ForegroundColor Red
+        } else {
+            Write-Host ("Menu action failed DURING EXECUTION: {0}  A partial move may have happened - the undo journal restores it." -f $_.Exception.Message) -ForegroundColor Red
+        }
+        if($logPath){ Write-Host ("  Full diagnostics: {0}   (run .\SysOrg.ps1 -Diagnostics for a support bundle)" -f $logPath) -ForegroundColor DarkYellow }
+    } finally {
+        # v3.0.2 A1: the next menu iteration always starts in the preview phase.
+        $script:SysOrgPhase = 'preview'
     }
 }

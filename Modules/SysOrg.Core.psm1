@@ -451,6 +451,72 @@ function Get-SysOrgSetting {
     return $node
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 A1: last-error diagnostics for support. The menu catch-all and every
+# CLI entry point log the FULL exception (type, message, script stack trace,
+# invocation position) through Write-SysOrgErrorDiagnostic; the record is kept
+# so -Diagnostics (v3.0.2 A4) can bundle it.
+# ---------------------------------------------------------------------------
+$script:SysOrgLastErrorRecord = $null
+
+function Get-SysOrgLastError {
+<#
+.SYNOPSIS
+    The last recorded SysOrg error with its full diagnostic fields (v3.0.2 A1/A4).
+.DESCRIPTION
+    $null when no error was recorded in this session.
+.EXAMPLE
+    Get-SysOrgLastError   # -> @{ When=...; Type=...; Message=...; ... }
+#>
+    return $script:SysOrgLastErrorRecord
+}
+
+function Write-SysOrgErrorDiagnostic {
+<#
+.SYNOPSIS
+    Logs the FULL diagnostic of a terminating error and returns the log path.
+.DESCRIPTION
+    Writes exception type, message, ScriptStackTrace and
+    InvocationInfo.PositionMessage to the dated log file (one [ERROR] block per
+    field), remembers the record for Get-SysOrgLastError / -Diagnostics, and
+    returns the log file path ('' when the log itself could not be written).
+    Never throws.
+.EXAMPLE
+    $p = Write-SysOrgErrorDiagnostic -ErrorRecord $_ -LogFolder $logFolder -Phase 'preview'
+    Write-Host ("Diagnostics written to: {0}" -f $p)
+#>
+    param([Parameter(Mandatory)]$ErrorRecord,
+          [string]$LogFolder,
+          [ValidateSet('preview','execute')][string]$Phase = 'preview')
+    $ex = $ErrorRecord.Exception
+    $type = if($null -ne $ex){ $ex.GetType().FullName } else { 'Unknown' }
+    $msg  = if($null -ne $ex){ "$($ex.Message)" } else { "$ErrorRecord" }
+    $stack = "$($ErrorRecord.ScriptStackTrace)"
+    $pos = ''
+    try { if($ErrorRecord.InvocationInfo){ $pos = "$($ErrorRecord.InvocationInfo.PositionMessage)" } } catch { }
+    $script:SysOrgLastErrorRecord = [pscustomobject]@{
+        When = (Get-Date).ToString('s'); Phase = $Phase; Type = $type
+        Message = $msg; ScriptStackTrace = $stack; PositionMessage = $pos
+    }
+    $logPath = ''
+    if($LogFolder){
+        try{
+            if(-not (Test-Path -LiteralPath $LogFolder)){ New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null }
+            $logPath = Join-Path $LogFolder ('sysorg-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+            $lines = @(
+                ("[{0}] [ERROR ] --- diagnostic begin (phase={1}) ---" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Phase),
+                ("[{0}] [ERROR ] Exception type:    {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $type),
+                ("[{0}] [ERROR ] Exception message: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg),
+                ("[{0}] [ERROR ] Script stack trace: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $stack),
+                ("[{0}] [ERROR ] Position: {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $pos),
+                ("[{0}] [ERROR ] --- diagnostic end ---" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+            )
+            Add-Content -LiteralPath $logPath -Value $lines -Encoding UTF8
+        } catch { $logPath = ''; Write-Verbose ("SysOrg diagnostic log write failed: " + $_.Exception.Message) }
+    }
+    return $logPath
+}
+
 function Write-SysOrgLog {
 <#
 .SYNOPSIS
