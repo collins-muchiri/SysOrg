@@ -216,6 +216,27 @@
         WarnOneDriveSyncOut = $true    # list moves that would remove files from OneDrive sync
     }
 
+    # v3.0.1 B3: self-supervised learning from YOUR OWN structure. Before classifying,
+    # SysOrg builds a small naive Bayes model (model.json under <root>\_Index) from
+    # the files already living in your curated folders: every existing subfolder of a
+    # known folder in scope (e.g. Documents\Work, Documents\Personal) becomes a label;
+    # filename tokens, extensions, Office/PDF title-author tokens and the first 2 KB
+    # of text become features. The model is rebuilt only when its input fingerprint
+    # changes, needs at least MinFilesPerLabel (5) files per label, and is strictly a
+    # CONFIDENCE SIGNAL (it appears in -Explain and never moves anything by itself).
+    # Learn.FromPaths adds extra training folders; GenericLabels are never used as
+    # labels. Run '.\SysOrg.ps1 -Learn' to see what it learned and what it trusts.
+    Learn = @{
+        Enabled          = $true
+        FromPaths        = @()      # e.g. @('D:\Reference\Proposals') - extra training folders
+        MinFilesPerLabel = 5        # fewer examples -> the label is not trusted
+        MinMargin        = 0.5      # posterior margin needed for a trusted prediction
+        MaxFilesPerLabel = 500      # training cap per label (keeps the build fast)
+        MaxTokensPerLabel = 2000    # keeps model.json small
+        GenericLabels    = @('documents','downloads','pictures','videos','music','desktop',
+                             'archive','archives','backup','misc','other','files','new folder','temp','tmp','unknown')
+    }
+
     # v3.0.1 A4: the download-source bucket map. 'Rules.SourcesPath' may point at a
     # custom map file; empty = <AppRoot>\Rules\Sources.psd1 (shipped). The map is
     # EXTENSIBLE: add Hosts (exact host -> bucket, e.g. 'myportal.go.ke' = 'MyPortal'),

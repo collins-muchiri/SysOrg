@@ -108,6 +108,17 @@ function New-SysOrgPlan {
             try { $learnedPath = ((Get-SysOrgDestinationRoot -Letter $Letter -Config $Config) + '\_Index\LearnedRules.psd1') } catch { $learnedPath = '' }
         }
         $learnedRules = @(Get-SysOrgLearnedRules -Config $Config -Path $learnedPath)
+        # v3.0.1 B3: the self-supervised model built from the user's OWN curated folders
+        # (existing subfolders of the known folders in scope). Loaded once per plan;
+        # rebuilt only when its input fingerprint changed. Never required: when the
+        # model cannot be built the pipeline simply runs without it.
+        $learnModel = $null
+        if(Get-SysOrgSetting $Config 'Learn.Enabled' $true){
+            try{
+                $lm = New-SysOrgLearnModel -Config $Config -DestinationRoot $root -KnownFolders $KnownFolders
+                if($lm -and $lm.Model){ $learnModel = $lm.Model }
+            } catch { Write-Verbose ("Learn model unavailable (continuing without it): {0}" -f $_.Exception.Message) }
+        }
     }
     # v3.0 Phase 3.1: metadata through the persistent file-state cache - a fresh hit
     # returns the stored EXIF/ID3/MP4/Office/PDF/text result WITHOUT re-reading the file
@@ -342,7 +353,7 @@ function New-SysOrgPlan {
                 $dec = Invoke-SysOrgClassifyPipeline -Path $src -Extension "$($f.Extension)" -Category "$category" `
                     -Config $Config -DriveProfile $DriveProfile -UrlBucket "$bucket" `
                     -IncludeMetadata -UserRules $userRules -LearnedRules $learnedRules -AppRoot "$planAppRoot" `
-                    -Extractors $cachedExtractors
+                    -Extractors $cachedExtractors -LearnModel $learnModel
                 $decOf[$src] = $dec
                 $inReviewMove = $false
                 if($dec.NeedsDecision){

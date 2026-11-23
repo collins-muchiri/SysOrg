@@ -29,6 +29,12 @@
 # compiled-token regex cache (Phase 3.8: lexicon hotspot) - token -> [regex]
 $script:SysOrgTokenRegexCache = @{}
 
+# v3.0.1 B3: user-folder labels may only become a document SUBTYPE when they map to a
+# known Findable document leaf - an arbitrary folder name ('Taxes', 'UNDP') never
+# becomes a destination on its own (the model only sharpens confidence).
+$script:SysOrgLearnDocSubtypes = @('Work','Education','Legal-Identity','Personal',
+    'Finance\Invoices','Finance\Receipts','Finance\Statements','Finance\Tax','Manuals','Books')
+
 function New-SysOrgDecision {
 <#
 .SYNOPSIS
@@ -145,7 +151,8 @@ function Invoke-SysOrgClassifyPipeline {
         [hashtable]$DateOverride,
         $UserRules,
         $LearnedRules,
-        [string]$AppRoot
+        [string]$AppRoot,
+        [AllowNull()]$LearnModel
     )
     $d = New-SysOrgDecision -Path $Path
     $ext = "$Extension".ToLowerInvariant()
@@ -258,6 +265,34 @@ function Invoke-SysOrgClassifyPipeline {
     else {
         if($meta){ $d.Confidence = 0.9 } else { $d.Confidence = 0.8 }
     }
+
+    # --- stage 8d (v3.0.1 B3): self-supervised model signal, applied BEFORE the
+    # confidence gating so a model-lifted confidence re-gates correctly. The model
+    # NEVER moves anything by itself: it feeds the confidence pipeline like any other
+    # signal and appears in -Explain. A trusted prediction may sharpen the confidence
+    # and adopt its label as the document subtype - but ONLY when the label is one of
+    # the known Findable document subtypes (a user folder like 'Taxes' never becomes
+    # a destination on its own).
+    if($LearnModel){
+        try {
+            $pred = Get-SysOrgLearnPrediction -Model $LearnModel -Path $Path -Config $Config
+            if($pred){
+                [void]$d.Signals.Add(('Learn: model suggests ' + $pred.Label + ' (margin ' + $pred.Margin + ', ' + $pred.LabelFiles + ' training file(s))' + $(if(-not $pred.Trusted){ ' - not trusted yet' })))
+                if($pred.Trusted){
+                    $modelConf = [Math]::Min(0.99, [Math]::Max(0.0, [double]$pred.Confidence))
+                    if($modelConf -gt [double]$d.Confidence){
+                        $d.Confidence = $modelConf
+                        $d.RuleId = if($lex){ 'lexicon+model' } else { 'model' }
+                    }
+                    if(($d.Category -in @('Documents','Spreadsheets','Databases')) -and ($script:SysOrgLearnDocSubtypes -contains "$($pred.Label)")){
+                        $subtype = "$($pred.Label)"
+                        $d.Subtype = $subtype
+                    }
+                }
+            }
+        } catch { [void]$d.Signals.Add(('Learn: failed soft (' + $_.Exception.Message + ')')) }
+    }
+
     if($d.Confidence -lt $minConf){
         $d.NeedsDecision = $true
         [void]$d.Flags.Add('needs-decision')
@@ -996,6 +1031,330 @@ function Get-SysOrgImageNearDuplicates {
         }
     }
     return [pscustomobject]@{ Groups=$groups.ToArray(); Note=$note }
+}
+
+# ---------------------------------------------------------------------------
+# v3.0.1 B3: self-supervised learning from the user's OWN structure.
+# Before classifying, a model is built from files already living in the user's
+# curated folders (existing subfolders of the known folders in scope, plus
+# optional Learn.FromPaths). Filename tokens, extensions, metadata title/author
+# tokens and the first 2 KB of text become features for a multinomial naive
+# Bayes classifier whose labels are the user's folder names. The model is
+# stored in <destination root>\_Index\model.json (small, versioned, rebuilt
+# only when its input fingerprint changes). It NEVER moves anything by itself:
+# it feeds the confidence pipeline like any other signal and appears in
+# -Explain. Labels need at least Learn.MinFilesPerLabel (5) examples; generic
+# labels (Documents, Downloads, ...) are ignored.
+# ---------------------------------------------------------------------------
+
+function Get-SysOrgLearnTokens {
+<#
+.SYNOPSIS
+    Tokenizes text for the learn model: lowercase [a-z0-9] runs of 2+ characters.
+.EXAMPLE
+    Get-SysOrgLearnTokens -Text 'Monthly Narrative Report'   # -> monthly, narrative, report
+#>
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Text)
+    if([string]::IsNullOrWhiteSpace("$Text")){ return @() }
+    return @([regex]::Matches("$Text".ToLowerInvariant(), '[a-z0-9]{2,}') | ForEach-Object { "$($_.Value)" })
+}
+
+function Get-SysOrgLearnModelPath {
+<#
+.SYNOPSIS
+    The model location for a destination root: <root>\_Index\model.json.
+.EXAMPLE
+    Get-SysOrgLearnModelPath -Root 'D:\_Organized'   # -> 'D:\_Organized\_Index\model.json'
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Root)
+    return (Join-Path ("$Root".TrimEnd('\')) '_Index\model.json')
+}
+
+function Get-SysOrgLearnLabelNames {
+<#
+.SYNOPSIS
+    The label names of a learn model (works for the in-memory OrderedDictionary/hashtable
+    AND the JSON round-trip PSCustomObject), sorted.
+#>
+    [CmdletBinding()]
+    param([AllowNull()]$Model)
+    if(-not $Model -or -not $Model.PSObject.Properties['Labels']){ return @() }
+    if($Model.Labels -is [hashtable] -or $Model.Labels -is [System.Collections.Specialized.OrderedDictionary]){
+        return @($Model.Labels.Keys | Sort-Object)
+    }
+    return @($Model.Labels.PSObject.Properties.Name | Sort-Object)
+}
+
+function Get-SysOrgLearnLabel {
+<#
+.SYNOPSIS
+    One label entry of a learn model by name (dictionary OR PSCustomObject safe).
+#>
+    [CmdletBinding()]
+    param([AllowNull()]$Model,[Parameter(Mandatory)][string]$Name)
+    if(-not $Model -or -not $Model.PSObject.Properties['Labels']){ return $null }
+    if($Model.Labels -is [hashtable] -or $Model.Labels -is [System.Collections.Specialized.OrderedDictionary]){
+        return $Model.Labels[$Name]
+    }
+    return $Model.Labels.$Name
+}
+
+function Get-SysOrgLearnFileTokens {
+<#
+.SYNOPSIS
+    The feature tokens of ONE file: extension, filename tokens, metadata
+    title/creator/author tokens and first-2KB text tokens (all fail soft).
+.EXAMPLE
+    Get-SysOrgLearnFileTokens -Path 'C:\x\report.docx'
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $out = New-Object System.Collections.Generic.List[string]
+    $name = Split-Path $Path -Leaf
+    $ext = [System.IO.Path]::GetExtension($name).ToLowerInvariant()
+    if(-not [string]::IsNullOrWhiteSpace($ext)){ [void]$out.Add(('ext:' + $ext.TrimStart('.'))) }
+    foreach($t in (Get-SysOrgLearnTokens -Text ([System.IO.Path]::GetFileNameWithoutExtension($name)))){ [void]$out.Add($t) }
+    try{
+        if(Get-Command Get-SysOrgFileMetadata -ErrorAction SilentlyContinue){
+            $meta = Get-SysOrgFileMetadata -Path $Path -Extension $ext
+            if($meta){
+                foreach($k in @('Title','Creator','Author')){
+                    if($meta.ContainsKey($k)){ foreach($t in (Get-SysOrgLearnTokens -Text "$($meta[$k])")){ [void]$out.Add($t) } }
+                }
+            }
+        }
+    } catch { }
+    try{
+        if(Get-Command Get-SysOrgTextSnippet -ErrorAction SilentlyContinue){
+            $sn = Get-SysOrgTextSnippet -Path $Path
+            if($sn -and $sn.PSObject.Properties['Snippet']){ foreach($t in (Get-SysOrgLearnTokens -Text "$($sn['Snippet'])")){ [void]$out.Add($t) } }
+        }
+    } catch { }
+    return $out.ToArray()
+}
+
+function New-SysOrgLearnModel {
+<#
+.SYNOPSIS
+    Builds (or reuses) the self-supervised learn model in <root>\_Index\model.json.
+.DESCRIPTION
+    Labels come from the EXISTING subfolders of the known folders in scope plus
+    optional Learn.FromPaths. Each label accumulates feature tokens from up to
+    Learn.MaxFilesPerLabel files. Labels that look generic (Learn.GenericLabels)
+    or bare dates are ignored; labels with fewer than Learn.MinFilesPerLabel
+    (5) files are not trusted (excluded from the model). The model carries a
+    fingerprint over 'label|fileCount|newestMtime' - when nothing changed, the
+    existing model.json is reused (Rebuilt=$false). Deterministic.
+.EXAMPLE
+    $lm = New-SysOrgLearnModel -Config $cfg -DestinationRoot 'C:\_Organized' -KnownFolders $kf
+    $lm.Model.Labels['Work'].Files   # -> 12
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Config,[Parameter(Mandatory)][string]$DestinationRoot,
+          [object[]]$KnownFolders,[string[]]$FromPaths)
+    if(-not (Get-SysOrgSetting $Config 'Learn.Enabled' $true)){ return $null }
+    $minFiles = [int](Get-SysOrgSetting $Config 'Learn.MinFilesPerLabel' 5)
+    $maxPerLabel = [int](Get-SysOrgSetting $Config 'Learn.MaxFilesPerLabel' 500)
+    $maxTokens = [int](Get-SysOrgSetting $Config 'Learn.MaxTokensPerLabel' 2000)
+    $generic = @(@(Get-SysOrgSetting $Config 'Learn.GenericLabels' @(
+        'documents','downloads','pictures','videos','music','desktop','archive','archives',
+        'backup','misc','other','files','new folder','temp','tmp','unknown')) | ForEach-Object { "$_".ToLowerInvariant() })
+    if(-not $FromPaths){ $FromPaths = @(Get-SysOrgSetting $Config 'Learn.FromPaths' @()) }
+
+    # label -> list of root directories
+    $labelRoots = @{}
+    foreach($k in @($KnownFolders)){
+        if(-not $k -or -not "$($k.Path)"){ continue }
+        try{
+            foreach($sub in @(Get-ChildItem -LiteralPath "$($k.Path)" -Directory -ErrorAction SilentlyContinue)){
+                $ll = "$($sub.Name)".ToLowerInvariant()
+                if($generic -contains $ll){ continue }
+                if($ll -match '^(19|20)\d{2}'){ continue }   # date-ish folder names are not labels
+                if([string]::IsNullOrWhiteSpace($ll)){ continue }
+                if(-not $labelRoots.ContainsKey($ll)){ $labelRoots[$ll] = New-Object System.Collections.Generic.List[string] }
+                [void]$labelRoots[$ll].Add("$($sub.FullName)")
+            }
+        } catch { Write-Verbose "Learn: could not enumerate subfolders of '$($k.Path)': $($_.Exception.Message)" }
+    }
+    foreach($p in @($FromPaths)){
+        if([string]::IsNullOrWhiteSpace("$p") -or -not (Test-Path -LiteralPath "$p")){ continue }
+        $ll = (Split-Path "$p" -Leaf).ToLowerInvariant()
+        if($generic -contains $ll -or [string]::IsNullOrWhiteSpace($ll)){ continue }
+        if(-not $labelRoots.ContainsKey($ll)){ $labelRoots[$ll] = New-Object System.Collections.Generic.List[string] }
+        [void]$labelRoots[$ll].Add("$p")
+    }
+
+    # collect files + fingerprint over 'label|fileCount|newestMtimeUtcTicks'
+    $fpParts = New-Object System.Collections.Generic.List[string]
+    $filesByLabel = @{}
+    foreach($ll in ($labelRoots.Keys | Sort-Object)){
+        $files = New-Object System.Collections.Generic.List[object]
+        foreach($dir in $labelRoots[$ll]){
+            try{
+                foreach($f in [System.IO.Directory]::EnumerateFiles($dir, '*', [System.IO.SearchOption]::AllDirectories)){
+                    try{
+                        $fi = Get-Item -LiteralPath $f -Force
+                        if($fi.PSIsContainer){ continue }
+                        [void]$files.Add([pscustomobject]@{ Path=[string]$f; Mtime=$fi.LastWriteTimeUtc.Ticks })
+                    } catch { }
+                    if($files.Count -ge $maxPerLabel){ break }
+                }
+            } catch { Write-Verbose "Learn: could not enumerate '$dir': $($_.Exception.Message)" }
+            if($files.Count -ge $maxPerLabel){ break }
+        }
+        $newest = [long]0
+        foreach($f in $files){ if([long]$f.Mtime -gt $newest){ $newest = [long]$f.Mtime } }
+        [void]$fpParts.Add(('{0}|{1}|{2}' -f $ll, $files.Count, $newest))
+        $filesByLabel[$ll] = $files
+    }
+    $fingerprint = ''
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try{
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($fpParts -join ';'))
+        $fingerprint = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+    } finally { $sha.Dispose() }
+
+    $modelPath = Get-SysOrgLearnModelPath -Root $DestinationRoot
+    if(Test-Path -LiteralPath $modelPath){
+        try{
+            $existing = Get-Content -LiteralPath $modelPath -Raw | ConvertFrom-Json
+            if($existing -and $existing.PSObject.Properties['Fingerprint'] -and ("$($existing.Fingerprint)" -eq $fingerprint)){
+                return [pscustomobject]@{ Model=$existing; Path=$modelPath; Rebuilt=$false; Fingerprint=$fingerprint }
+            }
+        } catch { Write-Verbose "Learn: existing model unreadable, rebuilding: $($_.Exception.Message)" }
+    }
+
+    # build the per-label token counts (only labels with enough examples are trusted)
+    $labels = [ordered]@{}
+    foreach($ll in ($labelRoots.Keys | Sort-Object)){
+        $files = $filesByLabel[$ll]
+        if($files.Count -lt $minFiles){ continue }   # untrusted: too few examples
+        $tokens = @{}
+        $total = 0
+        foreach($f in $files){
+            foreach($t in (Get-SysOrgLearnFileTokens -Path ([string]$f.Path))){
+                if(-not $tokens.ContainsKey($t)){ $tokens[$t] = 0 }
+                $tokens[$t]++
+                $total++
+            }
+        }
+        # keep the model small: top N tokens by count, ties by name (deterministic)
+        $kept = @{}
+        $rank = 0
+        foreach($t in ($tokens.Keys | Sort-Object { -[int]$tokens[$_] }, { $_ })){
+            if($rank -ge $maxTokens){ break }
+            $kept[$t] = [int]$tokens[$t]
+            $rank++
+        }
+        $labels[$ll] = @{ Files=$files.Count; Total=$total; Tokens=$kept }
+    }
+    if($labels.Count -eq 0){
+        return [pscustomobject]@{ Model=$null; Path=$modelPath; Rebuilt=$false; Fingerprint=$fingerprint }
+    }
+    $vocab = New-Object System.Collections.Generic.HashSet[string]
+    foreach($ll in $labels.Keys){ foreach($t in $labels[$ll]['Tokens'].Keys){ [void]$vocab.Add([string]$t) } }
+    $model = [pscustomobject]@{
+        Version        = 1
+        Fingerprint    = $fingerprint
+        Built          = (Get-Date).ToString('s')
+        Alpha          = 1.0
+        VocabSize      = $vocab.Count
+        MinFilesPerLabel = $minFiles
+        Labels         = $labels
+    }
+    # write atomically (temp + move) so a crash can never leave a half-written model
+    try{
+        $dir = Split-Path $modelPath -Parent
+        if(-not (Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $tmp = "$modelPath.tmp"
+        ($model | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $modelPath -Force
+    } catch { Write-Verbose "Learn: model write failed (continues without persistence): $($_.Exception.Message)" }
+    return [pscustomobject]@{ Model=$model; Path=$modelPath; Rebuilt=$true; Fingerprint=$fingerprint }
+}
+
+function Get-SysOrgLearnPrediction {
+<#
+.SYNOPSIS
+    Naive Bayes prediction for one file against the learn model.
+.DESCRIPTION
+    Multinomial NB with Laplace smoothing: score(label) = log prior + sum over the
+    file's tokens of count*log P(token|label); posteriors via a max-shifted softmax;
+    the margin (p1 - p2) is the confidence. A label is trusted only when the model
+    carries at least Learn.MinFilesPerLabel (5) examples AND the margin reaches
+    Learn.MinMargin (0.5). Returns $null when no model or no tokens. Deterministic
+    (label iteration in sorted order).
+.EXAMPLE
+    $p = Get-SysOrgLearnPrediction -Model $model -Path 'C:\dl\Monthly Narrative Report.docx' -Config $cfg
+    $p.Label   # -> 'Work'
+#>
+    [CmdletBinding()]
+    param([AllowNull()]$Model,[Parameter(Mandatory)][string]$Path,$Config)
+    if(-not $Model -or -not $Model.PSObject.Properties['Labels']){ return $null }
+    $minMargin = [double](Get-SysOrgSetting $Config 'Learn.MinMargin' 0.5)
+    $minFiles = [int](Get-SysOrgSetting $Config 'Learn.MinFilesPerLabel' 5)
+    $alpha = 1.0
+    if($Model.PSObject.Properties['Alpha'] -and $Model.Alpha){ $alpha = [double]$Model.Alpha }
+    $vocabSize = 1
+    if($Model.PSObject.Properties['VocabSize'] -and $Model.VocabSize){ $vocabSize = [int]$Model.VocabSize }
+    $tokens = @(Get-SysOrgLearnFileTokens -Path $Path)
+    if($tokens.Count -eq 0){ return $null }
+    $counts = @{}
+    foreach($t in $tokens){
+        if(-not $counts.ContainsKey($t)){ $counts[$t] = 0 }
+        $counts[$t]++
+    }
+    $labelNames = @(Get-SysOrgLearnLabelNames -Model $Model)
+    if($labelNames.Count -eq 0){ return $null }
+    $totalFiles = 0
+    foreach($ll in $labelNames){
+        $L = Get-SysOrgLearnLabel -Model $Model -Name $ll
+        $totalFiles += [int]$L.Files
+    }
+    $scores = @{}
+    foreach($ll in $labelNames){
+        $L = Get-SysOrgLearnLabel -Model $Model -Name $ll
+        $s = [Math]::Log([double][int]$L.Files / [double][int]$totalFiles)
+        foreach($t in $counts.Keys){
+            $c = 0
+            if($L.Tokens -is [hashtable] -or $L.Tokens -is [System.Collections.Specialized.OrderedDictionary]){
+                if($L.Tokens.Contains($t)){ $c = [int]$L.Tokens[$t] }
+            }
+            elseif($L.Tokens.PSObject.Properties[$t]){ $c = [int]$L.Tokens.$t }
+            $p = ([double]$c + $alpha) / ([double][int]$L.Total + $alpha * [double]$vocabSize)
+            $s += [double]$counts[$t] * [Math]::Log($p)
+        }
+        $scores[$ll] = $s
+    }
+    $maxScore = [double]::NegativeInfinity
+    foreach($ll in $labelNames){ if($scores[$ll] -gt $maxScore){ $maxScore = $scores[$ll] } }
+    $exps = @{}
+    $sum = 0.0
+    foreach($ll in $labelNames){
+        $e = [Math]::Exp($scores[$ll] - $maxScore)
+        $exps[$ll] = $e
+        $sum += $e
+    }
+    $ordered = @($labelNames | Sort-Object { -$exps[$_] }, { $_ })
+    $top = $ordered[0]
+    $second = $null
+    if($ordered.Count -ge 2){ $second = $ordered[1] }
+    $p1 = [double]$exps[$top] / $sum
+    $p2 = 0.0
+    if($second){ $p2 = [double]$exps[$second] / $sum }
+    $margin = $p1 - $p2
+    $labelFiles = 0
+    $L = Get-SysOrgLearnLabel -Model $Model -Name $top
+    if($L){ $labelFiles = [int]$L.Files }
+    # a model with a SINGLE label can never produce a meaningful margin (p1 = 1, p2 = 0)
+    # - such a prediction is never trusted, whatever its file count
+    $trusted = ($labelNames.Count -ge 2) -and ($labelFiles -ge $minFiles) -and ($margin -ge $minMargin)
+    return [pscustomobject]@{
+        Label=$top; Margin=[Math]::Round($margin, 4); Confidence=[Math]::Round($p1, 4)
+        LabelFiles=$labelFiles; Trusted=$trusted
+    }
 }
 
 function Show-SysOrgDecision {

@@ -45,6 +45,7 @@ param(
     [string]$Find,
     [string]$Explain,
     [switch]$Score,
+    [switch]$Learn,
     [int]$Parallelism = 0,
     [string]$Root
 )
@@ -550,6 +551,43 @@ if($Score){
     Show-SysOrgFindabilityScore -Score $s -Label ('organized tree ' + $scoreRoot) -Config $Config -WithTargets
     return
 }
+if($Learn){
+    # v3.0.1 B3: build (or refresh) the self-supervised model from the user's own
+    # curated folders and print what it learned and the labels it trusts.
+    $learnRoot = $null
+    if($Root){ $learnRoot = $Root }
+    else {
+        $learnLetter = if($ScanDrive -and @($ScanDrive).Count -gt 0){ ($ScanDrive[0].Trim().TrimEnd(':').ToUpper()) } else { 'C' }
+        try { $learnRoot = Get-SysOrgDestinationRoot -Letter $learnLetter -Config $Config } catch { $learnRoot = ('{0}:\_Organized' -f $learnLetter) }
+    }
+    Write-Host ("Building the learn model from your own folder structure (model: {0}\_Index\model.json) ..." -f $learnRoot) -ForegroundColor White
+    try { $lm = New-SysOrgLearnModel -Config $Config -DestinationRoot $learnRoot }
+    catch { Write-Host ("Learn failed: {0}" -f $_.Exception.Message) -ForegroundColor Red; return }
+    if($lm -and $lm.Model){
+        $minFiles = [int](Get-SysOrgSetting $Config 'Learn.MinFilesPerLabel' 5)
+        $labelNames = @(Get-SysOrgLearnLabelNames -Model $lm.Model)
+        Write-Host ("Learned {0} trusted label(s):" -f $labelNames.Count) -ForegroundColor Green
+        foreach($ll in $labelNames){
+            $L = Get-SysOrgLearnLabel -Model $lm.Model -Name $ll
+            $topTokens = @()
+            if($L.Tokens -is [hashtable] -or $L.Tokens -is [System.Collections.Specialized.OrderedDictionary]){
+                $topTokens = @($L.Tokens.Keys | Sort-Object { -[int]$L.Tokens[$_] }, { $_ } | Select-Object -First 8)
+            }
+            else { $topTokens = @($L.Tokens.PSObject.Properties | Sort-Object { -[int]$_.Value }, { $_.Name } | Select-Object -First 8 | ForEach-Object { $_.Name }) }
+            $trust = 'trusted'
+            if([int]$L.Files -lt $minFiles){ $trust = 'NOT trusted (too few files)' }
+            Write-Host ("  {0}: {1} training file(s) [{2}]" -f $ll, $L.Files, $trust)
+            Write-Host ("    top signals: {0}" -f ($topTokens -join ', ')) -ForegroundColor Gray
+        }
+        Write-Host ("Model fingerprint {0} ({1})." -f $lm.Fingerprint.Substring(0,12), $(if($lm.Rebuilt){ 'rebuilt' } else { 'unchanged - reused' })) -ForegroundColor Gray
+        Write-Host 'The model never moves anything by itself - it sharpens confidence and appears in -Explain.' -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host 'No trusted labels yet: the model needs folders with at least 5 files each' -ForegroundColor Yellow
+        Write-Host '(e.g. existing subfolders of Documents like Documents\Work or Documents\Personal).' -ForegroundColor Yellow
+    }
+    return
+}
 if($PSBoundParameters.ContainsKey('Find')){
     # v3.0 Phase 4.2: instant search over the catalog (falls back to a live scan)
     if([string]::IsNullOrWhiteSpace($Find)){ $Find = '*' }
@@ -586,6 +624,15 @@ if($Explain){
             KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
     }
     $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata
+    # v3.0.1 B3: -Explain includes the structure-model signal when a model exists
+    if(Get-SysOrgSetting $Config 'Learn.Enabled' $true){
+        try{
+            $explainRoot = $null
+            try { $explainRoot = Get-SysOrgDestinationRoot -Letter 'C' -Config $Config } catch { $explainRoot = 'C:\_Organized' }
+            $lmX = New-SysOrgLearnModel -Config $Config -DestinationRoot $explainRoot
+            if($lmX -and $lmX.Model){ $dec = Invoke-SysOrgClassifyPipeline -Path $Explain -Extension $ext -Category "$cat" -Config $Config -DriveProfile $profX -IncludeMetadata -LearnModel $lmX.Model }
+        } catch { }
+    }
     Show-SysOrgDecision -Decision $dec
     return
 }

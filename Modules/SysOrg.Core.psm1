@@ -267,6 +267,17 @@ function Import-SysOrgConfig {
         # ReviewConfidence plans with a 'review' flag in the preview, below
         # MinConfidence the file is left in place (or moved to _Review) and reported.
         Classify = @{ MinConfidence=0.40; ReviewConfidence=0.70 }
+        # v3.0.1 B3: self-supervised learning from the user's OWN curated folders.
+        # Labels come from existing subfolders of the known folders in scope (plus
+        # Learn.FromPaths); the naive Bayes model lives in <root>\_Index\model.json,
+        # is versioned by an input fingerprint, and is ONLY a confidence signal that
+        # appears in -Explain - it never moves anything by itself. Labels need at
+        # least MinFilesPerLabel (5) files and a posterior margin of MinMargin (0.5)
+        # to be trusted; generic labels are ignored.
+        Learn = @{ Enabled=$true; FromPaths=@(); MinFilesPerLabel=5; MinMargin=0.5
+                   MaxFilesPerLabel=500; MaxTokensPerLabel=2000
+                   GenericLabels=@('documents','downloads','pictures','videos','music','desktop',
+                                   'archive','archives','backup','misc','other','files','new folder','temp','tmp','unknown') }
         # v3.0 rules: UserRules are validated fail-closed at startup; learned rules are
         # NEVER applied unless ApplyLearned=$true (and they are flagged in the preview).
         # v3.0.1 A4: the source-bucket map is extensible via Rules\Sources.psd1
