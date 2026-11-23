@@ -309,6 +309,42 @@ function Invoke-SysOrgProfileFlow {
     Show-SysOrgDriveProfileReport -Profiles $profiles
     return $profiles
 }
+# ---------------------------------------------------------------------------
+# v3.0.2 D1: the plan picker's LIST. Option 5 shows the 10 newest plans BEFORE
+# prompting (number, id, drive, moves, age, executed status); an empty plans
+# folder says WHY instead of silently prompting for input that cannot match.
+# ---------------------------------------------------------------------------
+function Show-SysOrgPlanPickerList {
+    param([Parameter(Mandatory)][string]$PlansFolder,[int]$Top=10)
+    $list = @(Get-SysOrgPlanList -PlansFolder $PlansFolder -Top $Top)
+    if($list.Count -gt 0){
+        Write-Host ''
+        Write-Host ('Newest plans in {0}:' -f $PlansFolder) -ForegroundColor White
+        $i = 0
+        foreach($row in $list){
+            $i++
+            $status = if($row.Executed){ 'executed' } else { 'not executed' }
+            Write-Host ('  [{0}] {1}  drive {2}  {3} move(s)  {4}  [{5}]' -f $i, $row.PlanId, $row.Drive, $row.MoveCount, $row.Age, $status)
+        }
+    } else {
+        Write-Host ('No saved plans in {0}.' -f $PlansFolder) -ForegroundColor Yellow
+        Write-Host '  A plan is saved when a scan finishes - run option 3 (organize a drive) first.' -ForegroundColor Gray
+        Write-Host '  You can still type a plan id, a full plan path, or a folder.' -ForegroundColor Gray
+    }
+    return $list
+}
+
+# ---------------------------------------------------------------------------
+# v3.0.2 D2: the menu header shows the REAL version from the config - the old
+# hardcoded 'rev 2.1' stayed wrong through the whole 3.x line.
+# ---------------------------------------------------------------------------
+function Get-SysOrgDisplayVersion {
+    param($Config)
+    $v = "$(Get-SysOrgSetting $Config 'Version' '')"
+    if([string]::IsNullOrWhiteSpace($v)){ return '(config key Version missing)' }
+    return $v
+}
+
 function Invoke-SysOrgScanFlow {
     param([string]$Letter,[switch]$PreviewOnly,[switch]$WholeDrive,[switch]$NoCacheSwitch)
     # v3.0.1 D2: on Data/Removable drives FullDrive is never the silent default -
@@ -1324,7 +1360,7 @@ while($running){
     # can honestly say "Nothing was modified." until a flow sets the execute phase.
     $script:SysOrgPhase = 'preview'
     Write-Host ''
-    Write-Host '==== SysOrg - portable file organizer (preview-first) ====' -ForegroundColor White
+    Write-Host ('==== SysOrg v{0} - portable file organizer (preview-first) ====' -f (Get-SysOrgDisplayVersion -Config $Config)) -ForegroundColor White
     Write-Host ' [1] Profile drives (role, protected artifacts, known folders, writable scope)'
     Write-Host ' [2] Audit folders: which can / cannot be altered (safety map)'
     Write-Host ' [3] Organize a drive (profile -> scan -> plan -> preview -> optional execute)'
@@ -1356,18 +1392,8 @@ while($running){
                   }
                 }
             '5' {
-                  # v3.0.1 D1: the plan picker - 10 newest plans, accept a number, an id, a path, or a folder
-                  $list = @(Get-SysOrgPlanList -PlansFolder $folders.Plans -Top 10)
-                  if($list.Count -gt 0){
-                      Write-Host ''
-                      Write-Host 'Newest plans:' -ForegroundColor White
-                      $i = 0
-                      foreach($row in $list){
-                          $i++
-                          $status = if($row.Executed){ 'executed' } else { 'not executed' }
-                          Write-Host ('  [{0}] {1}  drive {2}  {3} move(s)  {4}  [{5}]' -f $i, $row.PlanId, $row.Drive, $row.MoveCount, $row.Age, $status)
-                      }
-                  }
+                  # v3.0.2 D1: the list (or the honest empty state) comes BEFORE the prompt
+                  $list = @(Show-SysOrgPlanPickerList -PlansFolder $folders.Plans -Top 10)
                   $p = Read-Host 'Plan (number, plan id, full path, or folder)'
                   $resolved = Resolve-SysOrgPlanChoice -Choice $p -PlansFolder $folders.Plans
                   if(-not $resolved){ Write-Host 'No matching plan found - nothing was modified.' -ForegroundColor Yellow; continue }
