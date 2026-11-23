@@ -363,6 +363,12 @@ function Get-SysOrgInventory {
     $stack = New-Object System.Collections.Stack
     foreach($startDir in $initial){ [void]$stack.Push([string]$startDir) }
     $count = 0
+    # v3.0.2 C2: the category map is resolved per DISTINCT extension, not per file
+    # (6,301-file corpus: ~30 distinct extensions instead of 6,301 function calls)
+    $extCatMemo = @{}
+    # v3.0.2 C2: with no exclusion rules at all, the per-file/per-directory matcher
+    # calls can never match - skip them entirely
+    $noExcludeRules = ($null -ne $exMatcher -and -not $exMatcher.HasRules)
     # v3.0.2 C1: every enumerated-and-accepted file is remembered so Removed counts
     # exactly the cached records whose file no longer exists
     $seenAll = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
@@ -420,10 +426,10 @@ function Get-SysOrgInventory {
             Add-SysOrgSkippedRoot -DirPath $dir -Reason 'contains a .sysorg-ignore marker'
             continue
         }
-        if($exMatcher){
+        if($exMatcher -and $exMatcher.HasRules){
             if(Test-SysOrgExcludedPathFast -Path $dir -Matcher $exMatcher){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'Excluded by configuration'; continue }
         } else {
-            if(Test-SysOrgExcludedPath -Path $dir -Config $Config){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'Excluded by configuration'; continue }
+            if(-not $noExcludeRules -and (Test-SysOrgExcludedPath -Path $dir -Config $Config)){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'Excluded by configuration'; continue }
         }
         if($excludeDest -and (Test-SysOrgDestinationPath -Path $dir -Config $Config)){ Add-SysOrgSkippedRoot -DirPath $dir -Reason 'SysOrg destination root'; continue }
 
@@ -523,7 +529,7 @@ function Get-SysOrgInventory {
                 # v3.0.1 C1: compiled name-regex fast path (identical semantics)
                 if($fileExRx){
                     if($fileExRx.IsMatch($fi.Name)){ continue }
-                } elseif(Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config){ continue }
+                } elseif((-not $noExcludeRules) -and (Test-SysOrgExcludedFile -Path $fi.FullName -Config $Config)){ continue }
                 # Attribute flags are compared as raw ints: on Windows PowerShell 5.1
                 # casting an int like 0x400020 to [System.IO.FileAttributes] throws
                 # (that value is not defined in the .NET Framework enum).
@@ -572,7 +578,15 @@ function Get-SysOrgInventory {
                     continue
                 }
                 $ext = $fi.Extension.ToLowerInvariant()
-                $category = Get-SysOrgCategory -Extension $ext -Config $Config
+                # v3.0.2 C2: one map lookup per DISTINCT extension instead of one
+                # function call per file - identical results (memo keyed by the same
+                # lowercase extension Get-SysOrgCategory normalizes to)
+                if($extCatMemo.ContainsKey($ext)){
+                    $category = $extCatMemo[$ext]
+                } else {
+                    $category = Get-SysOrgCategory -Extension $ext -Config $Config
+                    $extCatMemo[$ext] = $category
+                }
                 # v2.1.1: '.ts' maps to Code (TypeScript), but a real MPEG transport stream
                 # (sync bytes 0x47 at 0 and 188) routes to Videos. Sniffed only here, after
                 # the placeholder/reparse gates, so cloud files are never opened.

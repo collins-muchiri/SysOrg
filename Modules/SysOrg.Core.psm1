@@ -553,6 +553,7 @@ function Write-SysOrgLog {
 # 0xA000000C, and the cloud family 0x90000000-0x9000F001 (OneDrive cloud files).
 # ---------------------------------------------------------------------------
 $script:SysOrgReparseTagMocks = @{}
+$script:SysOrgReparseEnvMockCache = @{ Parsed=$false; Raw=''; Pairs=@() }
 
 if(-not ('SysOrg.NativeFind' -as [type])){
     try{
@@ -620,21 +621,32 @@ function Get-SysOrgReparseTag {
     $key = ("$Path").TrimEnd('\').TrimEnd('/').ToLowerInvariant()
     # 1) in-process mocks (unit tests)
     if($script:SysOrgReparseTagMocks.ContainsKey($key)){ return [uint32]$script:SysOrgReparseTagMocks[$key] }
-    # 2) environment mocks (child-process smoke runs)
+    # 2) environment mocks (child-process smoke runs) - parsed ONCE per distinct env
+    # value (v3.0.2 C2: the walk resolves a directory's tag on every directory, so a
+    # per-call split of the env string was measurable)
     $envMock = $env:SYSORG_REPARSE_MOCK
     if(-not [string]::IsNullOrWhiteSpace($envMock)){
-        foreach($pair in ($envMock -split ';')){
-            if([string]::IsNullOrWhiteSpace("$pair")){ continue }
-            $idx = "$pair".LastIndexOf('=')
-            if($idx -lt 1){ continue }
-            $mp = ("$pair".Substring(0,$idx)).Trim().TrimEnd('\').TrimEnd('/').ToLowerInvariant()
-            if($mp -ieq $key){
+        $mc = $script:SysOrgReparseEnvMockCache
+        if((-not $mc.Parsed) -or ("$($mc.Raw)" -cne $envMock)){
+            $pairs = New-Object System.Collections.Generic.List[object]
+            foreach($pair in ($envMock -split ';')){
+                if([string]::IsNullOrWhiteSpace("$pair")){ continue }
+                $idx = "$pair".LastIndexOf('=')
+                if($idx -lt 1){ continue }
+                $mp = ("$pair".Substring(0,$idx)).Trim().TrimEnd('\').TrimEnd('/').ToLowerInvariant()
                 $raw = ("$pair".Substring($idx+1)).Trim()
+                $tagVal = $null
                 try {
-                    if($raw -match '^(?i:0x)?([0-9A-Fa-f]{1,8})$'){ return [uint32][Convert]::ToUInt32($Matches[1], 16) }
-                    return [uint32][Convert]::ToUInt32($raw)
-                } catch { return $null }
+                    if($raw -match '^(?i:0x)?([0-9A-Fa-f]{1,8})$'){ $tagVal = [uint32][Convert]::ToUInt32($Matches[1], 16) }
+                    else { $tagVal = [uint32][Convert]::ToUInt32($raw) }
+                } catch { $tagVal = $null }
+                if($null -ne $tagVal){ [void]$pairs.Add([pscustomobject]@{ Key=$mp; Tag=$tagVal }) }
             }
+            $script:SysOrgReparseEnvMockCache = @{ Raw=$envMock; Parsed=$true; Pairs=$pairs }
+            $mc = $script:SysOrgReparseEnvMockCache
+        }
+        foreach($pr in $mc.Pairs){
+            if($pr.Key -ieq $key){ return [uint32]$pr.Tag }
         }
     }
     # 3) the real tag (Windows only)
@@ -1118,9 +1130,13 @@ function New-SysOrgExclusionMatcher {
         try { $wildRegex = [regex]::new(('^(' + ($wildcards -join '|') + ')(\\|$)'), 'IgnoreCase') } catch { $wildRegex = $null }
     }
     $appRoot = Get-SysOrgSetting $Config 'AppRoot' $null
+    # v3.0.2 C2: when the config has NO exclusion rules at all, the walk skips the
+    # per-file/per-directory matcher calls entirely (they could never match)
+    $hasRules = ($exact.Count -gt 0) -or ($wildcards.Count -gt 0) -or ($segments.Count -gt 0) -or (-not [string]::IsNullOrWhiteSpace("$appRoot"))
     return [pscustomobject]@{
         Exact=$exact; WildRegex=$wildRegex; Segments=$segments
         AppRoot=$(if($appRoot){ ("$appRoot").TrimEnd('\') } else { $null })
+        HasRules=$hasRules
     }
 }
 
