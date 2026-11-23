@@ -262,7 +262,10 @@ function Import-SysOrgConfig {
         # are NEVER dumped into a junk folder. Mode='Report' lists them in the plan's
         # "needs a decision" section and leaves them in place; Mode='Move' files them
         # under <root>\_Review\<Year> (still previewed + undoable like any move).
-        Review = @{ Mode='Report'; FolderName='_Review' }
+        # v3.0.1 B6: InteractiveThreshold - when MORE than this share of the planned
+        # moves sits below Classify.ReviewConfidence, the plan is not a ready-to-
+        # execute default and the interactive [A]/[R]/[S]/[N] review runs instead.
+        Review = @{ Mode='Report'; FolderName='_Review'; InteractiveThreshold=0.5 }
         # v3.0 confidence gating: >= ReviewConfidence plans normally, MinConfidence..
         # ReviewConfidence plans with a 'review' flag in the preview, below
         # MinConfidence the file is left in place (or moved to _Review) and reported.

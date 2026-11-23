@@ -124,6 +124,108 @@ function Confirm-SysOrgStrict {
     $a = Read-Host "$Prompt (type 'yes' to confirm)"
     return ($a -ieq 'yes')
 }
+function Invoke-SysOrgReviewFlow {
+<#
+.SYNOPSIS
+    v3.0.1 B6: the interactive review when MOST planned moves are below the review
+    threshold. The plan is NOT presented as a ready-to-execute default.
+.DESCRIPTION
+    Offers [A] approve only confident moves (>= Classify.ReviewConfidence),
+    [R] review the low-confidence moves one by one (accept / skip / set destination -
+    a chosen destination is saved as a learned rule, inert until Rules.ApplyLearned),
+    [S] skip all uncertain files (they stay in place), [N] cancel.
+    Returns $true when a (possibly filtered) plan was saved and execution may proceed;
+    $false to abort. The plan object is mutated in place (actions removed / destinations
+    set) and re-saved by the caller so the integrity hash is recomputed.
+#>
+    param([Parameter(Mandatory)]$Plan,[Parameter(Mandatory)][string]$PlansFolder,$Config)
+    $revConf = [double](Get-SysOrgSetting $Config 'Classify.ReviewConfidence' 0.70)
+    $lowCount = 0
+    foreach($a in @($Plan.Actions)){
+        if("$($a.Action)" -ne 'Move'){ continue }
+        if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
+        if($a.PSObject.Properties['Confidence'] -and ($null -ne $a.Confidence) -and ([double]$a.Confidence -lt $revConf)){ $lowCount++ }
+    }
+    Write-Host ''
+    Write-Host ('NOT READY TO EXECUTE AS-IS: {0} of the planned moves are below the review threshold ({1}).' -f $lowCount, $revConf) -ForegroundColor Yellow
+    Write-Host '  [A] approve only the confident moves (confidence >= {0})' -f $revConf -ForegroundColor White
+    Write-Host '  [R] review the low-confidence moves one by one (accept / skip / set destination)' -ForegroundColor White
+    Write-Host '  [S] skip ALL uncertain files (they stay in place)' -ForegroundColor White
+    Write-Host '  [N] cancel - nothing is modified' -ForegroundColor White
+    $choice = (Read-Host 'Choice').Trim().ToUpper()
+    $rulesPath = ''
+    try { $rulesPath = ((Get-SysOrgDestinationRoot -Letter ("$($Plan.Drive)".TrimEnd(':')) -Config $Config) + '\_Index\LearnedRules.psd1') } catch { $rulesPath = '' }
+
+    if($choice -eq 'A'){
+        $planNew = Get-SysOrgPlanFiltered -Plan $Plan -ConfidenceFloor $revConf
+        $Plan.Actions = $planNew.Actions
+        Write-Host ('Approved {0} confident move(s); {1} uncertain file(s) stay in place.' -f @($Plan.Actions).Count, $lowCount) -ForegroundColor Green
+        return $true
+    }
+    if($choice -eq 'S'){
+        $planNew = Get-SysOrgPlanFiltered -Plan $Plan -ConfidenceFloor $revConf
+        $Plan.Actions = $planNew.Actions
+        Write-Host ('All uncertain files skipped - they stay in place. {0} confident move(s) remain.' -f @($Plan.Actions).Count) -ForegroundColor Green
+        return $true
+    }
+    if($choice -eq 'R'){
+        $kept = New-Object System.Collections.Generic.List[object]
+        $lowMoves = @(@($Plan.Actions) | Where-Object {
+            ("$($_.Action)" -eq 'Move') -and (-not ($_.PSObject.Properties['Kind'] -and "$($_.Kind)" -eq 'Folder')) -and
+            ($_.PSObject.Properties['Confidence']) -and ($null -ne $_.Confidence) -and ([double]$_.Confidence -lt $revConf) })
+        $index = 0
+        foreach($a in @($Plan.Actions)){
+            $isLow = $false
+            if($lowMoves -contains $a){ $isLow = $true }
+            if(-not $isLow){ [void]$kept.Add($a); continue }
+            $index++
+            Write-Host ''
+            Write-Host ('[{0}/{1}] {2}' -f $index, $lowMoves.Count, $a.Source) -ForegroundColor White
+            $reasonTxt = ''
+            if($a.PSObject.Properties['ConfidenceReason'] -and "$($a.ConfidenceReason)"){ $reasonTxt = ('  reason: ' + $a.ConfidenceReason) }
+            Write-Host ('    -> {0}   [confidence {1}]{2}' -f $a.Destination, $a.Confidence, $reasonTxt) -ForegroundColor Gray
+            $sub = (Read-Host '    [a]ccept / [s]kip / [d]estination / [q]uit-cancel').Trim().ToLower()
+            if($sub -eq 'a'){ [void]$kept.Add($a); continue }
+            if($sub -eq 's'){ continue }
+            if($sub -eq 'd'){
+                $leaf = (Read-Host '    destination leaf (relative to the destination root, e.g. Documents\Work)').Trim()
+                if(Test-SysOrgReviewDestinationPath -Leaf $leaf){
+                    $newDest = ((($Plan.DestinationRoot).TrimEnd('\')) + '\' + ($leaf.Replace('/','\').Trim('\')) + '\' + (Split-Path $a.Source -Leaf))
+                    $a.Destination = $newDest
+                    $a.Reason = ('Review: you chose the destination (was: {0})' -f $a.Reason)
+                    [void]$kept.Add($a)
+                    # save the correction as a learned rule - inert until Rules.ApplyLearned = $true
+                    if($rulesPath){
+                        try{
+                            $stem = [System.IO.Path]::GetFileNameWithoutExtension($a.Source)
+                            $tokens = @([regex]::Matches($stem, '[A-Za-z0-9]{3,}') | ForEach-Object { "$($_.Value)" })
+                            $longest = ''
+                            foreach($t in $tokens){ if($t.Length -gt $longest.Length){ $longest = $t } }
+                            if($longest){
+                                $leafTemplate = ($leaf.Replace('/','\').Trim('\'))
+                                [void](Save-SysOrgLearnedRule -Path $rulesPath -Name ('review-' + $longest.ToLower()) `
+                                    -NameRegex ('(?i)' + [regex]::Escape($longest)) -Destination ($leafTemplate + '\{Year}'))
+                                Write-Host '    Saved as a learned rule (applies only after Rules.ApplyLearned = $true).' -ForegroundColor DarkGray
+                            }
+                        } catch { Write-Host ("    Rule save failed (the move itself is kept): {0}" -f $_.Exception.Message) -ForegroundColor DarkYellow }
+                    }
+                    continue
+                }
+                Write-Host '    Invalid destination leaf - the file is SKIPPED (stays in place).' -ForegroundColor Yellow
+                continue
+            }
+            if($sub -eq 'q'){ Write-Host 'Review cancelled. Nothing was modified.' -ForegroundColor Yellow; return $false }
+            Write-Host '    Unknown choice - the file is SKIPPED (stays in place).' -ForegroundColor Yellow
+            continue
+        }
+        $Plan.Actions = $kept.ToArray()
+        Write-Host ('Review complete: {0} move(s) remain.' -f @($Plan.Actions).Count) -ForegroundColor Green
+        return $true
+    }
+    Write-Host 'Nothing was modified.' -ForegroundColor Yellow
+    return $false
+}
+
 function Get-SysOrgLetterInput {
     param([string]$Prompt='Drive letter')
     do { $l = (Read-Host $Prompt).Trim().TrimEnd(':').ToUpper() } while(-not ($l -match '^[A-Z]$'))
@@ -248,6 +350,18 @@ function Invoke-SysOrgScanFlow {
     if($scoreDelta){ Show-SysOrgScoreDelta -Delta $scoreDelta }
     $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $folders.Plans
     Write-Host ("Plan saved: {0}" -f $planPath) -ForegroundColor Green
+    # v3.0.1 B6: when more than half of the planned moves are below the review
+    # threshold the plan is NOT a ready-to-execute default - run the review flow
+    # ([A] approve confident / [R] one by one / [S] skip uncertain / [N] cancel).
+    if(Test-SysOrgPlanNeedsReview -Plan $plan -Config $Config){
+        if(-not (Invoke-SysOrgReviewFlow -Plan $plan -PlansFolder $folders.Plans -Config $Config)){
+            return
+        }
+        # re-save: the review may have filtered actions or set destinations - the
+        # integrity hash must cover exactly what will execute
+        $planPath = Save-SysOrgPlan -Plan $plan -PlansFolder $folders.Plans
+        Write-Host ("Plan updated after review: {0}" -f $planPath) -ForegroundColor Green
+    }
     if($PreviewOnly){ return }
     # W8: the confirmation prompt names the OneDrive sync-out count
     $prompt = 'Execute this plan now (files will be moved)?'

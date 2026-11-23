@@ -931,3 +931,105 @@ Describe 'User collections: one unit, structure intact (v3.0.1 B2)' {
         @($plan.Actions).Count | Should -Be 0
     }
 }
+
+Describe 'Review experience: honest reasons, thresholds and filtering (v3.0.1 B6)' {
+
+    It 'a plan where more than half of the moves are low-confidence NEEDS review' {
+        $actions = @()
+        foreach($i in 1..6){
+            $actions += [pscustomobject]@{ Action='Move'; Kind='File'; Source=("C:\s\m$i.bin"); Destination=("C:\o\m$i.bin")
+                Confidence=0.3; ReviewFlag=$true; SizeBytes=[long]1 }
+        }
+        foreach($i in 1..4){
+            $actions += [pscustomobject]@{ Action='Move'; Kind='File'; Source=("C:\s\h$i.txt"); Destination=("C:\o\h$i.txt")
+                Confidence=0.9; ReviewFlag=$false; SizeBytes=[long]1 }
+        }
+        $plan = [pscustomobject]@{ PlanId='plan-rev'; Actions=$actions; NeedsDecision=@(); DestinationRoot='C:\Organized' }
+        $cfg = @{ Classify=@{ ReviewConfidence=0.70 }; Review=@{ InteractiveThreshold=0.5 } }
+        (Test-SysOrgPlanNeedsReview -Plan $plan -Config $cfg) | Should -BeTrue
+        # a majority of confident moves does NOT need review
+        $ok = [pscustomobject]@{ PlanId='plan-ok'; Actions=@($actions | Where-Object { $_.Confidence -ge 0.7 }); NeedsDecision=@(); DestinationRoot='C:\Organized' }
+        (Test-SysOrgPlanNeedsReview -Plan $ok -Config $cfg) | Should -BeFalse
+    }
+
+    It 'folder units, quarantines and undecided actions are excluded from the review share' {
+        $actions = @(
+            [pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\s\a.bin'; Destination='C:\o\a.bin'; Confidence=0.3 },
+            [pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\s\b.txt'; Destination='C:\o\b.txt'; Confidence=0.9 },
+            [pscustomobject]@{ Action='Move'; Kind='Folder'; Source='C:\s\UNDP'; Destination='C:\o\Documents\Work\UNDP'; Confidence=0.9 },
+            [pscustomobject]@{ Action='Quarantine'; Kind='File'; Source='C:\s\c.bin'; Destination='C:\o\_Duplicates\c.bin'; Confidence=0.3 }
+        )
+        $plan = [pscustomobject]@{ PlanId='plan-rev2'; Actions=$actions; NeedsDecision=@(); DestinationRoot='C:\Organized' }
+        $cfg = @{ Classify=@{ ReviewConfidence=0.70 }; Review=@{ InteractiveThreshold=0.5 } }
+        # decided file moves: 1 low of 2 = exactly 50% -> NOT more than half -> no review
+        (Test-SysOrgPlanNeedsReview -Plan $plan -Config $cfg) | Should -BeFalse
+    }
+
+    It '[A]/[S] filtering keeps confident moves, folder units and quarantines, drops uncertain ones' {
+        $actions = @(
+            [pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\s\high.txt'; Destination='C:\o\high.txt'; Confidence=0.9 },
+            [pscustomobject]@{ Action='Move'; Kind='File'; Source='C:\s\low.bin'; Destination='C:\o\low.bin'; Confidence=0.4 },
+            [pscustomobject]@{ Action='Move'; Kind='Folder'; Source='C:\s\UNDP'; Destination='C:\o\Documents\Work\UNDP'; Confidence=0.6 },
+            [pscustomobject]@{ Action='Quarantine'; Kind='File'; Source='C:\s\dup.bin'; Destination='C:\o\_Duplicates\dup.bin'; Confidence=0.4 }
+        )
+        $plan = [pscustomobject]@{ PlanId='plan-filt'; Drive='C:'; DestinationRoot='C:\Organized'; Actions=$actions; NeedsDecision=@(); Skipped=@(); Warnings=@() }
+        $f = Get-SysOrgPlanFiltered -Plan $plan -ConfidenceFloor 0.70
+        $srcs = @($f.Actions | ForEach-Object { $_.Source })
+        ($srcs -contains 'C:\s\high.txt') | Should -BeTrue
+        ($srcs -contains 'C:\s\low.bin') | Should -BeFalse
+        ($srcs -contains 'C:\s\UNDP') | Should -BeTrue          # folder units survive
+        ($srcs -contains 'C:\s\dup.bin') | Should -BeTrue       # quarantines survive
+        @($f.Actions).Count | Should -Be 3
+        # the filtered plan saves with a valid integrity hash and executes
+        $fPath = Save-SysOrgPlan -Plan $f -PlansFolder (Join-Path $TestDrive 'revplans')
+        { $null = Get-Content -LiteralPath $fPath -Raw | ConvertFrom-Json } | Should -Not -Throw
+        $saved = Get-Content -LiteralPath $fPath -Raw | ConvertFrom-Json
+        $expected = Get-SysOrgPlanIntegrityHash -Actions $saved.Actions
+        "$($saved.IntegrityHash)" | Should -Be "$expected"
+    }
+
+    It 'the honest confidence reason is stored on actions and shown for review-flagged moves' {
+        $work = Join-Path $TestDrive ('b6-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $srcRoot = Join-Path $work 'src'
+        New-Item -ItemType Directory -Path $srcRoot -Force | Out-Null
+        $inv = @()
+        foreach($i in 1..3){
+            $p = Join-Path $srcRoot ("loose note $i.txt"); Set-Content -LiteralPath $p -Value 'unrelated plain text' -Encoding UTF8
+            $inv += [pscustomobject]@{ FullName=$p; Name="loose note $i.txt"; Stem="loose note $i"; Extension='.txt'
+                Length=[long]20; LastWriteTime=(Get-Date '2026-01-05'); Directory=$srcRoot; Category='Documents' }
+        }
+        $prof = [pscustomobject]@{ Letter='T'; Root='T:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $cfg = @{ OrganizedRoots=@{ 'T' = (Join-Path $work 'org') }; ExcludedPaths=@(); ExcludedFilePatterns=@()
+                  SkipHiddenSystemFiles=$true; ExcludeDestinations=$true; PreserveExistingFolders=$false
+                  Copies=@{Policy='NumberCopies';StartIndex=2;MinFileSizeKB=1}; Families=@{Enabled=$false}
+                  Downloads=@{UseZoneIdentifier=$false}; FolderAudit=@{Enabled=$false}; DateFolders='Year'
+                  LayoutProfile='Findable'; TypeMap=@{}; Classify=@{ MinConfidence=0.40; ReviewConfidence=0.70 } }
+        $plan = New-SysOrgPlan -Letter T -Inventory $inv -DriveProfile $prof -DupGroups @() -Config $cfg -KnownFolders @()
+        @($plan.Actions).Count | Should -Be 3
+        foreach($a in @($plan.Actions)){
+            "$($a.ConfidenceReason)" | Should -Be 'no lexicon match, extension only'
+            [double]$a.Confidence | Should -Be 0.5
+        }
+        # the reason helper maps the other decision kinds honestly
+        $d = [pscustomobject]@{ RuleId='user:taxes'; Gate=$null; Subtype='General'; Category='Documents'; Confidence=1.0 }
+        (Get-SysOrgDecisionReason -Decision $d) | Should -Be "matched your rule 'taxes'"
+        $d2 = [pscustomobject]@{ RuleId='lexicon'; Gate=$null; Subtype='Work'; Category='Documents'; Confidence=0.8 }
+        (Get-SysOrgDecisionReason -Decision $d2) | Should -Be 'lexicon match: Work'
+        $d3 = [pscustomobject]@{ RuleId='model'; Gate=$null; Subtype='General'; Category='Documents'; Confidence=0.8 }
+        (Get-SysOrgDecisionReason -Decision $d3) | Should -Match 'structure model'
+        $d4 = [pscustomobject]@{ RuleId='default'; Gate=$null; Subtype='Media'; Category='Videos'; Confidence=0.8 }
+        (Get-SysOrgDecisionReason -Decision $d4) | Should -Be 'media type from extension/metadata only'
+    }
+
+    It 'the review destination validator accepts relative leaves only' {
+        (Test-SysOrgReviewDestinationPath -Leaf 'Documents\Work') | Should -BeTrue
+        (Test-SysOrgReviewDestinationPath -Leaf 'Documents/Work') | Should -BeTrue   # slashes normalize
+        (Test-SysOrgReviewDestinationPath -Leaf 'Invoices') | Should -BeTrue
+        (Test-SysOrgReviewDestinationPath -Leaf '') | Should -BeFalse
+        (Test-SysOrgReviewDestinationPath -Leaf '..\System32') | Should -BeFalse
+        (Test-SysOrgReviewDestinationPath -Leaf 'Documents\..\..') | Should -BeFalse
+        (Test-SysOrgReviewDestinationPath -Leaf 'C:\Windows') | Should -BeFalse       # the leaf is relative to the plan root
+        (Test-SysOrgReviewDestinationPath -Leaf 'a\b') | Should -BeTrue
+    }
+}

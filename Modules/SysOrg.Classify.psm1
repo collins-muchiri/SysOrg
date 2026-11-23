@@ -1371,6 +1371,34 @@ function Get-SysOrgLearnPrediction {
     }
 }
 
+function Get-SysOrgDecisionReason {
+<#
+.SYNOPSIS
+    An honest, short reason for a Decision's confidence (v3.0.1 B6 review experience).
+.DESCRIPTION
+    'no lexicon match, extension only' instead of a bare 'conf 0.5'. Pure function
+    of the Decision record; used by the plan preview and the interactive review.
+.EXAMPLE
+    Get-SysOrgDecisionReason -Decision $d   # -> 'no lexicon match, extension only'
+#>
+    [CmdletBinding()]
+    param([AllowNull()]$Decision)
+    if(-not $Decision){ return 'no classification decision' }
+    if($Decision.PSObject.Properties['Gate'] -and $Decision.Gate){ return ('gated: ' + "$($Decision.Gate)") }
+    $rid = "$($Decision.RuleId)"
+    if($rid -like 'user:*'){ return ("matched your rule '{0}'" -f $rid.Substring(5)) }
+    if($rid -like 'learned:*'){ return ("matched learned rule '{0}'" -f $rid.Substring(8)) }
+    if($rid -eq 'lexicon+model'){ return ('lexicon match ({0}) + structure model agree' -f "$($Decision.Subtype)") }
+    if($rid -eq 'model'){ return 'structure model (learned from your own folders)' }
+    if($rid -eq 'lexicon'){ return ('lexicon match: {0}' -f "$($Decision.Subtype)") }
+    if($rid -eq 'default'){
+        if(@('Documents','Spreadsheets','Databases') -contains "$($Decision.Category)"){ return 'no lexicon match, extension only' }
+        if(@('Pictures','Videos','Music','Audio','Images') -contains "$($Decision.Category)"){ return 'media type from extension/metadata only' }
+        return ('type routing only ({0})' -f "$($Decision.Category)")
+    }
+    return ('classified by {0}' -f $rid)
+}
+
 function Show-SysOrgDecision {
 <#
 .SYNOPSIS

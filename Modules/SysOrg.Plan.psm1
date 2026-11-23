@@ -577,11 +577,13 @@ function New-SysOrgPlan {
             # v2.1.1: capture plan-time metadata so the executor can detect a source that
             # changed between planning and execution. Stored as a round-trip-safe UTC string.
             # v3.0: Decision provenance rides along (confidence, rule, review flag).
-            $decConf = $null; $decRule = $null; $decReview = $false
+            $decConf = $null; $decRule = $null; $decReview = $false; $decReason = ''
             if($decOf.ContainsKey($src)){
                 $decConf = $decOf[$src].Confidence
                 $decRule = $decOf[$src].RuleId
                 $decReview = (@($decOf[$src].Flags) -contains 'review')
+                # v3.0.1 B6: the honest REASON for the score, not just the number
+                try { $decReason = Get-SysOrgDecisionReason -Decision $decOf[$src] } catch { $decReason = '' }
             }
             $actions.Add([pscustomobject]@{
                 Action='Move'; Kind='File'; Source=$src; Destination=$dest; DestRoot=$destRoot
@@ -591,6 +593,7 @@ function New-SysOrgPlan {
                 PlannedLastWriteTimeUtc=([datetime]$f.LastWriteTime).ToUniversalTime().ToString('o')
                 OneDriveSyncOut=$syncOut; OneDriveIntoCloud=$intoCloud
                 Confidence=$decConf; RuleId=$decRule; ReviewFlag=$decReview
+                ConfidenceReason=$decReason
             })
             $actionFolderBySrc[$src] = $destFolder
         } catch {
@@ -1407,6 +1410,13 @@ function Show-SysOrgPlan {
     if($reviewMoves.Count -gt 0){
         Write-Host ''
         Write-Host ("Review-flagged moves (confidence below {0}): {1} - planned, but worth a look" -f 0.70, $reviewMoves.Count) -ForegroundColor Yellow
+        # v3.0.1 B6: show the REASON for each low score, not just the number
+        foreach($rm in ($reviewMoves | Select-Object -First 8)){
+            $reasonTxt = ''
+            if($rm.PSObject.Properties['ConfidenceReason'] -and "$($rm.ConfidenceReason)"){ $reasonTxt = ('  - ' + $rm.ConfidenceReason) }
+            Write-Host ('  conf {0}  {1}{2}' -f $rm.Confidence, $rm.Source, $reasonTxt) -ForegroundColor DarkYellow
+        }
+        if($reviewMoves.Count -gt 8){ Write-Host ('  ... and {0} more review-flagged moves' -f ($reviewMoves.Count - 8)) -ForegroundColor DarkGray }
     }
     if($Plan.PSObject.Properties['NeedsDecision'] -and @($Plan.NeedsDecision).Count -gt 0){
         Write-Host ''
@@ -2061,6 +2071,91 @@ function New-SysOrgLayoutMigrationPlan {
         ProvenanceFile  = ''
         Stats           = [pscustomobject]@{ Scanned=$files.Count; Routed=$actions.Count }
     }
+}
+
+function Test-SysOrgPlanNeedsReview {
+<#
+.SYNOPSIS
+    True when MORE THAN HALF of the planned moves are below the review threshold (v3.0.1 B6).
+.DESCRIPTION
+    Denominator: planned FILE moves that carry a confidence (the classification
+    decisions). Folder units, quarantines and numbered copies are excluded - they
+    are not confidence decisions. Threshold: Classify.ReviewConfidence (0.70);
+    share: Review.InteractiveThreshold (0.5). When this returns $true the plan must
+    NOT be presented as a ready-to-execute default - the interactive review offers
+    [A]/[R]/[S]/[N] instead.
+.EXAMPLE
+    Test-SysOrgPlanNeedsReview -Plan $plan -Config $cfg   # -> $true
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan,$Config)
+    $revConf = [double](Get-SysOrgSetting $Config 'Classify.ReviewConfidence' 0.70)
+    $share = [double](Get-SysOrgSetting $Config 'Review.InteractiveThreshold' 0.5)
+    $decided = New-Object System.Collections.Generic.List[object]
+    foreach($a in @($Plan.Actions)){
+        if("$($a.Action)" -ne 'Move'){ continue }
+        if($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder'){ continue }
+        if(-not ($a.PSObject.Properties['Confidence']) -or ($null -eq $a.Confidence)){ continue }
+        [void]$decided.Add($a)
+    }
+    if($decided.Count -eq 0){ return $false }
+    $low = 0
+    foreach($a in $decided){ if([double]$a.Confidence -lt $revConf){ $low++ } }
+    return (($low / $decided.Count) -gt $share)
+}
+
+function Get-SysOrgPlanFiltered {
+<#
+.SYNOPSIS
+    A copy of the plan with only the actions at/above a confidence floor (v3.0.1 B6).
+.DESCRIPTION
+    Used by the review options [A] (approve only confident moves) and [S] (skip all
+    uncertain files). Folder moves, quarantines and actions WITHOUT a confidence
+    (legacy plans, collection units) are always kept - the floor filters confidence
+    decisions only. The returned plan carries the same metadata; re-saving it
+    recomputes the integrity hash, so the executor accepts it.
+.EXAMPLE
+    $filtered = Get-SysOrgPlanFiltered -Plan $plan -ConfidenceFloor 0.70
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Plan,[Parameter(Mandatory)][double]$ConfidenceFloor)
+    $kept = New-Object System.Collections.Generic.List[object]
+    foreach($a in @($Plan.Actions)){
+        $isFolder = ($a.PSObject.Properties['Kind'] -and "$($a.Kind)" -eq 'Folder')
+        $isQuarantine = ("$($a.Action)" -eq 'Quarantine')
+        $hasConf = ($a.PSObject.Properties['Confidence'] -and ($null -ne $a.Confidence))
+        if($isFolder -or $isQuarantine -or (-not $hasConf) -or ([double]$a.Confidence -ge $ConfidenceFloor)){
+            [void]$kept.Add($a)
+        }
+    }
+    $copy = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach($prop in $Plan.PSObject.Properties){
+        if($prop.Name -eq 'Actions'){ continue }
+        $copy[$prop.Name] = $prop.Value
+    }
+    $copy['Actions'] = $kept.ToArray()
+    return [pscustomobject]$copy
+}
+
+function Test-SysOrgReviewDestinationPath {
+<#
+.SYNOPSIS
+    Validates a user-typed destination LEAF for the review flow (v3.0.1 B6).
+.DESCRIPTION
+    The leaf is RELATIVE to the plan's destination root: non-empty, no '.'/'..'
+    segments, no drive qualifier, no leading/trailing separators, no empty segments.
+.EXAMPLE
+    Test-SysOrgReviewDestinationPath -Leaf 'Documents\Work'   # -> $true
+#>
+    [CmdletBinding()]
+    param([string]$Leaf)
+    if([string]::IsNullOrWhiteSpace("$Leaf")){ return $false }
+    $l = ("$Leaf").Replace('/','\').Trim('\')
+    if([string]::IsNullOrWhiteSpace($l)){ return $false }
+    if($l -match '(^|\\)\.{1,2}(\\|$)'){ return $false }
+    if($l -match '^[A-Za-z]:'){ return $false }
+    foreach($seg in @($l.Split('\'))){ if([string]::IsNullOrWhiteSpace($seg)){ return $false } }
+    return $true
 }
 
 function Undo-SysOrgPlan {
