@@ -345,6 +345,26 @@ function Get-SysOrgDisplayVersion {
     return $v
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 D4: when a plan cannot be built, the user gets the cause in ONE line,
+# the log path (A1 already logged the full diagnostic) and an immediate offer
+# to create the -Diagnostics support bundle.
+# ---------------------------------------------------------------------------
+function Offer-SysOrgDiagnosticsBundle {
+    param([string]$Cause,[string]$LogPath)
+    Write-Host ("Plan could not be built: {0}" -f "$Cause") -ForegroundColor Red
+    Write-Host 'Nothing was modified.' -ForegroundColor Yellow
+    if($LogPath){ Write-Host ("  Full diagnostic: {0}" -f $LogPath) -ForegroundColor DarkYellow }
+    try {
+        $yn = Read-Host 'Create a diagnostics bundle now (versions, config hash, log tail, last error)? (y/n)'
+        if("$yn".Trim() -match '^(y|yes)$'){
+            $bundlePath = Invoke-SysOrgDiagnosticsBundle
+            Write-Host ("Diagnostics bundle written: {0}" -f $bundlePath) -ForegroundColor Green
+            Write-Host 'Attach this file when asking for support.' -ForegroundColor DarkGray
+        }
+    } catch { Write-Verbose "Diagnostics bundle offer failed: $($_.Exception.Message)" }
+}
+
 function Invoke-SysOrgScanFlow {
     param([string]$Letter,[switch]$PreviewOnly,[switch]$WholeDrive,[switch]$NoCacheSwitch)
     # v3.0.1 D2: on Data/Removable drives FullDrive is never the silent default -
@@ -569,7 +589,16 @@ function Invoke-SysOrgScanFlow {
     if($reusePlanPath){
         Write-Host ("Reusing existing plan {0} (identical scan inputs - nothing was re-planned)." -f $plan.PlanId) -ForegroundColor Cyan
     } else {
-        $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries -SkippedScanRoots $skippedScanRoots
+        # v3.0.2 D4: a plan that cannot be built reports the cause in one line,
+        # points at the log and offers the diagnostics bundle - it does NOT crash
+        # into the generic catch-all with no context.
+        try {
+            $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries -SkippedScanRoots $skippedScanRoots
+        } catch {
+            $planFailLog = Write-SysOrgErrorDiagnostic -ErrorRecord $_ -LogFolder $logFolder -Phase $script:SysOrgPhase
+            Offer-SysOrgDiagnosticsBundle -Cause $_.Exception.Message -LogPath $planFailLog
+            return
+        }
     }
     Stop-SysOrgPhase $swPlan 'plan'
     # persist the updated file-state cache (best effort - it is a performance cache)

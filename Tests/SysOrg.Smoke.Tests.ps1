@@ -44,7 +44,7 @@ BeforeAll {
 
     # --- extract the REAL flow functions from SysOrg.ps1 (the menu option 3 path) ---
     $sysAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'SysOrg.ps1'), [ref]$null, [ref]$null)
-    foreach($fnName in @('Invoke-SysOrgScanFlow','Get-SysOrgPhaseStart','Stop-SysOrgPhase')){
+    foreach($fnName in @('Invoke-SysOrgScanFlow','Get-SysOrgPhaseStart','Stop-SysOrgPhase','Offer-SysOrgDiagnosticsBundle','Invoke-SysOrgDiagnosticsBundle','Get-SysOrgDisplayVersion')){
         $fd = $sysAst.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
             Where-Object { $_.Name -eq $fnName } | Select-Object -First 1
         if(-not $fd){ throw "SysOrg.ps1 no longer defines $fnName - the smoke test must follow the real code path" }
@@ -284,6 +284,33 @@ Describe 'v3.0.2 A2 smoke: child-process SysOrg.ps1 -ScanDrive -ReportOnly (Wind
             }
         } finally {
             $null = cmd /c "subst $letter`: /d"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# v3.0.2 D4: a plan that cannot be built reports the cause in one line, points
+# at the log and offers the diagnostics bundle - through the REAL flow.
+# ---------------------------------------------------------------------------
+Describe 'v3.0.2 D4: forced plan-build failure through the real scan flow' {
+
+    It 'prints the cause, "Nothing was modified.", the log path - and saves no plan' {
+        $env:SYSORG_FAULT_PLANBUILD = 'd4-fault'
+        try {
+            # the fixture changed (new file) so the identical-scan plan reuse misses
+            # and the flow really calls New-SysOrgPlan, which now faults
+            Set-Content -LiteralPath (Join-Path $script:smokeRoot 'Documents\d4 new file.txt') -Value 'd4'
+            $plansDir = $script:smokeFolders.Plans
+            $before = @(Get-ChildItem -LiteralPath $plansDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+            $out = Invoke-SysOrgScanFlow -Letter 'X' -PreviewOnly -WholeDrive 2>&1 3>&1 4>&1 5>&1 6>&1
+            $text = (($out | ForEach-Object { "$_" }) -join "`n")
+            $text | Should -Match 'Plan could not be built: Synthetic plan-build fault'
+            $text | Should -Match 'Nothing was modified\.'
+            $text | Should -Match 'Full diagnostic:'
+            $after = @(Get-ChildItem -LiteralPath $plansDir -Filter '*.json' -File -ErrorAction SilentlyContinue).Count
+            $after | Should -Be $before -Because 'a failed plan build saves nothing'
+        } finally {
+            Remove-Item Env:SYSORG_FAULT_PLANBUILD -ErrorAction SilentlyContinue
         }
     }
 }
