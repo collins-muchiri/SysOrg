@@ -903,7 +903,7 @@ Describe 'User collections: one unit, structure intact (v3.0.1 B2)' {
                 Length=[long]5; LastWriteTime=(Get-Date '2026-01-05'); Directory=(Join-Path $srcRoot 'Mixed'); Category='Documents' }
         }
         foreach($i in 1..5){
-            $p = Join-Path $srcRoot 'Mixed' ("pic$i.jpg"); Set-Content -LiteralPath $p -Value 'p'
+            $p = Join-Path (Join-Path $srcRoot 'Mixed') ("pic$i.jpg"); Set-Content -LiteralPath $p -Value 'p'
             $inv += [pscustomobject]@{ FullName=$p; Name="pic$i.jpg"; Stem="pic$i"; Extension='.jpg'
                 Length=[long]5; LastWriteTime=(Get-Date '2026-01-05'); Directory=(Join-Path $srcRoot 'Mixed'); Category='Images' }
         }
