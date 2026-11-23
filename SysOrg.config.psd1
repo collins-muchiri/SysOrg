@@ -200,6 +200,19 @@
         KeepMultipartTogether = $true   # .zip.001/.002, part1.rar/.r00 move as one unit
     }
 
+    # v3.0.1 C2: prune during the walk. Directory NAMES listed here are never
+    # descended into - their files are not even enumerated (counted as 'preserved'
+    # in the summary, never moved). Code projects (VCS marker or two project
+    # markers) are detected in the same single pass and move as ONE unit with .git
+    # intact. Pruning is the main cold-scan speedup on trees with project or
+    # dependency folders (a 9,500-file fixture where 99% sits in such folders scans
+    # in well under a second instead of walking every file).
+    Prune = @{
+        Enabled       = $true
+        DirectoryNames = @('node_modules','.venv','venv','site-packages','vendor','__pycache__',
+                           '.next','dist','build','target','.gradle','bower_components','Pods','.git')
+    }
+
 
     # v3.0 findability: the Data leaves (csv/xlsx/json/db exports route here via
     # their extension even though Windows' routing set calls them Documents).

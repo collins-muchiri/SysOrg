@@ -704,3 +704,118 @@ Describe 'Duplicates for small documents and re-download version pairs (v3.0.1 B
         @(Find-SysOrgDuplicates -Inventory $inv -Config $script:b5Cfg).Count | Should -Be 0
     }
 }
+
+Describe 'Prune walk and in-walk project detection (v3.0.1 C2)' {
+
+    BeforeAll {
+        $script:c2Cfg = @{
+            ExcludedPaths = @(); ExcludedFilePatterns = @()
+            SkipHiddenSystemFiles = $true; ExcludeDestinations = $true
+            OrganizedRoots = @{ '*' = '__AUTO__' }
+            FolderAudit = @{ Enabled = $false }
+            TypeMap = @{}
+            Prune = @{ Enabled=$true; DirectoryNames=@('node_modules','.venv','dist','build','target','vendor','__pycache__','.git') }
+            Projects = @{ Enabled=$true; Markers=@(); GenericNames=@('new folder','src') }
+            AlwaysScanFolders = @(); PreserveExistingFolders = $false
+        }
+        $script:c2OffCfg = @{} + $script:c2Cfg
+        $script:c2OffCfg.Prune = @{ Enabled=$false; DirectoryNames=@() }
+        function New-SysOrgC2Tree {
+            param([string]$Root)
+            # a real code project: .git + package.json + sources
+            $proj = Join-Path $Root 'my-app'
+            New-Item -ItemType Directory -Path (Join-Path $proj '.git') -Force | Out-Null
+            New-Item -ItemType Directory -Path (Join-Path $proj 'src') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $proj 'package.json') -Value '{}' -Encoding UTF8
+            foreach($i in 1..30){ Set-Content -LiteralPath (Join-Path $proj 'src' ("m$i.js")) -Value 'x' }
+            # dependency folders full of files
+            foreach($dep in @('node_modules','dist','target','vendor','.venv')){
+                $dd = Join-Path $proj $dep
+                New-Item -ItemType Directory -Path $dd -Force | Out-Null
+                foreach($i in 1..10){ Set-Content -LiteralPath (Join-Path $dd ("f$i.bin")) -Value 'y' }
+            }
+            # loose files at the root (planned normally)
+            foreach($i in 1..3){ Set-Content -LiteralPath (Join-Path $Root ("loose$i.txt")) -Value 'z' }
+            return $proj
+        }
+    }
+
+    It 'dependency and project subtrees are never enumerated; the walk reports them preserved' {
+        $root = Join-Path $TestDrive ('c2-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        $proj = New-SysOrgC2Tree -Root $root
+        $trail = New-Object System.Collections.Generic.List[object]
+        $projectsOut = New-Object System.Collections.Generic.List[object]
+        $preservedOut = New-Object System.Collections.Generic.List[object]
+        $inv = @(Get-SysOrgInventory -Letter 'S' -Config $script:c2Cfg -Roots @($root) -AuditTrail $trail -ProjectFoldersOut $projectsOut -PreservedOut $preservedOut)
+        # the pruned files never reach the inventory
+        (@($inv | Where-Object { $_.FullName -like '*node_modules*' }).Count) | Should -Be 0
+        (@($inv | Where-Object { $_.FullName -like '*\dist\*' -or $_.FullName -like '*\target\*' -or $_.FullName -like '*\vendor\*' -or $_.FullName -like '*\.venv\*' }).Count) | Should -Be 0
+        (@($inv | Where-Object { $_.FullName -like '*\.git\*' }).Count) | Should -Be 0
+        # the project's own sources are not planned either (the WHOLE project moves as one unit)
+        (@($inv | Where-Object { $_.FullName -like "$proj*" }).Count) | Should -Be 0
+        # loose files are inventoried
+        (@($inv | Where-Object { $_.Name -like 'loose*.txt' }).Count) | Should -Be 3
+        # the walk detected exactly ONE project (the outer one)
+        $projectsOut.Count | Should -Be 1
+        $projectsOut[0].Name | Should -Be 'my-app'
+        # preserved units: 1 project + 4 dependency dirs inside it are NOT visited at all
+        # (the project is preserved first), so preserved = 1 project unit only
+        $preservedOut.Count | Should -Be 1
+        $preservedOut[0].Kind | Should -Be 'Project'
+        # the audit trail carries the preserved entries
+        (@($trail | Where-Object { $_.Status -eq 'Preserved' }).Count) | Should -Be 1
+    }
+
+    It 'walk-detected projects equal the standalone Get-SysOrgProjectFolders result' {
+        $root = Join-Path $TestDrive ('c2e-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        New-SysOrgC2Tree -Root $root
+        # a second project using two non-VCS markers (pyproject.toml + Makefile)
+        $p2 = Join-Path $root 'tooling'
+        New-Item -ItemType Directory -Path $p2 -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $p2 'pyproject.toml') -Value 'x' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $p2 'Makefile') -Value 'x' -Encoding UTF8
+        # NOT a project: a lone .gitignore (thesis-folder rule from v2.1.1)
+        $p3 = Join-Path $root 'thesis'
+        New-Item -ItemType Directory -Path $p3 -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $p3 '.gitignore') -Value 'x' -Encoding UTF8
+        foreach($i in 1..5){ Set-Content -LiteralPath (Join-Path $p3 ("n$i.md")) -Value 'x' }
+        $projectsOut = New-Object System.Collections.Generic.List[object]
+        $null = Get-SysOrgInventory -Letter 'S' -Config $script:c2Cfg -Roots @($root) -ProjectFoldersOut $projectsOut
+        $standalone = @(Get-SysOrgProjectFolders -Roots @($root) -Config $script:c2Cfg -DriveProfile $null -KnownFolders @())
+        $walkNames = @($projectsOut | ForEach-Object { $_.Name } | Sort-Object)
+        $standaloneNames = @($standalone | ForEach-Object { $_.Name } | Sort-Object)
+        $walkNames | Should -Be $standaloneNames
+        $walkNames | Should -Be @('my-app','tooling')
+    }
+
+    It 'Prune.Enabled=$false restores the old behavior (everything enumerated)' {
+        $root = Join-Path $TestDrive ('c2off-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        New-SysOrgC2Tree -Root $root
+        $inv = @(Get-SysOrgInventory -Letter 'S' -Config $script:c2OffCfg -Roots @($root))
+        # without pruning the dependency files ARE enumerated (and excluded via Projects rules at plan time)
+        (@($inv | Where-Object { $_.FullName -like '*node_modules*' }).Count) | Should -BeGreaterThan 0
+        (@($inv | Where-Object { $_.Name -like 'm*.js' }).Count) | Should -Be 30
+    }
+
+    It 'a lone non-VCS marker is not a project; two markers or one VCS marker are' {
+        (Test-SysOrgProjectMarkers -Entries @('.gitignore','notes.md') -Markers @('.git','package.json','Makefile','pyproject.toml')) | Should -BeFalse
+        (Test-SysOrgProjectMarkers -Entries @('pyproject.toml','Makefile') -Markers @('.git','package.json','Makefile','pyproject.toml')) | Should -BeTrue
+        (Test-SysOrgProjectMarkers -Entries @('.git','readme.md') -Markers @('.git','package.json','Makefile')) | Should -BeTrue
+        (Test-SysOrgProjectMarkers -Entries @('readme.md') -Markers @('.git','package.json')) | Should -BeFalse
+    }
+
+    It 'generic project names get the deterministic hash suffix in both paths' {
+        $root = Join-Path $TestDrive ('c2g-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $src = Join-Path $root 'src'
+        New-Item -ItemType Directory -Path (Join-Path $src '.git') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $src 'a.txt') -Value 'x'
+        $projectsOut = New-Object System.Collections.Generic.List[object]
+        $null = Get-SysOrgInventory -Letter 'S' -Config $script:c2Cfg -Roots @($root) -ProjectFoldersOut $projectsOut
+        $standalone = @(Get-SysOrgProjectFolders -Roots @($root) -Config $script:c2Cfg -DriveProfile $null -KnownFolders @())
+        $projectsOut[0].SafeName | Should -Be $standalone[0].SafeName
+        $projectsOut[0].SafeName | Should -Match 'src \([0-9a-f]{8}\)'
+    }
+}

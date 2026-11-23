@@ -302,8 +302,11 @@ function Invoke-SysOrgScanFlow {
     }
     Write-Host ("Drive {0}\  role={1}  proposed scope={2}" -f $prof.Letter, $prof.Role, $prof.ProposedScope) -ForegroundColor White
     $trail = New-Object System.Collections.Generic.List[object]
+    # v3.0.1 C2: the walk itself detects projects and prunes dependency dirs
+    $walkProjects = New-Object System.Collections.Generic.List[object]
+    $walkPreserved = New-Object System.Collections.Generic.List[object]
     $rootsInfo = Get-SysOrgScanRoots -Letter $Letter -Config $Config -DefaultScope:(-not $WholeDrive) -KnownFolders @($prof.KnownFolders)
-    $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail; KnownFolders=@($prof.KnownFolders) }
+    $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail; KnownFolders=@($prof.KnownFolders); ProjectFoldersOut=$walkProjects; PreservedOut=$walkPreserved }
     if($NoCacheSwitch){ $invParams.NoCache = $true }
     if(-not $WholeDrive){ $invParams.DefaultScope = $true }
     # @() collect: the inventory streams records (empty scan emits nothing)
@@ -354,8 +357,19 @@ function Invoke-SysOrgScanFlow {
     if($versionPairs -and @($versionPairs.Versions).Count -gt 0){
         Write-Host ("Possible newer-version pairs (report only): {0}" -f @($versionPairs.Versions).Count) -ForegroundColor Yellow
     }
-    $projects = @(Get-SysOrgProjectFolders -Roots @($rootsInfo.Initial) -Config $Config -DriveProfile $prof -KnownFolders @($prof.KnownFolders))
+    # v3.0.1 C2: projects come from the walk when pruning is enabled; the standalone
+    # walk stays as the fallback for Prune.Enabled=$false
+    if([bool](Get-SysOrgSetting $Config 'Prune.Enabled' $true)){
+        $projects = @($walkProjects.ToArray())
+    } else {
+        $projects = @(Get-SysOrgProjectFolders -Roots @($rootsInfo.Initial) -Config $Config -DriveProfile $prof -KnownFolders @($prof.KnownFolders))
+    }
     if(@($projects).Count -gt 0){ Write-Host ("Code project folders detected: {0} (moved whole, .git intact)" -f @($projects).Count) }
+    if(@($walkPreserved).Count -gt 0){
+        $depCount = @(@($walkPreserved) | Where-Object { $_.Kind -eq 'Dependency' }).Count
+        $projCount = @(@($walkPreserved) | Where-Object { $_.Kind -eq 'Project' }).Count
+        Write-Host ("Preserved without enumeration: {0} dependency folder(s), {1} project folder(s)" -f $depCount, $projCount) -ForegroundColor DarkGray
+    }
     # v3.0.1 B2: user collections - user-named folders inside the scan roots move as
     # ONE unit (structure intact), chosen by the majority classification of contents.
     $collections = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($rootsInfo.Initial) -Config $Config -KnownFolders @($prof.KnownFolders))

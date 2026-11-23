@@ -254,7 +254,9 @@ function Get-SysOrgInventory {
         [string[]]$Roots,
         [string[]]$CfaFolders,
         [object[]]$KnownFolders,
-        [System.Collections.Generic.List[object]]$AuditTrail
+        [System.Collections.Generic.List[object]]$AuditTrail,
+        [System.Collections.Generic.List[object]]$ProjectFoldersOut,
+        [System.Collections.Generic.List[object]]$PreservedOut
     )
     $root = ('{0}:\' -f $Letter)
     if(-not ($Roots -and @($Roots).Count -gt 0) -and (-not $DefaultScope)){
@@ -315,6 +317,29 @@ function Get-SysOrgInventory {
     $folderAuditEnabled = [bool](Get-SysOrgSetting $Config 'FolderAudit.Enabled' $true)
     $fileExRx = $null
     try { $fileExRx = Get-SysOrgExcludedFileMatcher -Config $Config } catch { $fileExRx = $null }
+    # v3.0.1 C2: prune dependency directories and detect projects DURING the walk -
+    # their subtrees are never enumerated (counted as preserved), and the project
+    # list comes out of the same single pass (the old separate walk to depth 4 is
+    # replaced by the walk's own detection).
+    $pruneEnabled = [bool](Get-SysOrgSetting $Config 'Prune.Enabled' $true)
+    $pruneNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach($n in @(Get-SysOrgSetting $Config 'Prune.DirectoryNames' @('node_modules','.venv','venv','site-packages','vendor','__pycache__','.next','dist','build','target','.gradle','bower_components','Pods','.git'))){
+        if(-not [string]::IsNullOrWhiteSpace("$n")){ [void]$pruneNames.Add("$n") }
+    }
+    $projectMarkers = @(Get-SysOrgSetting $Config 'Projects.Markers' @())
+    if($projectMarkers.Count -eq 0){
+        $projectMarkers = @('.git','.svn','.hg','.jj','.gitignore','package.json','package-lock.json','yarn.lock',
+                     'pnpm-lock.yaml','Cargo.toml','go.mod','go.sum','pyproject.toml','setup.py','composer.json',
+                     'Gemfile','pom.xml','build.gradle','build.gradle.kts','Makefile','CMakeLists.txt',
+                     '*.sln','*.csproj','*.vcxproj','*.fsproj')
+    }
+    $projectGeneric = @(@(Get-SysOrgSetting $Config 'Projects.GenericNames' @()) | ForEach-Object { "$_".ToLowerInvariant() })
+    $projectGuard = New-Object System.Collections.Generic.HashSet[string]
+    $appRootWalk = Get-SysOrgSetting $Config 'AppRoot' $null
+    if($appRootWalk){ [void]$projectGuard.Add(("$appRootWalk").TrimEnd('\').ToLowerInvariant()) }
+    if($env:USERPROFILE){ [void]$projectGuard.Add(($env:USERPROFILE).TrimEnd('\').ToLowerInvariant()) }
+    try { [void]$projectGuard.Add((Get-SysOrgDestinationRoot -Letter $Letter -Config $Config).ToLowerInvariant()) } catch { }
+    foreach($k in @($KnownFolders)){ if($k.Path){ [void]$projectGuard.Add(("$($k.Path)").TrimEnd('\').ToLowerInvariant()) } }
 
     while($stack.Count -gt 0){
         $dir = [string]$stack.Pop()
@@ -335,16 +360,16 @@ function Get-SysOrgInventory {
         if($folderAuditEnabled -and ($dir -ine $root)){
             $protectReason = Get-SysOrgFolderProtectionReason -Path $dir -Config $Config -CfaFolders $cfaFolders
             if($protectReason){
-                if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$protectReason }) }
+                if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=$protectReason }) }
                 continue
             }
             $acc = Test-SysOrgDirAccess -Path $dir
             if(-not $acc.Readable){
-                if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=('Access denied reading folder (error {0})' -f $acc.ReadError) }) }
+                if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Protected'; Reason=('Access denied reading folder (error {0})' -f $acc.ReadError) }) }
                 continue
             }
             if((-not $acc.Writable) -and (-not (Get-SysOrgSetting $Config 'FolderAudit.IncludeRestrictedInPlans' $false))){
-                if($AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Restricted'; Reason='No write permission - folder left in place' }) }
+                if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Restricted'; Reason='No write permission - folder left in place' }) }
                 continue
             }
         }
@@ -356,6 +381,32 @@ function Get-SysOrgInventory {
             try { $subDirs = $di.GetDirectories() } catch { Write-Verbose "Directory enumeration failed: $dir - $($_.Exception.Message)" }
             try { $files   = $di.GetFiles() } catch { Write-Verbose "File enumeration failed: $dir - $($_.Exception.Message)" }
         } catch { Write-Verbose "Folder skipped: $dir - $($_.Exception.Message)"; continue }
+
+        # v3.0.1 C2: prune DEPENDENCY directories without descending - their contents
+        # are never enumerated and they are counted as preserved.
+        $dirLeaf = Split-Path $dir -Leaf
+        if($pruneEnabled -and $pruneNames.Contains($dirLeaf)){
+            if($null -ne $PreservedOut){ [void]$PreservedOut.Add([pscustomobject]@{ Path=$dir; Kind='Dependency'; Name=$dirLeaf }) }
+            if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Preserved'; Reason='Dependency folder (pruned without enumeration)' }) }
+            continue
+        }
+        # v3.0.1 C2: project detection happens IN the walk (VCS marker or >= 2 markers),
+        # the whole subtree is preserved as ONE unit and never enumerated.
+        if($pruneEnabled -and (-not $projectGuard.Contains((("$dir").Replace('/','\')).TrimEnd('\').ToLowerInvariant()))){
+            $entryNames = @()
+            foreach($d in $subDirs){ $entryNames += $d.Name }
+            foreach($fi2 in $files){ $entryNames += $fi2.Name }
+            if(($entryNames.Count -gt 0) -and (Test-SysOrgProjectMarkers -Entries $entryNames -Markers $projectMarkers)){
+                if($null -ne $ProjectFoldersOut){
+                    [void]$ProjectFoldersOut.Add([pscustomobject]@{
+                        Path=$dir; Name=$dirLeaf
+                        SafeName=(Get-SysOrgProjectSafeName -Dir $dir -GenericNames $projectGeneric) })
+                }
+                if($null -ne $PreservedOut){ [void]$PreservedOut.Add([pscustomobject]@{ Path=$dir; Kind='Project'; Name=$dirLeaf }) }
+                if($null -ne $AuditTrail){ [void]$AuditTrail.Add([pscustomobject]@{ Path=$dir; Status='Preserved'; Reason='Code project folder (moved as one unit; subtree not enumerated)' }) }
+                continue
+            }
+        }
 
         foreach($d in $subDirs){ [void]$stack.Push($d.FullName) }
 
@@ -984,6 +1035,51 @@ function Get-SysOrgUserCollections {
     return $result.ToArray()
 }
 
+function Test-SysOrgProjectMarkers {
+<#
+.SYNOPSIS
+    The project decision rule shared by the pruned walk and Get-SysOrgProjectFolders (v3.0.1 C2).
+.DESCRIPTION
+    A folder is a project when it has a VCS marker (.git/.hg/.svn/.jj) OR at least
+    TWO distinct markers - a lone .gitignore/Makefile/lock file is not enough
+    (thesis folders, data directories and exports carry those too).
+.EXAMPLE
+    Test-SysOrgProjectMarkers -Entries @('.git','src','readme.md')   # -> $true
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Entries,[AllowEmptyCollection()][string[]]$Markers)
+    $matched = New-Object System.Collections.Generic.List[string]
+    foreach($m in $Markers){
+        if([string]::IsNullOrWhiteSpace("$m")){ continue }
+        if("$m".Contains('*') -or "$m".Contains('?')){
+            foreach($e in $Entries){ if($e -like "$m"){ [void]$matched.Add("$m"); break } }
+        } elseif($Entries -contains "$m"){ [void]$matched.Add("$m") }
+    }
+    foreach($v in @('.git','.hg','.svn','.jj')){ if($matched -contains $v){ return $true } }
+    return ($matched.Count -ge 2)
+}
+
+function Get-SysOrgProjectSafeName {
+<#
+.SYNOPSIS
+    Safe project folder name with a deterministic suffix for generic names (v3.0.1 C2).
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Dir,[AllowEmptyCollection()][string[]]$GenericNames)
+    $name = Split-Path $Dir -Leaf
+    $safe = Get-SysOrgSafeFolderName -Name $name -MaxLength 60
+    $lc = ($dir.Replace('/','\')).TrimEnd('\').ToLowerInvariant()
+    if($genericNames -contains $name.ToLowerInvariant()){
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try{
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($lc)
+            $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+            $safe = ('{0} ({1})' -f $safe, $hash.Substring(0,8))
+        } finally { $sha.Dispose() }
+    }
+    return $safe
+}
+
 function Get-SysOrgProjectFolders {
 <#
 .SYNOPSIS
@@ -1045,33 +1141,11 @@ function Get-SysOrgProjectFolders {
 
         $entries = @()
         try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir) | ForEach-Object { Split-Path $_ -Leaf }) } catch { $entries = @() }
-        $isProject = $false
-        if($entries.Count -gt 0){
-            # v2.1.1: a project needs a VCS marker (.git/.hg/.svn/.jj) OR at least TWO
-            # distinct markers. A lone .gitignore, Makefile or lock file is not enough
-            # (thesis folders, data directories and exports carry those too).
-            $matched = New-Object System.Collections.Generic.List[string]
-            foreach($m in $markers){
-                if([string]::IsNullOrWhiteSpace("$m")){ continue }
-                if("$m".Contains('*') -or "$m".Contains('?')){
-                    foreach($e in $entries){ if($e -like "$m"){ [void]$matched.Add("$m"); break } }
-                } elseif($entries -contains "$m"){ [void]$matched.Add("$m") }
-            }
-            $vcsHit = $false
-            foreach($v in @('.git','.hg','.svn','.jj')){ if($matched -contains $v){ $vcsHit = $true; break } }
-            if($vcsHit -or ($matched.Count -ge 2)){ $isProject = $true }
-        }
-        if($isProject){
+        # v2.1.1 rule, shared with the pruned inventory walk since v3.0.1 C2:
+        # VCS marker (.git/.hg/.svn/.jj) OR at least TWO distinct markers
+        if(($entries.Count -gt 0) -and (Test-SysOrgProjectMarkers -Entries $entries -Markers $markers)){
             $name = Split-Path $dir -Leaf
-            $safe = Get-SysOrgSafeFolderName -Name $name -MaxLength 60
-            if($generic -contains $name.ToLowerInvariant()){
-                $sha = [System.Security.Cryptography.SHA256]::Create()
-                try{
-                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($lc)
-                    $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
-                    $safe = ('{0} ({1})' -f $safe, $hash.Substring(0,8))
-                } finally { $sha.Dispose() }
-            }
+            $safe = Get-SysOrgProjectSafeName -Dir $dir -GenericNames $generic
             [void]$result.Add([pscustomobject]@{ Path=$dir; Name=$name; SafeName=$safe })
             if($result.Count -ge $maxCount){ break }
             continue   # do not descend: nested projects belong to the outer project

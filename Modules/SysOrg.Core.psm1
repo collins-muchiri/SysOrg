@@ -245,6 +245,14 @@ function Import-SysOrgConfig {
                                     'miscellaneous','various','stuff','things','random','temp','tmp',
                                     'downloads','desktop','documents','pictures','videos','music') }
         Archives = @{ Extract=$false; KeepMultipartTogether=$true }
+        # v3.0.1 C2: prune dependency/build directories DURING the walk - their
+        # subtrees are never enumerated (counted as preserved, never moved) and code
+        # projects are detected in the same pass (the separate depth-4 walk goes away).
+        # A dependency folder is identified by its NAME; a project by a VCS marker or
+        # two distinct project markers (see Projects.Markers).
+        Prune = @{ Enabled=$true
+                   DirectoryNames=@('node_modules','.venv','venv','site-packages','vendor','__pycache__',
+                                    '.next','dist','build','target','.gradle','bower_components','Pods','.git') }
         Preview  = @{ NaturalSort=$true; ShowDenied=$true; WarnOneDriveSyncOut=$true }
         Privacy  = @{ StoreFullUrlsInJournal=$true }
         # v3.0 Findable layout knobs (used by the Findable LayoutProfile; the legacy
