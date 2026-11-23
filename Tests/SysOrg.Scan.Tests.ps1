@@ -1032,7 +1032,7 @@ Describe 'App folder inside scan root + empty-tree scoring (v3.0.1 D4/D5)' {
         Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Score.psm1') -Force
         $tree = Join-Path $TestDrive ('d5t-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path (Join-Path $tree 'Documents\2026') -Force | Out-Null
-        foreach($i in 1..25){ Set-Content -LiteralPath (Join-Path $tree 'Documents\2026' ("f$i.txt")) -Value 'x' }
+        foreach($i in 1..25){ Set-Content -LiteralPath (Join-Path (Join-Path (Join-Path $tree "Documents") "2026") ("f$i.txt")) -Value "x" }
         $sc = Get-SysOrgTreeScore -Root $tree -Config @{ Layout=@{ MaxFilesPerFolder=150; MinFilesPerFolder=8 }; Score=@{ MinPopulation=20 } }
         $sc.Files | Should -Be 25
         $sc.Score | Should -BeGreaterOrEqual 0

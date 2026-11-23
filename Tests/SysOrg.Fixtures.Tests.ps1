@@ -214,7 +214,7 @@ Describe 'Fixture: AI download provenance (table row 7)' {
         $cat = Update-SysOrgCatalog -PlanPath $planPath -UndoPath $journal -Root $org -PlanId 'plan-20260101-093000-123'
         $cat | Should -Not -BeNullOrEmpty
         $entries = @(Read-SysOrgCatalog -Path (Get-SysOrgCatalogPath -Root $org))
-        ($entries | Where-Object { "$($_.SourceBucket)" -eq 'Z-AI' }).Count | Should -Be 1
+        @($entries | Where-Object { "$($_.SourceBucket)" -eq 'Z-AI' }).Count | Should -Be 1
     }
 }
 
