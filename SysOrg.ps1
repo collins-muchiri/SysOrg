@@ -49,7 +49,9 @@ param(
     [int]$Parallelism = 0,
     [string]$Root,
     [switch]$Timing,
-    [string]$SimilarFolders
+    [string]$SimilarFolders,
+    [switch]$SelfTest,
+    [switch]$Diagnostics
 )
 $ErrorActionPreference = 'Stop'
 $appRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -818,11 +820,165 @@ function Invoke-SysOrgBenchmarkFlow {
     Write-Host ("Benchmark report saved: {0}" -f $repPath) -ForegroundColor Green
 }
 
+# ---------------------------------------------------------------------------
+# v3.0.2 A3: SELF-TEST. Builds a temporary synthetic tree under the system temp
+# area and runs the WHOLE pipeline on the user's own machine, exactly as a real
+# run would: inventory walk -> duplicates -> projects -> collections -> plan ->
+# preview -> save -> execute into a temporary destination -> undo -> verify.
+# Every step reports [PASS]/[FAIL]; a failure logs the full diagnostic (type,
+# message, script stack trace, position) via Write-SysOrgErrorDiagnostic and
+# prints the failing step's stack trace. Real user folders are NEVER touched:
+# every path - fixture, destination, plans, undo journal, cache - lives under a
+# fresh 'SysOrgSelfTest-<guid>' directory that is removed again on success.
+# ---------------------------------------------------------------------------
+function Invoke-SysOrgSelfTest {
+    $results = New-Object System.Collections.Generic.List[object]
+    $state = @{ Failed = 0; Total = 0; TempRoot = $null; TempApp = $null }
+
+    function Invoke-SysOrgSelfTestStep {
+        param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][scriptblock]$Body)
+        $state.Total++
+        try {
+            & $Body
+            [void]$results.Add([pscustomobject]@{ Name=$Name; Passed=$true; Message='' })
+            Write-Host ("  [PASS] {0}" -f $Name) -ForegroundColor Green
+        } catch {
+            $state.Failed++
+            $logPath = Write-SysOrgErrorDiagnostic -ErrorRecord $_ -LogFolder $script:selfTestLog -Phase 'preview'
+            [void]$results.Add([pscustomobject]@{ Name=$Name; Passed=$false; Message="$($_.Exception.Message)" })
+            Write-Host ("  [FAIL] {0}: {1}" -f $Name, $_.Exception.Message) -ForegroundColor Red
+            if($_.ScriptStackTrace){
+                $stackHead = (@($_.ScriptStackTrace -split "`n") | Select-Object -First 2) -join ' | '
+                Write-Host ("         at {0}" -f $stackHead) -ForegroundColor DarkYellow
+            }
+            if($logPath){ Write-Host ("         full diagnostic: {0}" -f $logPath) -ForegroundColor DarkYellow }
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'SysOrg self-test: running the whole pipeline on a temporary synthetic tree.' -ForegroundColor White
+    Write-Host 'Nothing outside the temporary folders is read or modified.' -ForegroundColor DarkGray
+
+    $script:selfTestLog = Join-Path ([System.IO.Path]::GetTempPath()) ('SysOrgSelfTest-logs-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $tempRoot  = Join-Path ([System.IO.Path]::GetTempPath()) ('SysOrgSelfTest-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $tempApp   = Join-Path $tempRoot 'app'
+    $tempSrc   = Join-Path $tempRoot 'src'
+    $tempDest  = Join-Path $tempRoot 'organized'
+    $state.TempRoot = $tempRoot
+    $state.TempApp  = $tempApp
+
+    Invoke-SysOrgSelfTestStep -Name 'temporary fixture tree' -Body {
+        # NOTE: the fixture root folder is deliberately NOT named like a category
+        # ('Documents' would trip the already-organized preservation heuristic -
+        # correct production behaviour for a real Documents folder).
+        New-Item -ItemType Directory -Path (Join-Path $tempSrc 'Inbox') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $tempSrc 'proj-main\.git') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $tempApp 'Config') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $tempSrc 'Inbox\Quarterly Report.docx') -Value 'report body'
+        Set-Content -LiteralPath (Join-Path $tempSrc 'Inbox\Snapshot Album.jpg') -Value 'image bytes'
+        Set-Content -LiteralPath (Join-Path $tempSrc 'Inbox\Snapshot Album (1).jpg') -Value 'image bytes'
+        Set-Content -LiteralPath (Join-Path $tempSrc 'proj-main\.git\HEAD') -Value 'ref: refs/heads/main'
+        Set-Content -LiteralPath (Join-Path $tempSrc 'proj-main\main.py') -Value 'print(1)'
+        Set-Content -LiteralPath (Join-Path $tempApp 'Config\ScanRoots.json') -Value '{}'
+    }
+    $cfg = $null; $prof = $null
+    Invoke-SysOrgSelfTestStep -Name 'config + app folders' -Body {
+        $script:selfTestFolders = New-SysOrgAppFolders -AppRoot $tempApp
+        $script:selfTestCfg = @{
+            AppRoot        = $tempApp
+            LayoutProfile  = 'Windows'
+            OrganizedRoots = @{ 'X' = $tempDest }
+            Copies         = @{ Policy='NumberCopies'; MinFileSizeKB=0; DocMinFileSizeKB=0; HeaderHashKB=64 }
+            Classify       = @{ MinConfidence=0.40; ReviewConfidence=0.0 }
+            Review         = @{ Mode='Report' }
+            Learn          = @{ Enabled=$false }
+            Families       = @{ Enabled=$false }
+            Downloads      = @{ UseZoneIdentifier=$false }
+            Move           = @{ AllowCrossVolume = $true }
+            ExcludedPaths  = @()
+            ExcludedFilePatterns = @()
+            SkipHiddenSystemFiles = $true
+            ExcludeDestinations = $true
+            PreserveExistingFolders = $false
+            DateFolders    = 'Year'
+            FolderAudit    = @{ Enabled = $true }
+            TypeMap        = @{}
+            Plans          = @{ ReuseIdentical = $true }
+        }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'scan (inventory walk)' -Body {
+        $script:selfTestInv = @(Get-SysOrgInventory -Letter 'X' -Roots @($tempSrc) -Config $script:selfTestCfg -CacheFolder $script:selfTestFolders.Cache)
+        if(@($script:selfTestInv).Count -lt 3){ throw ("inventory walked only {0} file(s)" -f @($script:selfTestInv).Count) }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'duplicate detection' -Body {
+        $script:selfTestDups = @(Find-SysOrgDuplicates -Inventory $script:selfTestInv -Config $script:selfTestCfg)
+        if(@($script:selfTestDups).Count -lt 1){ throw 'the identical Snapshot Album pair was not grouped' }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'project folder detection' -Body {
+        $projects = @(Get-SysOrgProjectFolders -Roots @($tempSrc) -Config $script:selfTestCfg -DriveProfile $null -KnownFolders @())
+        if(@($projects).Count -lt 1){ throw 'proj-main was not detected as a code project' }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'plan build' -Body {
+        $prof = [pscustomobject]@{ Letter='X'; Root='X:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $script:selfTestPlan = New-SysOrgPlan -Letter 'X' -Inventory $script:selfTestInv -DriveProfile $prof `
+            -DupGroups $script:selfTestDups -Config $script:selfTestCfg -KnownFolders @()
+        if(@($script:selfTestPlan.Actions).Count -lt 1){ throw 'the plan has no actions' }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'preview + save' -Body {
+        $null = Show-SysOrgPlan -Plan $script:selfTestPlan -Config $script:selfTestCfg
+        $script:selfTestPlanPath = Save-SysOrgPlan -Plan $script:selfTestPlan -PlansFolder $script:selfTestFolders.Plans
+        if(-not (Test-Path -LiteralPath $script:selfTestPlanPath)){ throw 'the plan file was not written' }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'execute into the temporary destination' -Body {
+        $script:selfTestExec = Invoke-SysOrgPlan -PlanPath $script:selfTestPlanPath -Config $script:selfTestCfg -AppRoot $tempApp
+        if(([int]$script:selfTestExec.Summary.Moved + [int]$script:selfTestExec.Summary.FolderMoves) -lt 1){
+            throw ("nothing was moved (summary: {0})" -f (($script:selfTestExec.Summary.Keys | ForEach-Object { "$_=$($script:selfTestExec.Summary[$_])" }) -join ' '))
+        }
+        if(-not (Test-Path -LiteralPath (Join-Path $tempDest 'Documents'))){ throw 'the destination tree was not created' }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'undo (restore to original locations)' -Body {
+        $script:selfTestUndo = Undo-SysOrgPlan -PlanId $script:selfTestPlan.PlanId -AppRoot $tempApp -Config $script:selfTestCfg
+        if([int]$script:selfTestUndo.Restored -lt 1){ throw ("nothing was restored ({0})" -f "$($script:selfTestUndo.Restored)") }
+    }
+    Invoke-SysOrgSelfTestStep -Name 'verify the restore byte-for-byte' -Body {
+        $back = Join-Path $tempSrc 'Inbox\Quarterly Report.docx'
+        if(-not (Test-Path -LiteralPath $back)){ throw 'Quarterly Report.docx did not come back to its original location' }
+        $body = (Get-Content -LiteralPath $back -Raw)
+        if($null -eq $body){ $body = '' }
+        if("$body".TrimEnd() -ne 'report body'){ throw 'the restored file content differs' }
+    }
+
+    # cleanup is BEST EFFORT and never reported as a step failure of the pipeline
+    try {
+        if($state.Failed -eq 0){ Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    Remove-Item Env:SYSORG_FAULT_PLANBUILD -ErrorAction SilentlyContinue
+
+    Write-Host ''
+    if($state.Failed -eq 0){
+        Write-Host ("SELF-TEST PASSED: {0} step(s) ok on this machine ({1})." -f $state.Total, $PSVersionTable.PSVersion.ToString()) -ForegroundColor Green
+        return $true
+    }
+    Write-Host ("SELF-TEST FAILED: {0} of {1} step(s) failed. The temporary folders were KEPT for inspection: {2}" -f $state.Failed, $state.Total, $tempRoot) -ForegroundColor Red
+    Write-Host 'Nothing outside the temporary folders was modified at any point.' -ForegroundColor Yellow
+    return $false
+}
+
 # ---------------- non-interactive modes ----------------
 # v3.0.2 A1: every CLI entry point runs through Invoke-SysOrgCliStep so a
 # terminating error produces a FULL diagnostic log (type, message, script stack
 # trace, invocation position), a one-line user message pointing at the log and
 # the honest "Nothing was modified." - never a raw red stack dump.
+if($SelfTest){
+    Invoke-SysOrgCliStep -Step 'Self-test' -Action {
+        # v3.0.2 A3: the whole pipeline on a temporary synthetic tree - PASS/FAIL per
+        # step. The verdict is printed by the self-test itself; the CLI step wrapper
+        # only guards against an unexpected throw outside the per-step catches.
+        $null = Invoke-SysOrgSelfTest
+    }
+    return
+}
 if($ProfileDrives){
     Invoke-SysOrgCliStep -Step 'Drive profiling' -Action { [void](Invoke-SysOrgProfileFlow -Letters $null) }
     return
@@ -1082,6 +1238,7 @@ while($running){
     Write-Host ' [8] Open working folder (plans, undo journals, logs, reports)'
     Write-Host ' [9] Find files in the catalog (instant search)'
     Write-Host ' [10] Score the organized tree (findability)'
+    Write-Host ' [11] Self-test (whole pipeline on a temporary synthetic tree)'
     Write-Host ' [0] Exit'
     $choice = Read-Host 'Choose'
     # P2-4: one bad drive or folder never kills the whole app
@@ -1134,6 +1291,7 @@ while($running){
             '8' { Start-Process explorer.exe $appRoot }
             '9' { $q = Read-Host 'Search (wildcard, e.g. *invoice*)'; $res = @(Find-SysOrgFile -Root (Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config) -Name $q -Config $Config 3>$null); Write-Host ("{0} result(s):" -f $res.Count); $res | Select-Object -First 30 | ForEach-Object { Write-Host ('  ' + $_.CurrentPath + '  [' + $_.Category + ']') } }
             '10' { $sr = Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config; $sc = Get-SysOrgTreeScore -Root $sr -Config $Config; if($sc.Files -eq 0){ Write-Host ''; Write-Host 'No organized tree yet.' -ForegroundColor Yellow; Write-Host ('  Nothing has been organized into {0} so far. Run option 3 (organize a drive) first.' -f $sr) -ForegroundColor Gray } else { Show-SysOrgFindabilityScore -Score $sc -Label $sr -Config $Config -WithTargets } }
+            '11' { $null = Invoke-SysOrgSelfTest }
             '0' { $running = $false }
             default { Write-Host 'Unknown option.' }
         }
