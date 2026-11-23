@@ -192,7 +192,7 @@ function Import-SysOrgConfig {
     [CmdletBinding()]
     param([string]$Path,[string]$AppRoot,[switch]$AllowDegradedMode)
     $defaults = @{
-        Version          = '3.0.0'
+        Version          = '3.0.1'
         # v3.0 LayoutProfile: 'Findable' is the NEW-install default (injected only when no
         # config file was loaded - see the load block below). A config file that exists
         # but does not carry the key keeps its current 'Windows' behaviour, so upgrading

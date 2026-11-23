@@ -2,6 +2,144 @@
 
 All notable changes to SysOrg. Versions follow [SemVer](https://semver.org/).
 
+## [3.0.1] - 2026-11-23 - Defects from a real run; classification that fits real usage
+
+Driven by a real Windows 11 run (C: system NVMe + A: data NVMe, 9,579 files) whose
+findings became the regression fixtures: a drive-relative audit bug, a scoring
+verdict that could call an 11-of-9,579 plan "worsens", a mutability line that
+counted preserved files as denied, and classification that put provenance above
+content. All v3.0 guarantees are preserved: preview first, never overwrite, never
+delete, crash-safe undo, protected paths and mutability always win, deterministic
+plans, idempotent re-runs.
+
+### Fixed (Phase A - defects)
+- **A1 Folder audit root bug:** the audit walked 'X:' (slash stripped) - a
+  DRIVE-RELATIVE path that .NET resolves against the drive's CURRENT directory - so
+  auditing from a subfolder audited the app folder and reported error 2 for every
+  child ('C:.github', 'C:Cache', ...). The root now stays 'X:\' for enumeration and
+  probes; every path passes the new `ConvertTo-SysOrgPath`, which REJECTS
+  drive-relative forms (`^[A-Za-z]:(?![\\])`) and '.'/'..' segments.
+- **A2 Scoring correctness:** the plan score delta compares before/after over the
+  SAME population (untouched + moved files at their before AND after locations) -
+  never a whole-tree 'before' against a moved-files-only 'after'. An empty tree or
+  fewer than 20 files scores 'n/a', never 100. Verdicts are honest about scale:
+  an affected share below 5% reads 'no meaningful change (11 of 9,500 files
+  affected)' and can never read 'worsens'.
+- **A3 Honest skip taxonomy:** 'Mutability: N denied (provably never touched)' is
+  replaced by three separate groups - Protected/denied (mutability engine),
+  Preserved by design (organized-folder heuristic, project units, user
+  collections), Left for a decision (low confidence) - plus per-reason counts with
+  one example each and the untouched percentage. Headline:
+  '9,579 scanned: 11 planned, 9,518 preserved, 50 protected, 0 need a decision.'
+- **A4 Source buckets:** AI and chat sources map to buckets (z.ai -> Z-AI,
+  chat.z.ai, meta.ai -> Meta-AI, claude.ai -> Claude, chatgpt.com/openai.com ->
+  OpenAI, gemini.google.com -> Gemini) alongside the existing hosts, with
+  public-suffix-aware registrable domains (co.ke, go.ke, co.uk, com.au, ...).
+  Bucket names shorter than 3 characters fall back to the full host label. The map
+  is extensible in `Rules\Sources.psd1`; every bucket passes
+  `Get-SysOrgSafeFolderName`; a broken map file fails closed.
+- **A5 Family folder names:** over-limit names truncate on a WORD boundary with a
+  deterministic 4-character hash suffix ('Peer Education Support Supervision
+  Report-a3f9'); the longest common word-prefix of the members wins over the
+  longest stem; the 200-character total path budget stays enforced.
+- **A6 Startup noise:** every module imports with `-DisableNameChecking` - the
+  menu starts clean.
+
+### Added (Phase B - layout and classification that fit real usage)
+- **B1 Provenance is metadata, not taxonomy:** under the Findable layout, files
+  from Downloads route by CONTENT like every other file (Documents\Work\<Year>,
+  Pictures\..., Software\Installers\<App>); the source lives in the catalog's
+  Source field and -Explain, and becomes a folder level ONLY for messaging sources
+  and Screenshots. No `_NoSource` and no generic source-bucket folders in the
+  Findable tree. The old behaviour stays behind `LayoutProfile = Windows` /
+  `Compact4`.
+- **B2 Respect user collections:** a user-named folder inside a scanned root
+  (`Folders.PreserveUserCollections`, default on; bounded: <= 200 files, <= 3
+  levels deep; not generic/date/auto-generated) is treated as ONE unit and moved
+  whole (structure intact, never flattened) to the destination chosen by the
+  majority classification of its contents - e.g. Documents\Work\UNDP - or left in
+  place when the confidence is low. The preview lists collections separately.
+  Fixture: a UNDP folder with a nested Workshop subfolder stays together.
+- **B3 Self-supervised learning:** before classifying, a small multinomial naive
+  Bayes model is built from the files ALREADY living in the user's curated folders
+  (existing subfolders of the known folders in scope, plus `Learn.FromPaths`);
+  filename tokens, extensions, metadata title/author tokens and the first 2 KB of
+  text are features; labels need >= 5 files and a posterior margin >= 0.5; a
+  single-label model is never trusted. Stored in `<root>\_Index\model.json`
+  (versioned by an input fingerprint, rebuilt only on change). It NEVER moves
+  anything by itself: it feeds the confidence pipeline like any other signal and
+  appears in `-Explain`. `.\SysOrg.ps1 -Learn` prints what it learned and the
+  labels it trusts.
+- **B4 Lexicon extension:** monitoring & evaluation and NGO programme vocabulary
+  (MEAL, M&E, narrative/monthly/quarterly report, concept note, supervision,
+  workplan, logframe, indicator, baseline, endline, training, workshop,
+  curriculum, TOR/terms of reference, MoU, budget) and CV/bio/profile terms,
+  mapped to Documents\Work, Documents\Education, Documents\Legal-Identity and
+  Documents\Personal. Filename, Office docProps title/creator and text-snippet
+  matches carry separate, LOGGED weights ('Lexicon: Work score=4 (filename 4,
+  metadata 0, content 1.6) -> confidence=0.72').
+- **B5 Duplicates for small documents:** the 256 KB size floor now applies to media
+  and installers only; documents and data files use `Copies.DocMinFileSizeKB`
+  (default 0). Browser re-download pairs 'name(1).ext'/'name (1).ext' are
+  recognized: hash-identical pairs collapse into the copies policy; pairs that
+  differ are flagged 'possible newer version' in the preview with sizes and
+  modified times (report-only).
+- **B6 Review experience:** when more than half of the planned moves are below the
+  review threshold, the plan is NOT a ready-to-execute default: the review offers
+  [A] approve only confident moves (>= 0.70), [R] review the low-confidence moves
+  one by one (accept / skip / set destination - saved as a rule), [S] skip all
+  uncertain files, [N] cancel. Each low score shows its REASON
+  ('no lexicon match, extension only'), not just 'conf 0.5'.
+
+### Added (Phase C - speed, profiled first)
+- **C1 `-Timing`:** per-phase wall times (enumerate / duplicates / plan). Profiled
+  on a 3,151-file corpus; the top hotspots fixed: the mutability policy resolved
+  once per (config, profile) instead of per file (2.4x per call), the TypeMap and
+  excluded-file regexes compiled once per config (reference-identity cached - a
+  config-hash key would itself cost ms/file), and the lexicon + rules files parsed
+  ONCE per run instead of once per file (PSD1 parsing was 10-30 s of the observed
+  112 s scan profile on real installs). The walk hoists all per-file settings.
+- **C2 Prune during the walk:** dependency directories (node_modules, .venv, venv,
+  site-packages, vendor, __pycache__, .next, dist, build, target, .gradle,
+  bower_components, Pods, .git) are never descended into - counted as PRESERVED
+  without enumerating their files - and code projects (VCS marker or two markers)
+  are detected in the same single pass (the separate depth-4 walk is gone). On the
+  9,500-file fixture (99% inside projects) the inventory reads 95 files in ~0.3 s.
+- **C3 Cache freshness:** the 24-hour whole-inventory cache is validated, never
+  trusted: the walk always re-enumerates (cheap, streaming) and reuses a cached
+  record only when size AND mtime still match; the preview states the cache age and
+  the changed count; a plan never references a file that no longer exists.
+- **C4/C5:** exclusions are compiled once per run (hash set + one regex, identical
+  semantics, regression-tested); the 'Other' category reports its top unknown
+  extensions (count + bytes) so they can be mapped via TypeMap (report-only).
+
+### Added (Phase D - usability and safety on data drives)
+- **D1 Plan picker:** option 5 lists the 10 newest plans (id, drive, moves, age,
+  executed status) and accepts a number, a plan id, a full path or a folder.
+  Re-running an IDENTICAL scan reuses the existing not-executed plan (input
+  fingerprint) instead of creating a duplicate.
+- **D2 Scan-root picker:** on Data/Removable drives FullDrive is no longer the
+  silent default - top-level folders are shown with risk labels (project, VCS
+  repo, note vault (.obsidian), model store (ollama/models/...), app store,
+  installer collection, OS/tool folder) and the choice is remembered per drive in
+  Config\ScanRoots.json. Vault/model/app/VCS/OS folders are excluded by default
+  and never moved.
+- **D3 Similar-folder report:** folders fingerprinted by their file-hash sets;
+  pairs with >= 80% overlap (e.g. '-v1' copies) listed with sizes and dates.
+  REPORT ONLY - never moved or merged.
+- **D4/D5:** a warning when the SysOrg app folder sits inside a scan root
+  (it stays protected); option 10 on a tree with no files prints 'No organized
+  tree yet.', not a score.
+
+### Internal
+- Two PowerShell portability classes caught by the real 5.1 CI leg and fixed:
+  `.Count` on a Where-Object scalar is $null on 5.1 (pwsh 7 gives every object the
+  intrinsic Count=1) - assertions @()-wrapped; `Join-Path` with 3 arguments is
+  pwsh 7-only - nested 2-arg form. Collection truthiness (an empty List/hashtable
+  is $false) had silently swallowed audit-trail writes - now $null-checked.
+- The Learn model trains ONLY on the drive profile's known folders (in scope) -
+  not on registry-resolved real folders of the machine.
+
 ## [3.0.0] - 2026-11-22 - Faster, smarter, more findable (Findable layout + scored pipeline)
 
 The layout becomes a choice (`LayoutProfile = Windows | Compact4 | Findable`; new

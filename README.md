@@ -4,12 +4,18 @@ Preview-first, zero-dependency file organizer for Windows 10/11, built entirely 
 Windows PowerShell 5.1+. Nothing is installed and nothing runs in the background.
 Licensed under the MIT license (see `LICENSE`).
 
-**Version 3.0.0** is the current release: a chooseable layout profile (`Windows` |
-`Compact4` | `Findable`), a scored classification pipeline for ALL file types
-(Decisions with confidence, signals and explainability), a persistent file-state
-cache with parallel hashing for large drives, and a searchable offline catalog —
-see the `v3.0 in one page` section below and the measured numbers (including the
-honest misses) in `BENCHMARKS.md`.
+**Version 3.0.1** is the current release: the v3.0 engine (chooseable layout
+profile `Windows | Compact4 | Findable`, scored classification pipeline, persistent
+file-state cache, searchable offline catalog) hardened and sharpened by a real
+Windows 11 run — honest skip taxonomy and score verdicts, provenance-as-metadata
+(Downloads route by CONTENT under Findable), respect for user collections (moved
+whole, never flattened), self-supervised classification from your OWN folder
+structure (`-Learn`), NGO/MEAL + CV lexicon with logged weights, small-document
+duplicate detection with re-download version flags, a review experience for
+low-confidence plans, per-phase `-Timing`, a pruning walk for project/dependency
+folders (9,500-file fixture: only 95 files enumerated, ~0.3 s), cache-freshness
+validation, a plan picker, a scan-root picker for data drives, and a
+similar-folder report. See `CHANGELOG.md` for the full list.
 
 **Revision 2.1** organizes the way Windows itself sorts: type-first into known-folder
 names, name families within each type, numbered copies instead of quarantine, and an
@@ -72,6 +78,8 @@ and the undo journal survives a power cut (WriteThrough + Pending/Done rows).
 
       .\SysOrg.ps1 -Find '*invoice*'                 (wildcard)
       .\SysOrg.ps1 -Find '.*\.pdf$' -Type Documents  (regex via module)
+      .\SysOrg.ps1 -Learn                            (what the model learned from your own folders)
+      .\SysOrg.ps1 -SimilarFolders 'D:\Projects'     (report-only similar-folder pairs)
 
   `_Index\Index.html` is a static offline browse page; `_Index\README.txt`
   explains the folder.
@@ -145,7 +153,7 @@ additionally requires typing `yes`.
 
 ## Quick start
 
-1. Download `SysOrg-3.0.0.zip` from the [Releases page](../../releases/latest) and verify the
+1. Download `SysOrg-3.0.1.zip` from the [Releases page](../../releases/latest) and verify the
    published `SHA256SUMS` entry before extracting.
 2. Right-click the ZIP → Properties → **Unblock** → extract.
 3. In the extracted folder run in PowerShell:
