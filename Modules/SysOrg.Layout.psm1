@@ -102,11 +102,18 @@ function Get-SysOrgFindableSubtype {
         if($stem -match 'receipt'){ return 'Finance\Receipts' }
         if($stem -match 'statement'){ return 'Finance\Statements' }
         if($stem -match '(tax|paye|kra|vat|nhif|nssf|withholding)'){ return 'Finance\Tax' }
+        # v3.0.1 B4: CV/bio/profile terms route to Documents\Personal (never _NoSource)
+        if($stem -match '(curriculum vitae|[^a-z]cv([^a-z]|$)|^cv([^a-z]|$)|resume|biodata|(^|[^a-z])bio([^a-z]|$)|profile)'){ return 'Personal' }
         if($stem -match '(contract|agreement|certificate|passport|identity|id ?scan|deed|licence|license|permit)'){ return 'Legal-Identity' }
         if($stem -match '(manual|handbook|user ?guide|quick ?start)'){ return 'Manuals' }
         if($stem -match '(book|novel|textbook|epub)'){ return 'Books' }
-        if($stem -match '(thesis|dissertation|syllabus|course|lecture|assignment|exam|school|university|college)'){ return 'Education' }
-        if($stem -match '(work|meeting|minutes|proposal|report|memo)'){ return 'Work' }
+        # v3.0.1 B4: Work BEFORE Education - a report-bearing NGO document
+        # ('Workshop Report') is a programme document; bare training/curriculum names
+        # stay Education because they carry no Work token. Short ambiguous tokens
+        # ('work' inside 'workshop', 'mou' inside 'amount', 'tor' inside 'history')
+        # are word-boundary guarded.
+        if($stem -match '(^|[^a-z])(work|meeting|minutes|proposal|report|memo|meal|mou|tor|brief|budget)([^a-z]|$)|m&e|narrative|monthly report|quarterly report|supervision|workplan|logframe|concept note|terms of reference'){ return 'Work' }
+        if($stem -match '(thesis|dissertation|syllabus|course|lecture|assignment|exam|school|university|college|training|curriculum|workshop)'){ return 'Education' }
         return 'General'
     }
     if($Category -eq 'Spreadsheets'){ return 'Data' }

@@ -426,3 +426,68 @@ Describe 'Near-duplicate image detection (Phase 2.8, report only)' {
         (Get-SysOrgHammingDistance -A '111' -B '0000') | Should -Be 64
     }
 }
+
+Describe 'Lexicon NGO/MEAL/CV extension with logged weights (v3.0.1 B4)' {
+
+    It 'NGO programme vocabulary reaches Work at >= 0.70 from the filename alone' {
+        $p = Join-Path $TestDrive 'Monthly Narrative Report.txt'
+        Set-Content -LiteralPath $p -Value 'unrelated body text' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'Monthly Narrative Report.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg -AppRoot (Split-Path $PSScriptRoot -Parent))
+        $lex.Subtype | Should -Be 'Work'
+        $lex.Confidence | Should -BeGreaterOrEqual 0.70
+    }
+
+    It 'supervision, workplan, MEAL/M&E and logframe tokens map to Work' {
+        $p = Join-Path $TestDrive 'Quarterly Supervision Report.txt'
+        Set-Content -LiteralPath $p -Value 'monitoring and evaluation logframe indicator baseline endline workplan concept note terms of reference mou budget' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'Quarterly Supervision Report.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg -AppRoot (Split-Path $PSScriptRoot -Parent))
+        $lex.Subtype | Should -Be 'Work'
+        $lex.Confidence | Should -BeGreaterOrEqual 0.70
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'M&E field visit notes.txt') | Should -Be 'Work'
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'Programme workplan 2026.txt') | Should -Be 'Work'
+    }
+
+    It 'a training/curriculum/workshop document maps to Education' {
+        $p = Join-Path $TestDrive 'Peer Education Training Curriculum.txt'
+        Set-Content -LiteralPath $p -Value 'capacity building facilitator participants sessions' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'Peer Education Training Curriculum.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg -AppRoot (Split-Path $PSScriptRoot -Parent))
+        $lex.Subtype | Should -Be 'Education'
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'Workshop Curriculum final.txt') | Should -Be 'Education'
+    }
+
+    It 'a certificate document reaches Legal-Identity at >= 0.70' {
+        $p = Join-Path $TestDrive 'Certificate 1.pdf'
+        Set-Content -LiteralPath $p -Value 'this is to certify... certificate of completion signature' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'Certificate 1.pdf' -Lexicon (Get-SysOrgLexicon -Config $script:cfg -AppRoot (Split-Path $PSScriptRoot -Parent))
+        $lex.Subtype | Should -Be 'Legal-Identity'
+        $lex.Confidence | Should -BeGreaterOrEqual 0.70
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'Certificate 1.pdf') | Should -Be 'Legal-Identity'
+    }
+
+    It 'CV/bio/profile documents map to Personal - a new subtype with its own leaf' {
+        $p = Join-Path $TestDrive 'Jane Wanjiku CV.txt'
+        Set-Content -LiteralPath $p -Value 'curriculum vitae personal profile work experience skills references hobbies' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'Jane Wanjiku CV.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg -AppRoot (Split-Path $PSScriptRoot -Parent))
+        $lex.Subtype | Should -Be 'Personal'
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'Jane Wanjiku CV.pdf') | Should -Be 'Personal'
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'My Resume 2026.docx') | Should -Be 'Personal'
+        (Get-SysOrgFindableSubtype -Category 'Documents' -Name 'Bio-data form.pdf') | Should -Be 'Personal'
+        # the leaf routing carries the new subtype
+        (Get-SysOrgFindableRelBase -Category 'Documents' -Subtype 'Personal').RelBase | Should -Be 'Documents\Personal'
+    }
+
+    It 'reports and logs the per-source weight breakdown' {
+        $p = Join-Path $TestDrive 'KRA PAYE return 2024.txt'
+        Set-Content -LiteralPath $p -Value 'KENYA revenue authority pin number assessment itax portal' -Encoding UTF8
+        $lex = Get-SysOrgDocumentCategory -Path $p -Name 'KRA PAYE return 2024.txt' -Lexicon (Get-SysOrgLexicon -Config $script:cfg -AppRoot (Split-Path $PSScriptRoot -Parent))
+        $lex.PSObject.Properties['Breakdown'] | Should -Not -BeNullOrEmpty
+        $lex.Breakdown.Filename | Should -BeGreaterThan 0
+        $lex.Breakdown.Content  | Should -BeGreaterThan 0
+        $lex.Breakdown.Filename | Should -BeGreaterThan $lex.Breakdown.Content   # filename weighs more
+        # the pipeline logs the breakdown with the Lexicon signal
+        $prof = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; ProposedScope='FullDrive'
+            KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $d = Invoke-SysOrgClassifyPipeline -Path $p -Extension '.txt' -Category 'Documents' -Config $script:cfg -DriveProfile $prof -IncludeMetadata
+        (@($d.Signals) | Where-Object { $_ -match '^Lexicon: .*\(filename [\d.]+, metadata [\d.]+, content [\d.]+\)' }).Count | Should -BeGreaterOrEqual 1
+    }
+}

@@ -241,7 +241,12 @@ function Invoke-SysOrgClassifyPipeline {
                     # below the threshold the document goes to Documents\General\<Year>
                     # (still previewed; the confidence stays honest in the plan)
                     if($lex.Confidence -lt $minConf){ $subtype = 'General' }
-                    [void]$d.Signals.Add(('Lexicon: ' + $lex.Subtype + ' score=' + $lex.Matched + ' -> confidence=' + $lex.Confidence + $(if($subtype -eq 'General'){ ' -> General' })))
+                    # v3.0.1 B4: the per-source weights are logged with the signal
+                    $brk = ''
+                    if($lex.PSObject.Properties['Breakdown'] -and $lex.Breakdown){
+                        $brk = (' (filename {0}, metadata {1}, content {2})' -f $lex.Breakdown.Filename, $lex.Breakdown.Metadata, $lex.Breakdown.Content)
+                    }
+                    [void]$d.Signals.Add(('Lexicon: ' + $lex.Subtype + ' score=' + $lex.Matched + $brk + ' -> confidence=' + $lex.Confidence + $(if($subtype -eq 'General'){ ' -> General' })))
                 }
             } catch { [void]$d.Signals.Add(('Lexicon: failed soft (' + $_.Exception.Message + ')')) }
         }
@@ -723,16 +728,17 @@ function Get-SysOrgLexicon {
     if([string]::IsNullOrWhiteSpace($path) -or (-not (Test-Path -LiteralPath $path))){
         # built-in minimal fallback so a missing file never breaks classification
         return @{
-            Multiplier = @{ Filename = 1.2; Metadata = 1.0; Content = 0.6 }
+            Multiplier = @{ Filename = 2.0; Metadata = 1.5; Content = 0.8 }
             Confidence = @{ Divider = 1.5 }
             Entries = @(
                 @{ Subtype='Finance\Invoices';  Filename=@('invoice'); Content=@('invoice','amount due','payment due') }
                 @{ Subtype='Finance\Receipts';  Filename=@('receipt'); Content=@('receipt','received from','mpesa') }
                 @{ Subtype='Finance\Statements';Filename=@('statement'); Content=@('statement of account','closing balance') }
                 @{ Subtype='Finance\Tax';       Filename=@('tax','paye','kra'); Content=@('kra','paye','vat','tax return','itax') }
-                @{ Subtype='Legal-Identity';    Filename=@('contract','certificate','passport'); Content=@('this agreement','certificate of','passport number') }
-                @{ Subtype='Education';         Filename=@('thesis','syllabus','assignment'); Content=@('university','course outline','examination') }
-                @{ Subtype='Work';              Filename=@('proposal','minutes','memo'); Content=@('meeting minutes','action items','deliverables') }
+                @{ Subtype='Legal-Identity';    Filename=@('contract','certificate','passport'); Content=@('this agreement','certificate of','certificate','passport number') }
+                @{ Subtype='Work';              Filename=@('proposal','minutes','memo','meal','m&e','narrative report','monthly report','quarterly report','concept note','supervision','workplan','logframe','tor','terms of reference','mou','budget'); Content=@('meeting minutes','action items','deliverables','meal','m&e','logframe','indicator','baseline','endline','workplan','supervision','monitoring and evaluation','budget','programme','donor') }
+                @{ Subtype='Education';         Filename=@('thesis','syllabus','assignment','training','curriculum','workshop'); Content=@('university','course outline','examination','training','curriculum') }
+                @{ Subtype='Personal';          Filename=@('cv','resume','bio','biodata','profile','curriculum vitae'); Content=@('curriculum vitae','personal profile','work experience','skills','hobbies','date of birth') }
                 @{ Subtype='Manuals';           Filename=@('manual','handbook','user guide'); Content=@('user manual','troubleshooting','quick start') }
                 @{ Subtype='Books';             Filename=@('book','novel','textbook'); Content=@('chapter','isbn','published by') }
             )
@@ -788,10 +794,13 @@ function Get-SysOrgDocumentCategory {
 .SYNOPSIS
     Stage 8: scores a document against the lexicon and returns category + confidence.
 .DESCRIPTION
-    Combines stem tokens (1.2x), metadata title/creator tokens (1.0x) and the 2 KB
-    text snippet tokens (0.6x) per lexicon entry; the best entry wins deterministically
-    (ties break by list order). Returns @{ Subtype; Matched; Confidence } or $null when
-    nothing matched. Fail soft: unreadable content simply contributes no tokens.
+    Combines stem tokens, metadata title/creator tokens and the 2 KB text snippet
+    tokens per lexicon entry; the best entry wins deterministically (ties break by
+    list order). Weights come from the lexicon (shipped: filename 2.0x, metadata
+    1.5x, content 0.8x). Returns @{ Subtype; Matched; Confidence; Breakdown } where
+    Breakdown carries the per-source weighted sub-totals of the WINNING entry
+    (Filename / Metadata / Content) - logged in the -Explain output (v3.0.1 B4).
+    Fail soft: unreadable content simply contributes no tokens.
 .EXAMPLE
     Get-SysOrgDocumentCategory -Path 'C:\x\tax return.pdf' -Name 'tax return.pdf' -Metadata $m -Config $cfg
 #>
@@ -800,7 +809,7 @@ function Get-SysOrgDocumentCategory {
           [hashtable]$Metadata,$Lexicon,$Config,[string]$AppRoot)
     try{
         if(-not $Lexicon){ $Lexicon = Get-SysOrgLexicon -Config $Config -AppRoot $AppRoot }
-        $mult = @{ Filename = 1.2; Metadata = 1.0; Content = 0.6 }
+        $mult = @{ Filename = 2.0; Metadata = 1.5; Content = 0.8 }
         if($Lexicon -is [hashtable] -and $Lexicon.ContainsKey('Multiplier') -and ($Lexicon['Multiplier'] -is [hashtable])){
             foreach($k in @('Filename','Metadata','Content')){ if($Lexicon['Multiplier'].ContainsKey($k)){ $mult[$k] = [double]$Lexicon['Multiplier'][$k] } }
         }
@@ -823,22 +832,27 @@ function Get-SysOrgDocumentCategory {
                 if($Metadata.ContainsKey($k)){ $metaText += ' ' + "$($Metadata[$k])" }
             }
         }
-        $best = $null; $bestMatched = -1.0
+        $best = $null; $bestMatched = -1.0; $bestBreak = $null
         foreach($entry in @($Lexicon['Entries'])){
             if(-not ($entry -is [hashtable]) -or (-not $entry.ContainsKey('Subtype'))){ continue }
-            $m = 0.0
-            $m += (Get-SysOrgTokenMatches -Text $stem -Tokens ([string[]]@($entry['Filename']))) * $mult.Filename
-            $m += (Get-SysOrgTokenMatches -Text $metaText -Tokens ([string[]](@($entry['Filename']) + @($entry['Content'])))) * $mult.Metadata
-            $m += (Get-SysOrgTokenMatches -Text $snippet -Tokens ([string[]]@($entry['Content']))) * $mult.Content
+            # v3.0.1 B4: the three sources score SEPARATELY (logged per source)
+            $mF = (Get-SysOrgTokenMatches -Text $stem -Tokens ([string[]]@($entry['Filename']))) * $mult.Filename
+            $mM = (Get-SysOrgTokenMatches -Text $metaText -Tokens ([string[]](@($entry['Filename']) + @($entry['Content'])))) * $mult.Metadata
+            $mC = (Get-SysOrgTokenMatches -Text $snippet -Tokens ([string[]]@($entry['Content']))) * $mult.Content
+            $m = $mF + $mM + $mC
             if($m -gt $bestMatched){
                 $bestMatched = $m
                 $best = "$($entry['Subtype'])"
+                $bestBreak = @{ Filename=[Math]::Round($mF,2); Metadata=[Math]::Round($mM,2); Content=[Math]::Round($mC,2) }
             }
         }
         if(($null -eq $best) -or ($bestMatched -le 0)){ return $null }
         $conf = $bestMatched / ($bestMatched + $divider)
         if($conf -gt 0.99){ $conf = 0.99 }
-        return [pscustomobject]@{ Subtype=$best; Matched=[Math]::Round($bestMatched,2); Confidence=[Math]::Round($conf,3) }
+        return [pscustomobject]@{
+            Subtype=$best; Matched=[Math]::Round($bestMatched,2); Confidence=[Math]::Round($conf,3)
+            Breakdown=[pscustomobject]$bestBreak
+        }
     } catch { return $null }
 }
 
