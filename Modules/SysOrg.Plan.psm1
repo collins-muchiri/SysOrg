@@ -116,7 +116,12 @@ function New-SysOrgPlan {
         $learnModel = $null
         if(Get-SysOrgSetting $Config 'Learn.Enabled' $true){
             try{
-                $lm = New-SysOrgLearnModel -Config $Config -DestinationRoot $root -KnownFolders $KnownFolders
+                # v3.0.1: the model trains ONLY on the drive profile's known folders -
+                # the folders IN SCOPE for this scan. New-SysOrgPlan defaults the
+                # routing $KnownFolders to the registry-resolved real folders when the
+                # caller passes none; feeding those to the learner would train on the
+                # machine's real profile even when the scan has nothing to do with it.
+                $lm = New-SysOrgLearnModel -Config $Config -DestinationRoot $root -KnownFolders @($DriveProfile.KnownFolders)
                 if($lm -and $lm.Model){ $learnModel = $lm.Model }
             } catch { Write-Verbose ("Learn model unavailable (continuing without it): {0}" -f $_.Exception.Message) }
         }

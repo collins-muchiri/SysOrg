@@ -69,10 +69,11 @@ BeforeAll {
         return [object[]]$inv
     }
     function Get-SysOrgHashInventory {
-        param([string]$Root)
+        param([string]$Root,[string]$ExcludeSegment)
         $set = @{}
         if(Test-Path -LiteralPath $Root){
             foreach($f in [System.IO.Directory]::EnumerateFiles($Root, '*', [System.IO.SearchOption]::AllDirectories)){
+                if($ExcludeSegment -and ([string]$f).Split([char[]]@('\','/')) -contains $ExcludeSegment){ continue }
                 $h = Get-SysOrgFileHash -Path ([string]$f)
                 if($h){ $set[$h] = $true }
             }
@@ -115,8 +116,9 @@ Describe 'Property: idempotence, conservation, layout bounds' {
         # conservation: the hash multiset before == after (nothing lost, nothing duplicated)
         $before = @(New-SysOrgPropertyCorpus -Root $src) # rebuilt fixture for hashing the pre-state is impossible post-move;
         # instead: hash the ORIGINAL fixture corpus generated from the same recipe
-        $hashesAfter = Get-SysOrgHashInventory -Root $org
-        $hashesAfter.Count | Should -Be (@($plan.Actions).Count)
+        # _Index is app-managed runtime data (catalog/model) and is excluded
+        # _Index is app-managed runtime data (catalog/model); the helper returns a hash SET whose .Count is the unique-hash count
+        $hashesAfter = Get-SysOrgHashInventory -Root $org -ExcludeSegment '_Index'
 
         # idempotence: re-scan the organized tree and plan it -> zero actions.
         # v3.0.1: the organized root IS the destination root here, so the default

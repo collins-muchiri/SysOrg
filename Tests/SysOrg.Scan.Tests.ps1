@@ -606,7 +606,7 @@ Describe 'User collections detection (v3.0.1 B2)' {
         # a folder at depth 2 within the bound IS a unit even under excluded ancestors
         $mid = @(); foreach($i in 1..5){ $mid += New-SysOrgB2Record -Dir "$root\New folder\2024\UNDP" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
         $c = @(Get-SysOrgUserCollections -Inventory $mid -Roots @($root) -Config @{} -KnownFolders @())
-        ($c | Where-Object Name -eq 'UNDP').Count | Should -Be 1
+        ($c | Where-Object Name -eq 'UNDP').Count | Should -Be 1 -Because ("detected collections: [" + (($c | ForEach-Object { "$($_.Name) files=$($_.Files) depth=$($_.Depth)" }) -join '; ') + "]")
         # a folder containing ONLY subfolders is still the outer unit (structure intact)
         $nested = @(); foreach($i in 1..5){ $nested += New-SysOrgB2Record -Dir "$root\Programme X\Workshop" -Name "r$i.docx" -Ext '.docx' -Cat 'Documents' }
         $c2 = @(Get-SysOrgUserCollections -Inventory $nested -Roots @($root) -Config @{} -KnownFolders @())
@@ -675,8 +675,9 @@ Describe 'Duplicates for small documents and re-download version pairs (v3.0.1 B
     It 'a re-download pair that DIFFERS is flagged as a possible newer version - report only' {
         $d1 = Join-Path $TestDrive 'Guide_2026-11-20.pdf'
         $d2 = Join-Path $TestDrive 'Guide_2026-11-20 (1).pdf'
-        Set-Content -LiteralPath $d1 -Value ('A' * 500) -Encoding ASCII
-        Set-Content -LiteralPath $d2 -Value ('B' * 700) -Encoding ASCII
+        # WriteAllText: EXACT byte sizes on both platforms (Set-Content appends CRLF on Windows)
+        [System.IO.File]::WriteAllText($d1, ('A' * 500))
+        [System.IO.File]::WriteAllText($d2, ('B' * 700))
         (Get-Item -LiteralPath $d1).LastWriteTime = Get-Date '2026-11-20 08:00'
         (Get-Item -LiteralPath $d2).LastWriteTime = Get-Date '2026-11-20 09:30'
         $inv = @((New-SysOrgB5Record -Path $d1 -Cat 'Documents'), (New-SysOrgB5Record -Path $d2 -Cat 'Documents'))
@@ -688,9 +689,8 @@ Describe 'Duplicates for small documents and re-download version pairs (v3.0.1 B
         $v = $vp.Versions[0]
         $v.Original | Should -Be $d1
         $v.Copy | Should -Be $d2
-        # Set-Content appends a newline: 500/700 chars -> 501/701 bytes
-        $v.OriginalSize | Should -Be 501
-        $v.CopySize | Should -Be 701
+        $v.OriginalSize | Should -Be 500
+        $v.CopySize | Should -Be 700
         $v.CopyLooksNewer | Should -BeTrue
         $v.CopyLastWrite | Should -Match '^2026-11-20T09'
     }
@@ -727,7 +727,7 @@ Describe 'Prune walk and in-walk project detection (v3.0.1 C2)' {
             New-Item -ItemType Directory -Path (Join-Path $proj '.git') -Force | Out-Null
             New-Item -ItemType Directory -Path (Join-Path $proj 'src') -Force | Out-Null
             Set-Content -LiteralPath (Join-Path $proj 'package.json') -Value '{}' -Encoding UTF8
-            foreach($i in 1..30){ Set-Content -LiteralPath (Join-Path $proj 'src' ("m$i.js")) -Value 'x' }
+            foreach($i in 1..30){ Set-Content -LiteralPath (Join-Path (Join-Path $proj 'src') ("m$i.js")) -Value 'x' }
             # dependency folders full of files
             foreach($dep in @('node_modules','dist','target','vendor','.venv')){
                 $dd = Join-Path $proj $dep
@@ -830,7 +830,14 @@ Describe 'Inventory cache freshness validation (v3.0.1 C3)' {
         New-Item -ItemType Directory -Path $root -Force | Out-Null
         $cacheDir = Join-Path $TestDrive ('c3cache-' + [guid]::NewGuid().ToString('N').Substring(0,6))
         New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
-        foreach($i in 1..6){ Set-Content -LiteralPath (Join-Path $root ("f$i.txt")) -Value ("v$i") }
+        $baseUtc = (Get-Date).ToUniversalTime().AddMinutes(-30)
+        foreach($i in 1..6){
+            $p3 = Join-Path $root ("f$i.txt")
+            Set-Content -LiteralPath $p3 -Value ("v$i")
+            # explicit, millisecond-clean mtimes: the JSON round trip keeps millis
+            # exactly, so reused-vs-changed is deterministic on every platform
+            (Get-Item -LiteralPath $p3).LastWriteTimeUtc = $baseUtc.AddMinutes(-$i)
+        }
         $cfg = @{ ExcludedPaths=@(); ExcludedFilePatterns=@(); SkipHiddenSystemFiles=$true; ExcludeDestinations=$true
                   OrganizedRoots=@{ '*'='__AUTO__' }; FolderAudit=@{ Enabled=$false }; TypeMap=@{}
                   Prune=@{ Enabled=$false; DirectoryNames=@() } }
@@ -841,11 +848,13 @@ Describe 'Inventory cache freshness validation (v3.0.1 C3)' {
         $stats1.FromCache | Should -BeFalse
         Test-Path -LiteralPath (Get-ChildItem -LiteralPath $cacheDir -File | Select-Object -First 1).FullName | Should -BeTrue
         # mutate: touch 2 files (new mtime), delete 1, add 1
-        Start-Sleep -Milliseconds 60
         Set-Content -LiteralPath (Join-Path $root 'f1.txt') -Value 'changed'
         Set-Content -LiteralPath (Join-Path $root 'f2.txt') -Value 'changed too'
         Remove-Item -LiteralPath (Join-Path $root 'f6.txt') -Force
         Set-Content -LiteralPath (Join-Path $root 'f7.txt') -Value 'new file'
+        (Get-Item -LiteralPath (Join-Path $root 'f1.txt')).LastWriteTimeUtc = $baseUtc.AddMinutes(10)
+        (Get-Item -LiteralPath (Join-Path $root 'f2.txt')).LastWriteTimeUtc = $baseUtc.AddMinutes(11)
+        (Get-Item -LiteralPath (Join-Path $root 'f7.txt')).LastWriteTimeUtc = $baseUtc.AddMinutes(12)
         # second scan: VALIDATED cache
         $stats2 = @{}
         $inv2 = @(Get-SysOrgInventory -Letter 'S' -Config $cfg -Roots @($root) -CacheFolder $cacheDir -CacheStatsOut $stats2)
