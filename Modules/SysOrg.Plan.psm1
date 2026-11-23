@@ -64,6 +64,7 @@ function New-SysOrgPlan {
           $KnownFolders,
           $ProjectFolders,
           $UserCollections,
+          $VersionPairs,
           $FileCache,
           [hashtable]$NewCacheEntries)
 
@@ -907,6 +908,8 @@ function New-SysOrgPlan {
         Warnings        = @($warnings.ToArray())
         Provenance      = @($provRows.ToArray())
         ProvenanceFile  = ''
+        # v3.0.1 B5: re-download version pairs - REPORT ONLY (nothing moves)
+        VersionPairs    = $(if($VersionPairs){ $VersionPairs } else { [pscustomobject]@{ Identical=0; Versions=@() } })
         Stats           = [pscustomobject]@{ Scanned=@($invArray).Count; Routed=$routed.Count }
     }
 }
@@ -1356,6 +1359,22 @@ function Show-SysOrgPlan {
         }
         if("$($c.Policy)" -eq 'ReportOnly' -and ([int]$c.Reported -gt 0)){
             Write-Host ("  Copies reported (nothing moves): {0}" -f $c.Reported)
+        }
+    }
+
+    # v3.0.1 B5: possible newer versions (browser re-download signal) - report only
+    if($Plan.PSObject.Properties['VersionPairs'] -and $Plan.VersionPairs){
+        $vpVersions = @($Plan.VersionPairs.Versions)
+        if($vpVersions.Count -gt 0){
+            Write-Host ''
+            Write-Host ("Possible newer versions (report-only, nothing moves): {0}" -f $vpVersions.Count) -ForegroundColor Yellow
+            foreach($v in ($vpVersions | Select-Object -First 10)){
+                Write-Host ('  ' + $v.Original + ('  ({0} bytes, modified {1})' -f $v.OriginalSize, $v.OriginalLastWrite)) -ForegroundColor Gray
+                $tag = ''
+                if($v.PSObject.Properties['CopyLooksNewer'] -and $v.CopyLooksNewer){ $tag = '   <- looks NEWER' }
+                Write-Host ('    vs ' + $v.Copy + ('  ({0} bytes, modified {1}){2}' -f $v.CopySize, $v.CopyLastWrite, $tag)) -ForegroundColor DarkYellow
+            }
+            Write-Host '  Decide which version to keep yourself - SysOrg never deletes either file.' -ForegroundColor DarkGray
         }
     }
 

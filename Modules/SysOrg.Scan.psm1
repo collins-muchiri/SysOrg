@@ -1286,6 +1286,121 @@ function Get-SysOrgSourceBucket {
     return $null
 }
 
+function Get-SysOrgDuplicateFloor {
+<#
+.SYNOPSIS
+    The duplicate-detection size floor for one category (v3.0.1 B5).
+.DESCRIPTION
+    Size-grouping is cheap, so DOCUMENTS and DATA files (Documents, Spreadsheets,
+    Presentations, Databases) use their own floor - Copies.DocMinFileSizeKB,
+    default 0 (no floor). Everything else (media, installers, ...) keeps
+    Copies.MinFileSizeKB (default 256 KB) so thousands of tiny cache files are
+    never hashed. Find-SysOrgDuplicates precomputes both floors once per run and
+    applies them inline (identical semantics, no per-file setting lookups).
+.EXAMPLE
+    Get-SysOrgDuplicateFloor -Category 'Documents' -Config $cfg   # -> 0 (bytes)
+#>
+    [CmdletBinding()]
+    param([string]$Category,$Config)
+    if(@('Documents','Spreadsheets','Presentations','Databases') -contains "$Category"){
+        return ([int64](Get-SysOrgSetting $Config 'Copies.DocMinFileSizeKB' 0) * 1KB)
+    }
+    return ([int64](Get-SysOrgSetting $Config 'Copies.MinFileSizeKB' 256) * 1KB)
+}
+
+function Get-SysOrgVersionPairHash {
+<#
+.SYNOPSIS
+    Full SHA256 for a version-pair comparison, file-state-cache first (v3.0.1 B5).
+.DESCRIPTION
+    Cache hit returns the stored hash without reading the file; a miss hashes once
+    and stores. Never throws.
+#>
+    [CmdletBinding()]
+    param([string]$Path,$FileCache,[hashtable]$NewEntries)
+    try{
+        $h = $null
+        if($FileCache -and (Get-Command Get-SysOrgFileCacheKey -ErrorAction SilentlyContinue)){
+            $fi = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $k = Get-SysOrgFileCacheKey -Path $Path -Length ([long]$fi.Length) -LastWriteTimeUtc $fi.LastWriteTimeUtc
+            if($FileCache.ContainsKey($k)){
+                $e = $FileCache[$k]
+                if($e.PSObject.Properties['Hash'] -and "$($e.Hash)"){ return "$($e.Hash)" }
+            }
+            $h = Get-SysOrgFileHash -Path $Path
+            if($h){
+                $e = $FileCache[$k]
+                if($e){ $e.Hash = $h } else { $FileCache[$k] = [pscustomobject]@{ Hash=$h; HeaderHash=''; HeadTailHash=''; Meta=$null } }
+                if($NewEntries){ $NewEntries[$k] = $FileCache[$k] }
+            }
+            return $h
+        }
+        return (Get-SysOrgFileHash -Path $Path)
+    } catch { return $null }
+}
+
+function Get-SysOrgVersionPairs {
+<#
+.SYNOPSIS
+    Browser re-download signal: 'name.ext' next to 'name(1).ext' / 'name (1).ext' (v3.0.1 B5).
+.DESCRIPTION
+    REPORT-ONLY. Stems that differ only by a '(n)' copy counter (with or without a
+    space) and share the extension are compared by content hash (cache-first):
+      - hash-identical pair  -> an EXACT COPY: it collapses into the copies policy
+        (the duplicates pipeline already numbers/quarantines it); counted as Identical.
+      - pair that differs    -> flagged as a POSSIBLE NEWER VERSION with sizes and
+        modified times (CopyLooksNewer marks the copy whose mtime is newer).
+    Nothing is ever moved, renamed or deleted by this report.
+.EXAMPLE
+    $vp = Get-SysOrgVersionPairs -Inventory $inv -Config $cfg
+    $vp.Versions[0].CopyLooksNewer   # -> $true
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()]$Inventory,$Config,$DupGroups,$FileCache,[hashtable]$NewEntries)
+    $versions = New-Object System.Collections.Generic.List[object]
+    $identical = 0
+    $groups = @{}
+    foreach($f in @($Inventory)){
+        if("$($f.Category)" -eq 'SkippedLongPath'){ continue }
+        # EVERY file is grouped under its counter-stripped stem, so the group holds
+        # the original AND the re-download copies together
+        $stem = [string]$f.Stem
+        $base = $stem
+        if("$stem" -match '^(?<b>.+?)[ ]?\(\d+\)$'){ $base = $Matches.b }
+        if([string]::IsNullOrWhiteSpace($base)){ continue }
+        $key = ($base + [string]$f.Extension).ToLowerInvariant()
+        if(-not $groups.ContainsKey($key)){ $groups[$key] = New-Object System.Collections.Generic.List[object] }
+        [void]$groups[$key].Add($f)
+    }
+    foreach($k in ($groups.Keys | Sort-Object)){
+        # @() on a generic List[object] throws 'Argument types do not match' - ToArray
+        $members = $groups[$k].ToArray()
+        if($members.Count -lt 2){ continue }
+        $original = $null
+        $copies = New-Object System.Collections.Generic.List[object]
+        foreach($m in $members){
+            if([string]$m.Stem -match '[ ]?\(\d+\)$'){ [void]$copies.Add($m) }
+            elseif(-not $original){ $original = $m }
+            else { [void]$copies.Add($m) }
+        }
+        if(-not $original -or $copies.Count -eq 0){ continue }
+        foreach($cp in $copies){
+            $h1 = Get-SysOrgVersionPairHash -Path ([string]$original.FullName) -FileCache $FileCache -NewEntries $NewEntries
+            $h2 = Get-SysOrgVersionPairHash -Path ([string]$cp.FullName) -FileCache $FileCache -NewEntries $NewEntries
+            if($h1 -and $h2 -and ("$h1" -ieq "$h2")){ $identical++; continue }   # exact copy: copies policy handles it
+            $copyLooksNewer = $false
+            try { $copyLooksNewer = ((Get-Item -LiteralPath ([string]$cp.FullName) -Force).LastWriteTimeUtc -gt (Get-Item -LiteralPath ([string]$original.FullName) -Force).LastWriteTimeUtc) } catch { }
+            [void]$versions.Add([pscustomobject]@{
+                Original=[string]$original.FullName; Copy=[string]$cp.FullName
+                OriginalSize=[long]$original.Length; CopySize=[long]$cp.Length
+                OriginalLastWrite=([datetime]$original.LastWriteTime).ToString('s'); CopyLastWrite=([datetime]$cp.LastWriteTime).ToString('s')
+                CopyLooksNewer=[bool]$copyLooksNewer
+            })
+        }
+    }
+    return [pscustomobject]@{ Identical=$identical; Versions=$versions.ToArray() }
+}
+
 function Find-SysOrgDuplicates {
 <#
 .SYNOPSIS
@@ -1308,10 +1423,18 @@ function Find-SysOrgDuplicates {
     param($Inventory,$Config,$FileCache,[hashtable]$NewEntries,[int]$Parallelism=1,[long]$BytesHashed=[long]0)
     $groups = New-Object System.Collections.Generic.List[object]
     $minKB    = Get-SysOrgSetting $Config 'Copies.MinFileSizeKB' 256
+    $docMinKB = Get-SysOrgSetting $Config 'Copies.DocMinFileSizeKB' 0
     $headerKB = Get-SysOrgSetting $Config 'Copies.HeaderHashKB' 64
     $minBytes = [int64]$minKB * 1KB
-
-    $sizeCandidates = @($Inventory | Where-Object { $_.Category -ne 'SkippedLongPath' -and $_.Length -ge $minBytes } | Group-Object -Property Length | Where-Object { $_.Count -gt 1 })
+    $docMinBytes = [int64]$docMinKB * 1KB
+    # v3.0.1 B5: the size floor applies to MEDIA and INSTALLERS only. Documents and
+    # data files (Documents/Spreadsheets/Presentations/Databases) use the document
+    # floor (default 0) - size-grouping is cheap, so small duplicate docs collapse
+    # too. Both floors are precomputed once (see Get-SysOrgDuplicateFloor).
+    $sizeCandidates = @($Inventory | Where-Object {
+        ("$($_.Category)" -ne 'SkippedLongPath') -and
+        ([int64]$_.Length -ge $(if($_.Category -in @('Documents','Spreadsheets','Presentations','Databases')){ $docMinBytes } else { $minBytes }))
+    } | Group-Object -Property Length | Where-Object { $_.Count -gt 1 })
     $total = $sizeCandidates.Count; $done = 0
     $fullCandidates = New-Object System.Collections.Generic.List[object]      # records needing a full hash
     $headTailMap = @{}                                                        # path -> head+tail hash

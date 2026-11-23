@@ -138,7 +138,14 @@
         Policy               = 'NumberCopies'
         SuffixStyle          = 'Parentheses'   # Parentheses | DashCopy (Explorer paste style)
         StartIndex           = 2               # the original is implicitly 1
-        MinFileSizeKB        = 256             # ignore tiny files (thousands of 1 KB dupes)
+        # v3.0.1 B5: the size floor applies to MEDIA and INSTALLERS only. Documents and
+        # data files (Documents/Spreadsheets/Presentations/Databases) use DocMinFileSizeKB
+        # (default 0 = no floor) - size-grouping is cheap, so small duplicate documents
+        # collapse into the copies policy too. 'name(1).ext' re-download pairs are also
+        # compared: hash-identical pairs collapse into the policy; pairs that differ are
+        # flagged 'possible newer version' in the preview (report-only, never moved).
+        MinFileSizeKB        = 256             # media/installer floor (thousands of tiny cache files)
+        DocMinFileSizeKB     = 0               # documents/data floor (0 = hash small docs too)
         HeaderHashKB         = 64              # fast pre-filter before full SHA256
         QuarantineFolderName = '_Duplicates'   # used only when Policy = Quarantine
         RenameToKeeper       = $false          # $true = copies take the keeper's stem (v2.1.0 behaviour)

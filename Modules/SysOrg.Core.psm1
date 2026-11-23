@@ -229,7 +229,7 @@ function Import-SysOrgConfig {
                       NoiseTokens=@('copy','copie','final','new','old','backup','bak','draft','rev','revised','edit','edited','version','untitled')
                       StripVersionSuffix=$true; KeepDates=$true; MaxNameLength=60 }
         Copies   = @{ Policy='NumberCopies'; SuffixStyle='Parentheses'; StartIndex=2
-                      MinFileSizeKB=256; HeaderHashKB=64; QuarantineFolderName='_Duplicates'
+                      MinFileSizeKB=256; DocMinFileSizeKB=0; HeaderHashKB=64; QuarantineFolderName='_Duplicates'
                       RenameToKeeper=$false }
         Downloads = @{ Roots=@('Downloads'); GroupBy='SourceFirst'; DateFolders='Year'
                        UseZoneIdentifier=$true; UnknownSourceFolder='_NoSource' }

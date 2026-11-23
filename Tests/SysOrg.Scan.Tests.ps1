@@ -628,3 +628,79 @@ Describe 'User collections detection (v3.0.1 B2)' {
         @(Get-SysOrgUserCollections -Inventory $inv -Roots @($root) -Config @{ Folders=@{ PreserveUserCollections=$false } } -KnownFolders @()).Count | Should -Be 0
     }
 }
+
+Describe 'Duplicates for small documents and re-download version pairs (v3.0.1 B5)' {
+
+    BeforeAll {
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Layout.psm1') -Force
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Classify.psm1') -Force
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Cache.psm1') -Force
+        function New-SysOrgB5Record {
+            param([string]$Path,[string]$Cat)
+            $fi = Get-Item -LiteralPath $Path -Force
+            [pscustomobject]@{ FullName=$Path; Name=(Split-Path $Path -Leaf); Stem=([System.IO.Path]::GetFileNameWithoutExtension($Path))
+                Extension=([System.IO.Path]::GetExtension($Path).ToLowerInvariant()); Length=[long]$fi.Length
+                LastWriteTime=$fi.LastWriteTime; Directory=(Split-Path $Path -Parent); Category=$Cat }
+        }
+        $script:b5Cfg = @{ Copies=@{ Policy='NumberCopies'; SuffixStyle='Parentheses'; StartIndex=2; MinFileSizeKB=256; DocMinFileSizeKB=0; HeaderHashKB=64 } }
+    }
+
+    It 'the floor helper: documents/data are floor-free; media and installers keep 256 KB' {
+        (Get-SysOrgDuplicateFloor -Category 'Documents' -Config $script:b5Cfg) | Should -Be 0
+        (Get-SysOrgDuplicateFloor -Category 'Spreadsheets' -Config $script:b5Cfg) | Should -Be 0
+        (Get-SysOrgDuplicateFloor -Category 'Presentations' -Config $script:b5Cfg) | Should -Be 0
+        (Get-SysOrgDuplicateFloor -Category 'Databases' -Config $script:b5Cfg) | Should -Be 0
+        (Get-SysOrgDuplicateFloor -Category 'Images' -Config $script:b5Cfg) | Should -Be ([long](256KB))
+        (Get-SysOrgDuplicateFloor -Category 'Installers' -Config $script:b5Cfg) | Should -Be ([long](256KB))
+    }
+
+    It 'a small duplicate document collapses into one copies group (256 KB floor no longer blocks documents)' {
+        $d1 = Join-Path $TestDrive 'Report_2026-11-21.docx'
+        $d2 = Join-Path $TestDrive 'Report_2026-11-21(1).docx'
+        Set-Content -LiteralPath $d1 -Value ('R' * 400) -Encoding ASCII    # 400 bytes < 256 KB
+        Set-Content -LiteralPath $d2 -Value ('R' * 400) -Encoding ASCII    # identical bytes
+        (Get-Item -LiteralPath $d1).LastWriteTime = Get-Date '2026-11-21 09:00'
+        (Get-Item -LiteralPath $d2).LastWriteTime = Get-Date '2026-11-21 10:00'
+        $inv = @((New-SysOrgB5Record -Path $d1 -Cat 'Documents'), (New-SysOrgB5Record -Path $d2 -Cat 'Documents'))
+        $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $script:b5Cfg)
+        $dups.Count | Should -Be 1
+        $dups[0].KeepPath | Should -Be $d1                  # oldest wins
+        (@($dups[0].Duplicates) -contains $d2) | Should -BeTrue
+        # the re-download pair is recognized as identical and collapses into the policy
+        $vp = Get-SysOrgVersionPairs -Inventory $inv -Config $script:b5Cfg -DupGroups $dups
+        $vp.Identical | Should -Be 1
+        @($vp.Versions).Count | Should -Be 0
+    }
+
+    It 'a re-download pair that DIFFERS is flagged as a possible newer version - report only' {
+        $d1 = Join-Path $TestDrive 'Guide_2026-11-20.pdf'
+        $d2 = Join-Path $TestDrive 'Guide_2026-11-20 (1).pdf'
+        Set-Content -LiteralPath $d1 -Value ('A' * 500) -Encoding ASCII
+        Set-Content -LiteralPath $d2 -Value ('B' * 700) -Encoding ASCII
+        (Get-Item -LiteralPath $d1).LastWriteTime = Get-Date '2026-11-20 08:00'
+        (Get-Item -LiteralPath $d2).LastWriteTime = Get-Date '2026-11-20 09:30'
+        $inv = @((New-SysOrgB5Record -Path $d1 -Cat 'Documents'), (New-SysOrgB5Record -Path $d2 -Cat 'Documents'))
+        $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $script:b5Cfg)
+        $dups.Count | Should -Be 0                          # different bytes -> no copies group
+        $vp = Get-SysOrgVersionPairs -Inventory $inv -Config $script:b5Cfg -DupGroups $dups
+        $vp.Identical | Should -Be 0
+        @($vp.Versions).Count | Should -Be 1
+        $v = $vp.Versions[0]
+        $v.Original | Should -Be $d1
+        $v.Copy | Should -Be $d2
+        # Set-Content appends a newline: 500/700 chars -> 501/701 bytes
+        $v.OriginalSize | Should -Be 501
+        $v.CopySize | Should -Be 701
+        $v.CopyLooksNewer | Should -BeTrue
+        $v.CopyLastWrite | Should -Match '^2026-11-20T09'
+    }
+
+    It 'a media pair under the 256 KB floor stays out of duplicate detection' {
+        $m1 = Join-Path $TestDrive 'clip-a.mp4'
+        $m2 = Join-Path $TestDrive 'clip-b.mp4'
+        Set-Content -LiteralPath $m1 -Value ('M' * 400) -Encoding ASCII
+        Set-Content -LiteralPath $m2 -Value ('M' * 400) -Encoding ASCII
+        $inv = @((New-SysOrgB5Record -Path $m1 -Cat 'Videos'), (New-SysOrgB5Record -Path $m2 -Cat 'Videos'))
+        @(Find-SysOrgDuplicates -Inventory $inv -Config $script:b5Cfg).Count | Should -Be 0
+    }
+}

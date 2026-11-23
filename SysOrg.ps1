@@ -224,13 +224,18 @@ function Invoke-SysOrgScanFlow {
     if($Parallelism -gt 0){ $par = $Parallelism }
     $dups = @(Find-SysOrgDuplicates -Inventory $inv -Config $Config -FileCache $fileCache -NewEntries $newCacheEntries -Parallelism $par)
     Write-Host ("Duplicate groups found: {0}" -f @($dups).Count)
+    # v3.0.1 B5: re-download version pairs - report-only, never moved
+    $versionPairs = @(Get-SysOrgVersionPairs -Inventory $inv -Config $Config -DupGroups $dups -FileCache $fileCache -NewEntries $newCacheEntries)[0]
+    if($versionPairs -and @($versionPairs.Versions).Count -gt 0){
+        Write-Host ("Possible newer-version pairs (report only): {0}" -f @($versionPairs.Versions).Count) -ForegroundColor Yellow
+    }
     $projects = @(Get-SysOrgProjectFolders -Roots @($rootsInfo.Initial) -Config $Config -DriveProfile $prof -KnownFolders @($prof.KnownFolders))
     if(@($projects).Count -gt 0){ Write-Host ("Code project folders detected: {0} (moved whole, .git intact)" -f @($projects).Count) }
     # v3.0.1 B2: user collections - user-named folders inside the scan roots move as
     # ONE unit (structure intact), chosen by the majority classification of contents.
     $collections = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($rootsInfo.Initial) -Config $Config -KnownFolders @($prof.KnownFolders))
     if(@($collections).Count -gt 0){ Write-Host ("User collections detected: {0} (each moves whole, never flattened)" -f @($collections).Count) }
-    $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -FileCache $fileCache -NewCacheEntries $newCacheEntries
+    $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries
     # persist the updated file-state cache (best effort - it is a performance cache)
     foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
     $null = Save-SysOrgFileStateCache -Path $cachePath -Entries $fileCache
