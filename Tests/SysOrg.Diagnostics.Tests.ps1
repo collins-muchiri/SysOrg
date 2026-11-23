@@ -50,14 +50,11 @@ Describe 'Write-SysOrgErrorDiagnostic (v3.0.2 A1)' {
         function Thrower3 { throw 'third synthetic fault' }
         $err = $null
         try { Thrower3 } catch { $err = $_ }
-        # an impossible path: the parent is a real FILE, so no folder can ever
-        # exist under it (v3.0.2 CI: a fresh 'C:\definitely\missing\...' chain is
-        # CREATABLE on a clean runner - the fixture must stay impossible everywhere)
-        $badRoot = if($env:OS -eq 'Windows_NT'){
-            $fileAsParent = Join-Path $TestDrive ('notadir-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.txt')
-            Set-Content -LiteralPath $fileAsParent -Value 'a file, never a folder'
-            Join-Path $fileAsParent 'sub'
-        } else { '/proc/definitely-not-writable/sysorg' }
+        # an uncreatable path: '<' and '>' are illegal in NTFS names, so no API
+        # can ever create a folder here - unlike a fresh 'C:\definitely\missing\...'
+        # chain (creatable on a clean runner) or a file-as-parent (which
+        # New-Item -Force REPLACES with a directory on PS 5.1)
+        $badRoot = if($env:OS -eq 'Windows_NT'){ 'C:\sysorg-test<illegal>name\sub' } else { '/proc/definitely-not-writable/sysorg' }
         { $null = Write-SysOrgErrorDiagnostic -ErrorRecord $err -LogFolder $badRoot -Phase 'preview' } | Should -Not -Throw
     }
 }
@@ -78,13 +75,10 @@ Describe 'Transcript capture (v3.0.2 A4)' {
     }
 
     It 'never throws when the log folder cannot exist' {
-        # the parent is a real FILE, so the folder is uncreatable on any host
-        # (v3.0.2 CI: 'C:\definitely\missing\...' is creatable on a clean runner)
-        $badRoot = if($env:OS -eq 'Windows_NT'){
-            $fileAsParent = Join-Path $TestDrive ('notadir-' + [guid]::NewGuid().ToString('N').Substring(0,8) + '.txt')
-            Set-Content -LiteralPath $fileAsParent -Value 'a file, never a folder'
-            Join-Path $fileAsParent 'sub'
-        } else { '/proc/definitely-not-writable/sysorg' }
+        # '<' and '>' are illegal in NTFS names - the folder is uncreatable by
+        # ANY API on every Windows host (New-Item -Force even REPLACES a file
+        # parent with a directory on PS 5.1, so a file-as-parent is not enough)
+        $badRoot = if($env:OS -eq 'Windows_NT'){ 'C:\sysorg-test<illegal>name\sub' } else { '/proc/definitely-not-writable/sysorg' }
         { $null = Start-SysOrgTranscriptCapture -LogFolder $badRoot } | Should -Not -Throw
         $p2 = Start-SysOrgTranscriptCapture -LogFolder $badRoot
         "$p2" | Should -Be ''

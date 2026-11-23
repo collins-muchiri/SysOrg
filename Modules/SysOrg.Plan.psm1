@@ -2228,9 +2228,10 @@ function Get-SysOrgPlanInputFingerprint {
 .DESCRIPTION
     SHA256 over: drive letter, destination root, layout profile, copies policy and
     the sorted 'path|size|mtimeUtcTicks' of the inventory (long-path records
-    excluded). Two scans of the same tree in the same state produce the same
-    fingerprint - so re-running an identical scan can REUSE the existing plan
-    instead of building a duplicate. Deterministic.
+    excluded; mtimes quantized to WHOLE SECONDS - see the note below). Two scans
+    of the same tree in the same state produce the same fingerprint - so re-running
+    an identical scan can REUSE the existing plan instead of building a duplicate.
+    Deterministic.
 .EXAMPLE
     Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv -Config $cfg -DriveProfile $prof
 #>
@@ -2244,8 +2245,15 @@ function Get-SysOrgPlanInputFingerprint {
     [void]$parts.Add(('copies={0}' -f "$(Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies')"))
     [void]$parts.Add(('deststyle={0}' -f "$(Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot')"))
     foreach($f in (@($Inventory) | Where-Object { "$($_.Category)" -ne 'SkippedLongPath' } | Sort-Object { "$($_.FullName)" })){
-        $ticks = 0
-        try { $ticks = ([datetime]$f.LastWriteTime).ToUniversalTime().Ticks } catch { $ticks = 0 }
+        $ticks = [long]0
+        try { $ticks = ([datetime]$f.LastWriteTime).ToUniversalTime().Ticks } catch { $ticks = [long]0 }
+        # v3.0.2 CI: quantize to WHOLE SECONDS. The inventory cache round-trip on
+        # Windows PowerShell 5.1 serializes DateTimes with MILLISECOND precision
+        # (pwsh 7 round-trips losslessly), so on the supported runtime a cache-hit
+        # second run always produced different ticks from the fresh first run and
+        # never reused its plan. One-second granularity matches the documented
+        # 2-second drift tolerance the cache validation and the executor already use.
+        $ticks = $ticks - ($ticks % [long]10000000)
         [void]$parts.Add(('{0}|{1}|{2}' -f "$($f.FullName)", [long]$f.Length, $ticks))
     }
     $sha = [System.Security.Cryptography.SHA256]::Create()

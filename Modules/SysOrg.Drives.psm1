@@ -117,6 +117,48 @@ function Get-SysOrgDrive {
             DetectionBasis = $basis
         })
     }
+
+    # v3.0.2 CI: drive letters that exist on the FILESYSTEM but have no volume
+    # object - a 'subst' mapping creates a DOS device alias, not a volume, so
+    # Get-Volume never reports it and -ScanDrive on such a letter failed with
+    # 'could not be profiled' although the tree is perfectly scannable. DriveInfo
+    # sees them; their evidence is limited and the confidence says so, exactly
+    # like the module's other low-confidence fallbacks. Never invents letters:
+    # only letters the filesystem actually serves, and only ones Get-Volume missed.
+    # Windows only: a subst alias is a Windows concept, and portable hosts must
+    # keep the old behaviour exactly.
+    if($env:OS -eq 'Windows_NT'){
+        try{
+            $known = @($results | ForEach-Object { "$($_.Drive)".TrimEnd(':') })
+            foreach($di in [System.IO.DriveInfo]::GetDrives()){
+                $dLetter = "$($di.Name)".TrimEnd('\', ':').ToUpperInvariant()
+                if(-not $dLetter -or ($known -contains $dLetter)){ continue }
+                if($Letters -and ($Letters -notcontains $dLetter)){ continue }
+                $dt = $di.DriveType
+                if($dt -ne [System.IO.DriveType]::Fixed -and $dt -ne [System.IO.DriveType]::Removable){ continue }
+                if(-not $di.IsReady){ continue }
+                $sizeGB = 0; $freeGB = 0
+                try { $sizeGB = [math]::Round($di.TotalSize/1GB,1) } catch { }
+                try { $freeGB = [math]::Round($di.AvailableFreeSpace/1GB,1) } catch { }
+                $rLocation = 'Internal'; $rConfidence = 'Low'
+                $rBasis = 'Drive letter served by the filesystem without volume metadata (subst or virtual mapping)'
+                if($dt -eq [System.IO.DriveType]::Removable){ $rLocation = 'External'; $rConfidence = 'High'; $rBasis = 'DriveInfo reports Removable media (no volume object)' }
+                $results.Add([pscustomobject]@{
+                    Drive          = "$dLetter`:"
+                    Label          = "$($di.VolumeLabel)"
+                    FileSystem     = $di.DriveFormat
+                    SizeGB         = $sizeGB
+                    FreeGB         = $freeGB
+                    MediaType      = 'Unknown'
+                    BusType        = 'Unknown'
+                    Location       = $rLocation
+                    Confidence     = $rConfidence
+                    DetectionBasis = $rBasis
+                })
+            }
+        } catch { Write-Verbose "DriveInfo fallback unavailable: $($_.Exception.Message)" }
+    }
+
     return ($results.ToArray() | Sort-Object Drive)
 }
 
