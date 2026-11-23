@@ -1073,6 +1073,256 @@ function Get-SysOrgUserCollections {
     return $result.ToArray()
 }
 
+function Test-SysOrgAppUnderScanRoot {
+<#
+.SYNOPSIS
+    True when the SysOrg app folder itself sits INSIDE a scan root (v3.0.1 D4).
+.DESCRIPTION
+    The real run had SysOrg living under Downloads. The app folder stays protected
+    (it is always excluded from scans and moves), but a warning should recommend
+    moving it out: every plan preview otherwise shows a protected island in the
+    middle of the scanned tree, and app folders inside scan roots confuse provenance.
+.EXAMPLE
+    Test-SysOrgAppUnderScanRoot -AppRoot 'C:\\Users\\t\\Downloads\\SysOrg' -ScanRoots @('C:\\Users\\t\\Downloads')
+#>
+    [CmdletBinding()]
+    param([AllowNull()][string]$AppRoot,[AllowEmptyCollection()][string[]]$ScanRoots)
+    if([string]::IsNullOrWhiteSpace("$AppRoot")){ return $false }
+    $app = ("$AppRoot").TrimEnd('\\').TrimEnd('/')
+    if([string]::IsNullOrWhiteSpace($app)){ return $false }
+    foreach($r in @($ScanRoots)){
+        if([string]::IsNullOrWhiteSpace("$r")){ continue }
+        $r2 = ("$r").TrimEnd('\\').TrimEnd('/')
+        if([string]::IsNullOrWhiteSpace($r2)){ continue }
+        if($app -ieq $r2){ return $true }
+        $lc = $app.ToLowerInvariant(); $rl = $r2.ToLowerInvariant()
+        if($lc.StartsWith($rl + '\',[StringComparison]::OrdinalIgnoreCase) -or $lc.StartsWith($rl + '/',[StringComparison]::OrdinalIgnoreCase)){ return $true }
+    }
+    return $false
+}
+
+function Get-SysOrgFolderRiskLabel {
+<#
+.SYNOPSIS
+    A risk label for a top-level folder on a Data/Removable drive (v3.0.1 D2).
+.DESCRIPTION
+    Labels: 'code project' (two project markers), 'VCS repository' (.git/.hg/...),
+    'note vault' (.obsidian - Obsidian), 'model store' (ollama/models/huggingface/
+    lm-studio), 'app store' (node_modules, Packages), 'installer collection'
+    (>= half the visible files are installers/ISOs), 'OS/tool folder' (system-ish
+    names). Returns '' when there is no risk signal. Label only - never moves.
+.EXAMPLE
+    Get-SysOrgFolderRiskLabel -Name 'ollama' -Dir 'D:\ollama'   # -> 'model store'
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name,[Parameter(Mandatory)][string]$Dir,$Config)
+    $lc = "$Name".ToLowerInvariant()
+    $dir = "$Dir"
+    foreach($n in @('windows','program files','program files (x86)','programdata','$recycle.bin',
+                    'system volume information','recovery','msocache','perflogs','boot','tools','bin','opt','usr','etc')){
+        if($lc -eq $n){ return 'OS/tool folder' }
+    }
+    if(Test-Path -LiteralPath (Join-Path $dir '.obsidian')){ return 'note vault' }
+    foreach($n in @('ollama','models','huggingface','lm-studio','lm_studio','model-store','comfyui')){
+        if($lc -eq $n){ return 'model store' }
+    }
+    foreach($m in @('.git','.hg','.svn','.jj')){
+        if(Test-Path -LiteralPath (Join-Path $dir $m)){ return 'VCS repository' }
+    }
+    if((Test-Path -LiteralPath (Join-Path $dir 'node_modules')) -or (Test-Path -LiteralPath (Join-Path $dir 'Packages'))){
+        return 'app store'
+    }
+    $markers = @(Get-SysOrgSetting $Config 'Projects.Markers' @())
+    if($markers.Count -eq 0){
+        $markers = @('.gitignore','package.json','package-lock.json','yarn.lock','Cargo.toml','go.mod',
+                     'pyproject.toml','setup.py','Makefile','CMakeLists.txt','*.sln','*.csproj')
+    }
+    $entries = @()
+    try { $entries = @([System.IO.Directory]::GetFileSystemEntries($dir) | ForEach-Object { Split-Path $_ -Leaf }) } catch { $entries = @() }
+    if(($entries.Count -gt 0) -and (Test-SysOrgProjectMarkers -Entries $entries -Markers $markers)){ return 'code project' }
+    try{
+        $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue | Select-Object -First 200)
+        if($files.Count -ge 4){
+            $inst = @($files | Where-Object { $_.Extension -in @('.exe','.msi','.msix','.appx','.iso','.apk') })
+            if(($inst.Count / $files.Count) -ge 0.5){ return 'installer collection' }
+        }
+    } catch { }
+    return ''
+}
+
+function Get-SysOrgScanRootOptions {
+<#
+.SYNOPSIS
+    The top-level folders of a drive with risk labels and default include/exclude decisions (v3.0.1 D2).
+.DESCRIPTION
+    FullDrive scope is never the silent default on Data/Removable drives: the picker
+    lists the top-level folders, labels the risky ones and EXCLUDES BY DEFAULT every
+    folder labeled 'note vault', 'model store', 'app store', 'VCS repository' or
+    'OS/tool folder'. Excluded folders are never scanned, hence never moved.
+.EXAMPLE
+    Get-SysOrgScanRootOptions -Letter D -Config $cfg
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,$Config)
+    $options = New-Object System.Collections.Generic.List[object]
+    $root = ('{0}:\' -f $Letter)
+    if(-not (Test-Path -LiteralPath $root)){ return $options.ToArray() }
+    $topDirs = @()
+    try { $topDirs = @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue) } catch { $topDirs = @() }
+    foreach($d in $topDirs){
+        $risk = Get-SysOrgFolderRiskLabel -Name $d.Name -Dir $d.FullName -Config $Config
+        $exclude = $risk -in @('note vault','model store','app store','VCS repository','OS/tool folder')
+        [void]$options.Add([pscustomobject]@{
+            Path=([string]$d.FullName); Name=[string]$d.Name; Risk=$risk
+            DefaultInclude=(-not $exclude)
+        })
+    }
+    return $options.ToArray()
+}
+
+function Save-SysOrgUserScanRoots {
+<#
+.SYNOPSIS
+    Remembers the user's scan-root choice for a drive (v3.0.1 D2).
+.DESCRIPTION
+    Writes <AppRoot>\Config\ScanRoots.json atomically (temp + move):
+    @{ 'D': [absolute roots...], ... }. The remembered choice drives every future scan.
+.EXAMPLE
+    Save-SysOrgUserScanRoots -Letter D -Roots @('D:\Photos','D:\Docs') -AppRoot C:\SysOrg
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,[AllowEmptyCollection()][string[]]$Roots,[Parameter(Mandatory)][string]$AppRoot)
+    try{
+        $cfgDir = Join-Path $AppRoot 'Config'
+        if(-not (Test-Path -LiteralPath $cfgDir)){ New-Item -ItemType Directory -Path $cfgDir -Force | Out-Null }
+        $path = Join-Path $cfgDir 'ScanRoots.json'
+        $store = @{}
+        if(Test-Path -LiteralPath $path){
+            try{
+                $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+                foreach($p in $loaded.PSObject.Properties){ $store[$p.Name] = @($p.Value) }
+            } catch { $store = @{} }
+        }
+        $store["$Letter".ToUpper()] = @($Roots)
+        $ordered = [ordered]@{}
+        foreach($k in ($store.Keys | Sort-Object)){ $ordered[$k] = $store[$k] }
+        $tmp = "$path.tmp"
+        ($ordered | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $path -Force
+        return $path
+    } catch {
+        Write-Verbose "Scan-root choice could not be saved: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-SysOrgUserScanRoots {
+<#
+.SYNOPSIS
+    The remembered scan roots for a drive, or $null when none were saved (v3.0.1 D2).
+.EXAMPLE
+    Get-SysOrgUserScanRoots -Letter D -AppRoot C:\SysOrg   # -> @('D:\Photos', ...)
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,[Parameter(Mandatory)][string]$AppRoot)
+    $path = Join-Path (Join-Path $AppRoot 'Config') 'ScanRoots.json'
+    if(-not (Test-Path -LiteralPath $path)){ return $null }
+    try{
+        $loaded = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $prop = $loaded.PSObject.Properties["$Letter".ToUpper()]
+        if($prop -and @($prop.Value).Count -gt 0){ return @($prop.Value) }
+    } catch { }
+    return $null
+}
+
+function Get-SysOrgSimilarFolders {
+<#
+.SYNOPSIS
+    REPORT-ONLY similar-folder detection by file-hash overlap (v3.0.1 D3).
+.DESCRIPTION
+    Fingerprints every folder (within -MaxDepth of the roots, up to -MaxFilesPerFolder
+    files) by the SET of its file content hashes, then lists pairs with >= -Overlap
+    (default 0.80) overlap computed as |A and B| / min(|A|, |B|). Typical hit:
+    '-v1' copies of a project folder. Each pair reports file counts, total bytes and
+    the folders' last-modified dates. NOTHING is ever moved, merged or deleted -
+    the report exists so the USER can decide what to keep.
+.EXAMPLE
+    $r = Get-SysOrgSimilarFolders -Roots @('D:\\Projects') -Config $cfg
+    $r.Pairs[0].Overlap   # -> 0.85
+#>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Roots,$Config,
+          [int]$MaxDepth=3,[int]$MaxFilesPerFolder=400,[double]$Overlap=0.80,[int]$MaxFolders=300)
+    $pairs = New-Object System.Collections.Generic.List[object]
+    if(-not $Roots -or @($Roots).Count -eq 0){ return [pscustomobject]@{ Pairs=$pairs.ToArray(); FoldersCompared=0 } }
+    $fingerprints = @{}      # dir key -> @{ Hashes=set; Bytes; LastWrite; FileCount }
+    $stack = New-Object System.Collections.Stack
+    foreach($r in @($Roots)){ if(Test-Path -LiteralPath $r){ [void]$stack.Push(@{ Path=[string]$r; Depth=0 }) } }
+    $folderCount = 0
+    while($stack.Count -gt 0){
+        $item = $stack.Pop()
+        $dir = [string]$item.Path; $depth = [int]$item.Depth
+        if($folderCount -ge $MaxFolders){ break }
+        try{
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            if(($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq [System.IO.FileAttributes]::ReparsePoint){ continue }
+            if(($di.Attributes -band [System.IO.FileAttributes]::Hidden) -eq [System.IO.FileAttributes]::Hidden){ continue }
+        } catch { continue }
+        # fingerprint THIS folder (its direct files only; subfolders get their own)
+        $hashes = New-Object System.Collections.Generic.HashSet[string]
+        $bytes = [long]0
+        $lastWrite = $di.LastWriteTimeUtc
+        try{
+            $n = 0
+            foreach($f in $di.EnumerateFiles()){
+                if($n -ge $MaxFilesPerFolder){ break }
+                try{
+                    $h = Get-SysOrgFileHash -Path $f.FullName
+                    if($h){ [void]$hashes.Add($h); $bytes += [long]$f.Length; $n++ }
+                } catch { }
+            }
+        } catch { }
+        if($hashes.Count -gt 0){
+            $key = ("$dir").TrimEnd('\').ToLowerInvariant()
+            if(-not $fingerprints.ContainsKey($key)){
+                $fingerprints[$key] = @{ Hashes=$hashes; Bytes=$bytes; LastWrite=$lastWrite; Path=$dir; FileCount=$hashes.Count }
+                $folderCount++
+            }
+        }
+        if($depth -lt $MaxDepth){
+            try{
+                foreach($k in $di.EnumerateDirectories()){
+                    if($k.Name -in @('.git','node_modules','_Index','_Duplicates','_Review','_Reports')){ continue }
+                    [void]$stack.Push(@{ Path=$k.FullName; Depth=($depth+1) })
+                }
+            } catch { }
+        }
+    }
+    # pair comparison, deterministic order
+    $keys = @($fingerprints.Keys | Sort-Object)
+    for($i = 0; $i -lt $keys.Count; $i++){
+        for($j = $i + 1; $j -lt $keys.Count; $j++){
+            $A = $fingerprints[$keys[$i]]
+            $B = $fingerprints[$keys[$j]]
+            $common = 0
+            foreach($h in $A.Hashes){ if($B.Hashes.Contains($h)){ $common++ } }
+            $minCount = [Math]::Min($A.Hashes.Count, $B.Hashes.Count)
+            if($minCount -lt 2){ continue }
+            $ov = [Math]::Round([double]$common / [double]$minCount, 4)
+            if($ov -ge $Overlap){
+                [void]$pairs.Add([pscustomobject]@{
+                    FolderA=$A.Path; FolderB=$B.Path
+                    FilesA=$A.Hashes.Count; FilesB=$B.Hashes.Count; Common=$common
+                    Overlap=$ov; BytesA=$A.Bytes; BytesB=$B.Bytes
+                    LastWriteA=([datetime]$A.LastWrite).ToString('yyyy-MM-dd'); LastWriteB=([datetime]$B.LastWrite).ToString('yyyy-MM-dd')
+                })
+            }
+        }
+    }
+    $sortedPairs = @(@($pairs.ToArray()) | Sort-Object -Property @{e={ -$_.Overlap }}, { $_.FolderA })
+    return [pscustomobject]@{ Pairs=$sortedPairs; FoldersCompared=$folderCount }
+}
+
 function Test-SysOrgProjectMarkers {
 <#
 .SYNOPSIS

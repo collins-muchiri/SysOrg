@@ -2097,6 +2097,118 @@ function New-SysOrgLayoutMigrationPlan {
     }
 }
 
+function Get-SysOrgPlanInputFingerprint {
+<#
+.SYNOPSIS
+    A stable fingerprint of a plan's INPUTS (v3.0.1 D1).
+.DESCRIPTION
+    SHA256 over: drive letter, destination root, layout profile, copies policy and
+    the sorted 'path|size|mtimeUtcTicks' of the inventory (long-path records
+    excluded). Two scans of the same tree in the same state produce the same
+    fingerprint - so re-running an identical scan can REUSE the existing plan
+    instead of building a duplicate. Deterministic.
+.EXAMPLE
+    Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv -Config $cfg -DriveProfile $prof
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Letter,[AllowEmptyCollection()]$Inventory,
+          [Parameter(Mandatory)]$Config,[Parameter(Mandatory)]$DriveProfile)
+    $parts = New-Object System.Collections.Generic.List[string]
+    [void]$parts.Add(('letter={0}' -f $Letter))
+    try { [void]$parts.Add(('root={0}' -f (Get-SysOrgDestinationRoot -Letter $Letter -Config $Config))) } catch { }
+    try { [void]$parts.Add(('layout={0}' -f (Get-SysOrgLayoutProfile -Config $Config))) } catch { }
+    [void]$parts.Add(('copies={0}' -f "$(Get-SysOrgSetting $Config 'Copies.Policy' 'NumberCopies')"))
+    [void]$parts.Add(('deststyle={0}' -f "$(Get-SysOrgSetting $Config 'DestinationStyle' 'OrganizedRoot')"))
+    foreach($f in (@($Inventory) | Where-Object { "$($_.Category)" -ne 'SkippedLongPath' } | Sort-Object { "$($_.FullName)" })){
+        $ticks = 0
+        try { $ticks = ([datetime]$f.LastWriteTime).ToUniversalTime().Ticks } catch { $ticks = 0 }
+        [void]$parts.Add(('{0}|{1}|{2}' -f "$($f.FullName)", [long]$f.Length, $ticks))
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try{
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($parts -join ";"))
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','')
+    } finally { $sha.Dispose() }
+}
+
+function Get-SysOrgPlanList {
+<#
+.SYNOPSIS
+    The newest saved plans with their status (v3.0.1 D1).
+.DESCRIPTION
+    Returns up to -Top plans, newest first, each with PlanId, Drive, MoveCount,
+    Age (human), Executed (an undo journal exists) and Path. Best effort: unreadable
+    plan files are skipped.
+.EXAMPLE
+    Get-SysOrgPlanList -PlansFolder C:\SysOrg\Plans -Top 10
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$PlansFolder,[int]$Top=10)
+    $rows = New-Object System.Collections.Generic.List[object]
+    if(-not (Test-Path -LiteralPath $PlansFolder)){ return $rows.ToArray() }
+    $files = @(Get-ChildItem -LiteralPath $PlansFolder -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    $shown = 0
+    foreach($f in $files){
+        if($shown -ge $Top){ break }
+        try{
+            $p = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+            if(-not ($p.PSObject.Properties['PlanId'])){ continue }
+            $moveCount = 0
+            try { $moveCount = @(@($p.Actions) | Where-Object { "$($_.Action)" -eq 'Move' -and -not ($_.PSObject.Properties['Kind'] -and "$($_.Kind)" -eq 'Folder') }).Count } catch { }
+            $executed = (Test-Path -LiteralPath (Join-Path (Join-Path (Split-Path $PlansFolder -Parent) 'Undo') ("undo-{0}.csv" -f $p.PlanId)))
+            $age = (New-TimeSpan -Start $f.LastWriteTime -End (Get-Date))
+            $ageTxt = if($age.TotalDays -ge 1){ ('{0:N0}d {1}h ago' -f $age.TotalDays, $age.Hours) }
+                      elseif($age.TotalHours -ge 1){ ('{0}h {1}m ago' -f $age.Hours, $age.Minutes) }
+                      else { ('{0}m ago' -f [Math]::Max(1, $age.Minutes)) }
+            [void]$rows.Add([pscustomobject]@{
+                PlanId="$($p.PlanId)"; Drive="$($p.Drive)"; MoveCount=$moveCount
+                Age=$ageTxt; Executed=[bool]$executed; Path=$f.FullName
+            })
+            $shown++
+        } catch { continue }
+    }
+    return $rows.ToArray()
+}
+
+function Resolve-SysOrgPlanChoice {
+<#
+.SYNOPSIS
+    Resolves a plan-picker input: a list NUMBER, a plan id, a full path, or a FOLDER (v3.0.1 D1).
+.DESCRIPTION
+    - '1'..'9' selects the Nth entry of the newest-plan list
+    - a plan id ('plan-20260101-093000-123') matches the saved plan JSON
+    - a full path to a plan JSON is used as-is
+    - a FOLDER resolves to its newest plan JSON (recursive)
+    Returns the plan JSON path, or $null when nothing matched.
+.EXAMPLE
+    Resolve-SysOrgPlanChoice -Input '2' -PlansFolder C:\SysOrg\Plans
+#>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Choice,[Parameter(Mandatory)][string]$PlansFolder)
+    $v = "$Choice".Trim()
+    if([string]::IsNullOrWhiteSpace($v)){ return $null }
+    # 1) a list number
+    if($v -match '^\d+$'){
+        $list = @(Get-SysOrgPlanList -PlansFolder $PlansFolder -Top 10)
+        $idx = [int]$v
+        if($idx -ge 1 -and $idx -le $list.Count){ return [string]$list[$idx-1].Path }
+        return $null
+    }
+    # 2) a full path to a plan JSON
+    if(($v -match '\\') -or ("$v".Contains('/'))){
+        if(Test-Path -LiteralPath $v -PathType Leaf){ return $v }
+        if(Test-Path -LiteralPath $v -PathType Container){
+            $newest = @(Get-ChildItem -LiteralPath $v -Filter '*.json' -File -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+            if($newest.Count -gt 0){ return [string]$newest[0].FullName }
+        }
+        return $null
+    }
+    # 3) a plan id
+    $candidate = Join-Path $PlansFolder ("{0}.json" -f $v)
+    if($v -match '^(plan|migrate)-\d{8}-\d{6}(-\d{3})?$' -and (Test-Path -LiteralPath $candidate)){ return $candidate }
+    return $null
+}
+
 function Test-SysOrgPlanNeedsReview {
 <#
 .SYNOPSIS

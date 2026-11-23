@@ -1033,3 +1033,73 @@ Describe 'Review experience: honest reasons, thresholds and filtering (v3.0.1 B6
         (Test-SysOrgReviewDestinationPath -Leaf 'a\b') | Should -BeTrue
     }
 }
+
+Describe 'Plan picker and identical-scan reuse (v3.0.1 D1)' {
+
+    BeforeAll {
+        $script:d1App = Join-Path $TestDrive ('d1app-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $script:d1Plans = Join-Path $script:d1App 'Plans'
+        $script:d1Undo = Join-Path $script:d1App 'Undo'
+        New-Item -ItemType Directory -Path $script:d1Plans -Force | Out-Null
+        New-Item -ItemType Directory -Path $script:d1Undo -Force | Out-Null
+        function New-SysOrgD1PlanFile {
+            param([string]$PlanId,[int]$Moves,[switch]$Executed)
+            $actions = @()
+            foreach($i in 1..$Moves){
+                $actions += [pscustomobject]@{ Action='Move'; Kind='File'; Source=("C:\s\f$i.txt"); Destination=("C:\o\f$i.txt") }
+            }
+            $plan = [pscustomobject]@{
+                PlanId=$PlanId; Drive='C:'; DestinationRoot='C:\Organized'; Actions=$actions
+                NeedsDecision=@(); Skipped=@(); Warnings=@(); Provenance=@(); InputFingerprint=('fp-' + $PlanId)
+            }
+            $path = Join-Path $script:d1Plans ("{0}.json" -f $PlanId)
+            $plan | Select-Object -Property * -ExcludeProperty Provenance | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding UTF8
+            if($Executed){ Set-Content -LiteralPath (Join-Path $script:d1Undo ("undo-{0}.csv" -f $PlanId)) -Value 'Timestamp,PlanId,Kind,Action,OriginalSource,CurrentLocation,ContentHash,Status' -Encoding UTF8 }
+            Start-Sleep -Milliseconds 20
+            return $path
+        }
+        # oldest -> newest so the picker order is deterministic
+        $null = New-SysOrgD1PlanFile -PlanId 'plan-20260101-093000-001' -Moves 3
+        $null = New-SysOrgD1PlanFile -PlanId 'plan-20260101-093001-002' -Moves 5 -Executed
+        $script:d1Newest = New-SysOrgD1PlanFile -PlanId 'plan-20260101-093002-003' -Moves 7
+    }
+
+    It 'lists the newest plans with id, drive, moves, age and executed status' {
+        $list = @(Get-SysOrgPlanList -PlansFolder $script:d1Plans -Top 10)
+        $list.Count | Should -Be 3
+        $list[0].PlanId | Should -Be 'plan-20260101-093002-003'   # newest first
+        @($list | Where-Object { $_.Executed }).Count | Should -Be 1
+        ($list | Where-Object PlanId -eq 'plan-20260101-093001-002').MoveCount | Should -Be 5
+    }
+
+    It 'resolves a NUMBER, a plan id, a full path and a folder' {
+        (Resolve-SysOrgPlanChoice -Choice '1' -PlansFolder $script:d1Plans) | Should -Be $script:d1Newest
+        (Resolve-SysOrgPlanChoice -Choice 'plan-20260101-093000-001' -PlansFolder $script:d1Plans) | Should -Be (Join-Path $script:d1Plans 'plan-20260101-093000-001.json')
+        (Resolve-SysOrgPlanChoice -Choice $script:d1Newest -PlansFolder $script:d1Plans) | Should -Be $script:d1Newest
+        (Resolve-SysOrgPlanChoice -Choice $script:d1Plans -PlansFolder $script:d1Plans) | Should -Be $script:d1Newest   # folder -> newest
+        (Resolve-SysOrgPlanChoice -Choice 'plan-20990101-000000-999' -PlansFolder $script:d1Plans) | Should -BeNullOrEmpty
+        (Resolve-SysOrgPlanChoice -Choice '99' -PlansFolder $script:d1Plans) | Should -BeNullOrEmpty
+        (Resolve-SysOrgPlanChoice -Choice 'not-an-id' -PlansFolder $script:d1Plans) | Should -BeNullOrEmpty
+    }
+
+    It 'the input fingerprint is deterministic and changes when the inventory changes' {
+        $prof = [pscustomobject]@{ Letter='C'; Root='C:\'; Role='Data'; ProposedScope='FullDrive'; KnownFolders=@(); DownloadRoots=@(); Artifacts=@(); TopLevelDirs=@() }
+        $cfg = @{ OrganizedRoots=@{ 'C'='C:\Organized' }; Copies=@{ Policy='NumberCopies' } }
+        $mk = { param($n) [pscustomobject]@{ FullName="C:\s\$n"; Name=$n; Stem=$n; Extension='.txt'; Length=[long]10; LastWriteTime=(Get-Date '2026-01-01'); Directory='C:\s'; Category='Documents' } }
+        $inv = @((& $mk 'a.txt'), (& $mk 'b.txt'))
+        $f1 = Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv -Config $cfg -DriveProfile $prof
+        $f2 = Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv -Config $cfg -DriveProfile $prof
+        $f1 | Should -Be $f2
+        $f1 | Should -Match '^[0-9A-F]{64}$'
+        $inv2 = @((& $mk 'a.txt'), (& $mk 'b.txt'), (& $mk 'c.txt'))
+        (Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv2 -Config $cfg -DriveProfile $prof) | Should -Not -Be $f1
+        $inv3 = @((& $mk 'a.txt'), (& $mk 'b.txt'))
+        $inv3[0].Length = 99
+        (Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv3 -Config $cfg -DriveProfile $prof) | Should -Not -Be $f1
+        # untouched mtime must NOT change the fingerprint
+        $inv4 = @((& $mk 'a.txt'), (& $mk 'b.txt'))
+        $inv4[0].LastWriteTime = (Get-Date).AddHours(-2)
+        # a DIFFERENT mtime means the file changed -> fingerprint MUST change
+        (Get-SysOrgPlanInputFingerprint -Letter C -Inventory $inv4 -Config $cfg -DriveProfile $prof) | Should -Not -Be $f1
+    }
+}

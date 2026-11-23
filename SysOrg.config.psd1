@@ -290,6 +290,13 @@
 
     MaxPlanActions        = 5000
     InventoryCacheHours   = 24
+
+    # v3.0.1 D1: re-running an IDENTICAL scan (same drive, same files, same config)
+    # reuses the existing not-yet-executed plan instead of creating a duplicate -
+    # compared via a SHA256 input fingerprint (letter + root + layout + copies
+    # policy + the sorted path|size|mtime of the inventory). Executed plans are
+    # never silently reused: their undo journals exist, so a new plan is built.
+    Plans = @{ ReuseIdentical = $true }
     ReportsFolderName     = '_Reports'
     ScheduledTaskName     = 'SysOrg Weekly Scan'
     ScheduledDrives       = @('*')          # drives in scheduled reports; '*' = every FIXED (internal) drive only, e.g. @('C','D')

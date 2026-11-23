@@ -48,7 +48,8 @@ param(
     [switch]$Learn,
     [int]$Parallelism = 0,
     [string]$Root,
-    [switch]$Timing
+    [switch]$Timing,
+    [string]$SimilarFolders
 )
 $ErrorActionPreference = 'Stop'
 $appRoot   = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -280,6 +281,54 @@ function Invoke-SysOrgProfileFlow {
 }
 function Invoke-SysOrgScanFlow {
     param([string]$Letter,[switch]$PreviewOnly,[switch]$WholeDrive,[switch]$NoCacheSwitch)
+    # v3.0.1 D2: on Data/Removable drives FullDrive is never the silent default -
+    # the top-level folders are presented with risk labels and the choice is remembered.
+    $driveRole = 'Data'
+    try { $driveRole = "$((@(Get-SysOrgDrive -Letters $Letter))[0].Location)" } catch { $driveRole = 'Data' }
+    $rememberedRoots = $null
+    try { $rememberedRoots = Get-SysOrgUserScanRoots -Letter $Letter -AppRoot $appRoot } catch { $rememberedRoots = $null }
+    if(($driveRole -ne 'Internal') -and $WholeDrive -and (-not $PreviewOnly) -and (-not $rememberedRoots)){
+        $opts = @(Get-SysOrgScanRootOptions -Letter $Letter -Config $Config)
+        if($opts.Count -gt 0){
+            Write-Host ''
+            Write-Host ("Drive {0}: is a {1} drive. FullDrive scope is NOT the default - choose what to scan:" -f $Letter, $driveRole) -ForegroundColor White
+            $i = 0
+            foreach($o in $opts){
+                $i++
+                $riskTxt = if($o.Risk){ "  [$($o.Risk)]" } else { '' }
+                $defTxt = if($o.DefaultInclude){ 'Y' } else { 'n' }
+                Write-Host ('  [{0}] {1}  (include? {2}){3}' -f $i, $o.Name, $defTxt, $riskTxt) -ForegroundColor $(if($o.Risk){ 'Yellow' } else { 'Gray' })
+            }
+            Write-Host 'Folders labeled vault/model/app/VCS/OS are EXCLUDED by default and are never moved. Enter=accept the defaults, or list folders to INCLUDE (numbers or names), or ALL:'
+            $answer = Read-Host 'Selection'
+            $chosen = New-Object System.Collections.Generic.List[string]
+            $a = "$answer".Trim()
+            if($a -ieq 'all'){
+                foreach($o in $opts){ [void]$chosen.Add([string]$o.Path) }
+            } elseif([string]::IsNullOrWhiteSpace($a)){
+                foreach($o in $opts){ if($o.DefaultInclude){ [void]$chosen.Add([string]$o.Path) } }
+            } else {
+                $tokens = @($a.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                foreach($t in $tokens){
+                    if($t -match '^\d+$'){
+                        $idx = [int]$t
+                        if($idx -ge 1 -and $idx -le $opts.Count){ [void]$chosen.Add([string]$opts[$idx-1].Path) }
+                    } else {
+                        $match = @($opts | Where-Object { $_.Name -ieq $t })
+                        if($match.Count -gt 0){ [void]$chosen.Add([string]$match[0].Path) }
+                    }
+                }
+            }
+            if($chosen.Count -gt 0){
+                $null = Save-SysOrgUserScanRoots -Letter $Letter -Roots $chosen.ToArray() -AppRoot $appRoot
+                Write-Host ("Scan roots for drive {0}: saved ({1} folder(s)). Future scans reuse this choice until you change it." -f $Letter, $chosen.Count) -ForegroundColor Green
+                $rootsOverride = $chosen.ToArray()
+            } else {
+                Write-Host 'Nothing selected - nothing was scanned and nothing was modified.' -ForegroundColor Yellow
+                return
+            }
+        }
+    }
     # v3.0.1 C1: per-phase wall times behind -Timing (profile-first speed work)
     $phaseTimings = @{}
     function Get-SysOrgPhaseStart { param([string]$Phase)
@@ -305,7 +354,12 @@ function Invoke-SysOrgScanFlow {
     # v3.0.1 C2: the walk itself detects projects and prunes dependency dirs
     $walkProjects = New-Object System.Collections.Generic.List[object]
     $walkPreserved = New-Object System.Collections.Generic.List[object]
-    $rootsInfo = Get-SysOrgScanRoots -Letter $Letter -Config $Config -DefaultScope:(-not $WholeDrive) -KnownFolders @($prof.KnownFolders)
+    # v3.0.1 D2: remembered scan roots win over everything for Data/Removable drives
+    if($rootsOverride -and @($rootsOverride).Count -gt 0){
+        $rootsInfo = [pscustomobject]@{ Scope='custom'; Initial=@($rootsOverride) }
+    } else {
+        $rootsInfo = Get-SysOrgScanRoots -Letter $Letter -Config $Config -DefaultScope:(-not $WholeDrive) -KnownFolders @($prof.KnownFolders)
+    }
     $cacheStats = @{}
     $invParams = @{ Letter=$Letter; Config=$Config; CacheFolder=$folders.Cache; AuditTrail=$trail; KnownFolders=@($prof.KnownFolders); ProjectFoldersOut=$walkProjects; PreservedOut=$walkPreserved; CacheStatsOut=$cacheStats }
     if($NoCacheSwitch){ $invParams.NoCache = $true }
@@ -375,16 +429,50 @@ function Invoke-SysOrgScanFlow {
         $projCount = @(@($walkPreserved) | Where-Object { $_.Kind -eq 'Project' }).Count
         Write-Host ("Preserved without enumeration: {0} dependency folder(s), {1} project folder(s)" -f $depCount, $projCount) -ForegroundColor DarkGray
     }
+    # v3.0.1 D4: the app folder itself inside a scan root - recommend moving it
+    if(Test-SysOrgAppUnderScanRoot -AppRoot $appRoot -ScanRoots @($rootsInfo.Initial)){
+        Write-Host ("WARNING: the SysOrg app folder ({0}) sits INSIDE a scanned root." -f $appRoot) -ForegroundColor Yellow
+        Write-Host '  It stays fully protected (never scanned, never moved), but we recommend moving it out of the scanned tree - e.g. to the drive root or a tools folder.' -ForegroundColor Yellow
+    }
     # v3.0.1 B2: user collections - user-named folders inside the scan roots move as
     # ONE unit (structure intact), chosen by the majority classification of contents.
     $collections = @(Get-SysOrgUserCollections -Inventory $inv -Roots @($rootsInfo.Initial) -Config $Config -KnownFolders @($prof.KnownFolders))
     if(@($collections).Count -gt 0){ Write-Host ("User collections detected: {0} (each moves whole, never flattened)" -f @($collections).Count) }
     $swPlan = Get-SysOrgPhaseStart -Phase 'plan'
-    $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries
+    # v3.0.1 D1: re-running an identical scan (same inputs) reuses the existing plan
+    # instead of building a duplicate - compared via an input fingerprint.
+    $inputFingerprint = Get-SysOrgPlanInputFingerprint -Letter $Letter -Inventory $inv -Config $Config -DriveProfile $prof
+    $reusePlanPath = $null
+    if([bool](Get-SysOrgSetting $Config 'Plans.ReuseIdentical' $true)){
+        $plansDirNow = $folders.Plans
+        foreach($pf in @(Get-ChildItem -LiteralPath $plansDirNow -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 30)){
+            try{
+                $pp = Get-Content -LiteralPath $pf.FullName -Raw | ConvertFrom-Json
+                if($pp.PSObject.Properties['InputFingerprint'] -and "$($pp.InputFingerprint)" -eq $inputFingerprint){
+                    $alreadyExecuted = (Test-Path -LiteralPath (Join-Path $folders.Undo ("undo-{0}.csv" -f $pp.PlanId)))
+                    if(-not $alreadyExecuted){
+                        $reusePlanPath = $pf.FullName
+                        $plan = $pp
+                        break
+                    }
+                }
+            } catch { continue }
+        }
+    }
+    if($reusePlanPath){
+        Write-Host ("Reusing existing plan {0} (identical scan inputs - nothing was re-planned)." -f $plan.PlanId) -ForegroundColor Cyan
+    } else {
+        $plan = New-SysOrgPlan -Letter $Letter -Inventory $inv -DriveProfile $prof -DupGroups $dups -Config $Config -KnownFolders @($prof.KnownFolders) -ProjectFolders $projects -UserCollections $collections -VersionPairs $versionPairs -FileCache $fileCache -NewCacheEntries $newCacheEntries
+    }
     Stop-SysOrgPhase $swPlan 'plan'
     # persist the updated file-state cache (best effort - it is a performance cache)
     foreach($k in @($newCacheEntries.Keys)){ $fileCache[$k] = $newCacheEntries[$k] }
     $null = Save-SysOrgFileStateCache -Path $cachePath -Entries $fileCache
+    if($plan.PSObject.Properties['InputFingerprint']){
+        $plan.InputFingerprint = $inputFingerprint
+    } else {
+        [void]($plan | Add-Member -NotePropertyName InputFingerprint -NotePropertyValue $inputFingerprint)
+    }
     $sum = Show-SysOrgPlan -Plan $plan -Config $Config
     # v3.0 Phase 5: before/after findability score in the preview.
     # v3.0.1 A2: the full inventory is passed so before/after are scored over the SAME
@@ -518,6 +606,11 @@ function Invoke-SysOrgPlanFile {
     param([Parameter(Mandatory)][string]$Path)
     if(-not (Test-Path -LiteralPath $Path)){ Write-Host 'Plan file not found.' -ForegroundColor Red; return }
     $plan = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if($plan.PSObject.Properties['InputFingerprint']){
+        $plan.InputFingerprint = $inputFingerprint
+    } else {
+        [void]($plan | Add-Member -NotePropertyName InputFingerprint -NotePropertyValue $inputFingerprint)
+    }
     $sum = Show-SysOrgPlan -Plan $plan -Config $Config
     $prompt = 'Execute this plan now (files will be moved)?'
     if($sum.OneDriveSyncOut -gt 0){
@@ -711,7 +804,30 @@ if($Score){
         try { $scoreRoot = Get-SysOrgDestinationRoot -Letter $scoreLetter -Config $Config } catch { $scoreRoot = ('{0}:\_Organized' -f $scoreLetter) }
     }
     $s = Get-SysOrgTreeScore -Root $scoreRoot -Config $Config
+    if($s.Files -eq 0){
+        # v3.0.1 D5: an empty tree is not a score
+        Write-Host ''
+        Write-Host 'No organized tree yet.' -ForegroundColor Yellow
+        Write-Host ('  Nothing has been organized into {0} so far. Run -ScanDrive with execute to fill it.' -f $scoreRoot) -ForegroundColor Gray
+        return
+    }
     Show-SysOrgFindabilityScore -Score $s -Label ('organized tree ' + $scoreRoot) -Config $Config -WithTargets
+    return
+}
+if($SimilarFolders){
+    # v3.0.1 D3: similar-folder report - fingerprint folders by their file-hash sets,
+    # list pairs with >= 80% overlap. REPORT ONLY: nothing is ever moved or merged.
+    $sfRoot = $SimilarFolders
+    if(-not (Test-Path -LiteralPath $sfRoot)){ Write-Host ("Folder not found: {0}" -f $sfRoot) -ForegroundColor Red; return }
+    Write-Host ("Fingerprinting folders under {0} (report only - nothing moves) ..." -f $sfRoot) -ForegroundColor White
+    $rep = Get-SysOrgSimilarFolders -Roots @($sfRoot) -Config $Config
+    Write-Host ("Folders fingerprinted: {0}   similar pairs (>= {1}): {2}" -f $rep.FoldersCompared, 0.80, @($rep.Pairs).Count) -ForegroundColor White
+    foreach($p2 in ($rep.Pairs | Select-Object -First 20)){
+        Write-Host ('  {0}  ({1} file(s), {2}, {3})' -f $p2.FolderA, $p2.FilesA, (Format-SysOrgFileSize $p2.BytesA), $p2.LastWriteA) -ForegroundColor Gray
+        Write-Host ('  {0}  ({1} file(s), {2}, {3})' -f $p2.FolderB, $p2.FilesB, (Format-SysOrgFileSize $p2.BytesB), $p2.LastWriteB) -ForegroundColor Gray
+        Write-Host ('    overlap {0} ({1} identical file(s)) - decide yourself which copy to keep; SysOrg never merges.' -f $p2.Overlap, $p2.Common) -ForegroundColor Yellow
+    }
+    if(@($rep.Pairs).Count -eq 0){ Write-Host 'No similar folder pairs found.' -ForegroundColor Gray }
     return
 }
 if($Learn){
@@ -887,8 +1003,22 @@ while($running){
                   }
                 }
             '5' {
-                  $p = Read-Host 'Path to plan JSON'
-                  Invoke-SysOrgPlanFile -Path $p
+                  # v3.0.1 D1: the plan picker - 10 newest plans, accept a number, an id, a path, or a folder
+                  $list = @(Get-SysOrgPlanList -PlansFolder $folders.Plans -Top 10)
+                  if($list.Count -gt 0){
+                      Write-Host ''
+                      Write-Host 'Newest plans:' -ForegroundColor White
+                      $i = 0
+                      foreach($row in $list){
+                          $i++
+                          $status = if($row.Executed){ 'executed' } else { 'not executed' }
+                          Write-Host ('  [{0}] {1}  drive {2}  {3} move(s)  {4}  [{5}]' -f $i, $row.PlanId, $row.Drive, $row.MoveCount, $row.Age, $status)
+                      }
+                  }
+                  $p = Read-Host 'Plan (number, plan id, full path, or folder)'
+                  $resolved = Resolve-SysOrgPlanChoice -Choice $p -PlansFolder $folders.Plans
+                  if(-not $resolved){ Write-Host 'No matching plan found - nothing was modified.' -ForegroundColor Yellow; continue }
+                  Invoke-SysOrgPlanFile -Path $resolved
                 }
             '6' {
                   $id = Read-Host 'Plan id (e.g. plan-20260101-093000-123)'
@@ -903,7 +1033,7 @@ while($running){
             '7' { $l = Get-SysOrgLetterInput -Prompt 'Drive letter to migrate'; Invoke-SysOrgMigrationFlow -Letter $l }
             '8' { Start-Process explorer.exe $appRoot }
             '9' { $q = Read-Host 'Search (wildcard, e.g. *invoice*)'; $res = @(Find-SysOrgFile -Root (Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config) -Name $q -Config $Config 3>$null); Write-Host ("{0} result(s):" -f $res.Count); $res | Select-Object -First 30 | ForEach-Object { Write-Host ('  ' + $_.CurrentPath + '  [' + $_.Category + ']') } }
-            '10' { $sr = Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config; $sc = Get-SysOrgTreeScore -Root $sr -Config $Config; Show-SysOrgFindabilityScore -Score $sc -Label $sr -Config $Config -WithTargets }
+            '10' { $sr = Get-SysOrgDestinationRoot -Letter (Get-SysOrgLetterInput -Prompt 'Destination drive letter') -Config $Config; $sc = Get-SysOrgTreeScore -Root $sr -Config $Config; if($sc.Files -eq 0){ Write-Host ''; Write-Host 'No organized tree yet.' -ForegroundColor Yellow; Write-Host ('  Nothing has been organized into {0} so far. Run option 3 (organize a drive) first.' -f $sr) -ForegroundColor Gray } else { Show-SysOrgFindabilityScore -Score $sc -Label $sr -Config $Config -WithTargets } }
             '0' { $running = $false }
             default { Write-Host 'Unknown option.' }
         }

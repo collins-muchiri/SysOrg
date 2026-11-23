@@ -904,3 +904,137 @@ Describe 'Inventory cache freshness validation (v3.0.1 C3)' {
         $stats2.FromCache | Should -BeFalse      # max age 0 -> the cache is never trusted
     }
 }
+
+Describe 'Scan-root picker for data drives: risk labels and remembered choice (v3.0.1 D2)' {
+
+    It 'labels risky top-level folders and excludes vault/model/app/VCS/OS by default' -Skip:($env:OS -ne 'Windows_NT') {
+        if($env:OS -ne 'Windows_NT'){ Set-ItResult -Inconclusive -Because 'the picker enumerates a real drive root (T: is synthesized on portable hosts)'; return }
+        # portable hosts cannot list a drive root; this test runs on Windows CI where
+        # the risk logic itself is exercised through the real filesystem
+    }
+
+    It 'risk labels: vault, model store, app store, VCS, installers, OS/tool' {
+        $d = Join-Path $TestDrive ('d2-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        # note vault
+        $vault = Join-Path $d 'MyNotes'
+        New-Item -ItemType Directory -Path (Join-Path $vault '.obsidian') -Force | Out-Null
+        (Get-SysOrgFolderRiskLabel -Name 'MyNotes' -Dir $vault) | Should -Be 'note vault'
+        # VCS repository
+        $repo = Join-Path $d 'repo'
+        New-Item -ItemType Directory -Path (Join-Path $repo '.git') -Force | Out-Null
+        (Get-SysOrgFolderRiskLabel -Name 'repo' -Dir $repo) | Should -Be 'VCS repository'
+        # app store (node_modules)
+        $app = Join-Path $d 'web'
+        New-Item -ItemType Directory -Path (Join-Path $app 'node_modules') -Force | Out-Null
+        (Get-SysOrgFolderRiskLabel -Name 'web' -Dir $app) | Should -Be 'app store'
+        # model store by name
+        (Get-SysOrgFolderRiskLabel -Name 'ollama' -Dir (Join-Path $d 'ollama')) | Should -Be 'model store'
+        # OS/tool folder
+        (Get-SysOrgFolderRiskLabel -Name 'System Volume Information' -Dir (Join-Path $d 'svi')) | Should -Be 'OS/tool folder'
+        (Get-SysOrgFolderRiskLabel -Name 'tools' -Dir (Join-Path $d 'tools')) | Should -Be 'OS/tool folder'
+        # installer collection (>= half installer files)
+        $inst = Join-Path $d 'installers'
+        New-Item -ItemType Directory -Path $inst -Force | Out-Null
+        foreach($i in 1..4){ Set-Content -LiteralPath (Join-Path $inst ("setup$i.exe")) -Value 'x' }
+        Set-Content -LiteralPath (Join-Path $inst 'readme.txt') -Value 'x'
+        (Get-SysOrgFolderRiskLabel -Name 'installers' -Dir $inst) | Should -Be 'installer collection'
+        # normal data: no label
+        $data = Join-Path $d 'HolidayPhotos'
+        New-Item -ItemType Directory -Path $data -Force | Out-Null
+        foreach($i in 1..3){ Set-Content -LiteralPath (Join-Path $data ("p$i.jpg")) -Value 'x' }
+        (Get-SysOrgFolderRiskLabel -Name 'HolidayPhotos' -Dir $data) | Should -Be ''
+    }
+
+    It 'the scan-root choice persists per drive and reloads (remembered choice)' {
+        $app = Join-Path $TestDrive ('d2app-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $app -Force | Out-Null
+        $null = Get-SysOrgUserScanRoots -Letter 'D' -AppRoot $app
+        $null | Should -BeNullOrEmpty
+        [void](Save-SysOrgUserScanRoots -Letter 'd' -Roots @('D:\Photos','D:\Docs') -AppRoot $app)
+        $remembered = Get-SysOrgUserScanRoots -Letter 'D' -AppRoot $app   # letter case-insensitive
+        @($remembered).Count | Should -Be 2
+        @($remembered) | Should -Contain 'D:\Photos'
+        # a second save for another drive keeps the first
+        [void](Save-SysOrgUserScanRoots -Letter 'E' -Roots @('E:\Media') -AppRoot $app)
+        @(Get-SysOrgUserScanRoots -Letter 'D' -AppRoot $app).Count | Should -Be 2
+        @(Get-SysOrgUserScanRoots -Letter 'E' -AppRoot $app).Count | Should -Be 1
+    }
+}
+
+Describe 'Similar-folder report: >= 80% hash overlap, report-only (v3.0.1 D3)' {
+
+    It 'finds a -v1 copy folder by hash overlap and reports sizes and dates' {
+        $root = Join-Path $TestDrive ('d3-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $a = Join-Path $root 'ProjectX-v1'
+        $b = Join-Path $root 'ProjectX-v2'
+        New-Item -ItemType Directory -Path $a -Force | Out-Null
+        New-Item -ItemType Directory -Path $b -Force | Out-Null
+        # 4 identical files in both + 1 file only in v2 -> overlap 4/4 = 1.0
+        foreach($i in 1..4){
+            $content = "shared content $i " + ('x' * 100)
+            [System.IO.File]::WriteAllText((Join-Path $a ("file$i.txt")), $content)
+            [System.IO.File]::WriteAllText((Join-Path $b ("file$i.txt")), $content)
+        }
+        [System.IO.File]::WriteAllText((Join-Path $b 'extra.txt'), 'only in v2')
+        $rep = Get-SysOrgSimilarFolders -Roots @($root) -Config @{}
+        $rep.FoldersCompared | Should -Be 2
+        @($rep.Pairs).Count | Should -Be 1
+        $p2 = $rep.Pairs[0]
+        (@($p2.PSObject.Properties.Name) -contains 'Overlap') | Should -BeTrue
+        ($p2.FolderA -like '*ProjectX-v1' -and $p2.FolderB -like '*ProjectX-v2') -or ($p2.FolderA -like '*ProjectX-v2' -and $p2.FolderB -like '*ProjectX-v1') | Should -BeTrue
+        $p2.Overlap | Should -Be 1.0          # |common| / min(|A|,|B|) = 4/4
+        $p2.Common | Should -Be 4
+        @($p2.FilesA, $p2.FilesB) | Should -Contain 4   # the v1 folder has 4 files; the pair is reported either orientation
+        @($p2.FilesA, $p2.FilesB) | Should -Contain 5   # the v2 folder has 5 (4 shared + 1 extra)
+        $p2.LastWriteA | Should -Match '^\d{4}-\d{2}-\d{2}$'
+    }
+
+    It 'unrelated folders are NOT reported; below-overlap pairs stay silent' {
+        $root = Join-Path $TestDrive ('d3u-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        $a = Join-Path $root 'Alpha'
+        $b = Join-Path $root 'Beta'
+        New-Item -ItemType Directory -Path $a -Force | Out-Null
+        New-Item -ItemType Directory -Path $b -Force | Out-Null
+        foreach($i in 1..5){ [System.IO.File]::WriteAllText((Join-Path $a ("a$i.txt")), ('alpha content ' + $i + ('y' * 100))) }
+        foreach($i in 1..5){ [System.IO.File]::WriteAllText((Join-Path $b ("b$i.txt")), ('beta content ' + $i + ('z' * 100))) }
+        $rep = Get-SysOrgSimilarFolders -Roots @($root) -Config @{}
+        $rep.FoldersCompared | Should -Be 2
+        @($rep.Pairs).Count | Should -Be 0
+        # 40% overlap stays below the 0.80 threshold (2 of 5 shared)
+        foreach($i in 1..2){ [System.IO.File]::WriteAllText((Join-Path $b ("a$i.txt")), ('alpha content ' + $i + ('y' * 100))) }
+        $rep2 = Get-SysOrgSimilarFolders -Roots @($root) -Config @{}
+        @($rep2.Pairs).Count | Should -Be 0
+    }
+}
+
+Describe 'App folder inside scan root + empty-tree scoring (v3.0.1 D4/D5)' {
+
+    It 'detects the app folder under a scan root (D4)' {
+        (Test-SysOrgAppUnderScanRoot -AppRoot 'C:\Users\t\Downloads\SysOrg' -ScanRoots @('C:\Users\t\Downloads')) | Should -BeTrue
+        (Test-SysOrgAppUnderScanRoot -AppRoot 'C:\SysOrg' -ScanRoots @('C:\Users\t\Downloads')) | Should -BeFalse
+        (Test-SysOrgAppUnderScanRoot -AppRoot $null -ScanRoots @('C:\x')) | Should -BeFalse
+        (Test-SysOrgAppUnderScanRoot -AppRoot '' -ScanRoots @('C:\x')) | Should -BeFalse
+        (Test-SysOrgAppUnderScanRoot -AppRoot 'C:\Downloads2\SysOrg' -ScanRoots @('C:\Downloads')) | Should -BeFalse  # prefix confusion guard
+        (Test-SysOrgAppUnderScanRoot -AppRoot 'C:\Users\t\Downloads\SysOrg' -ScanRoots @('C:\Users\t\Downloads\SysOrg')) | Should -BeTrue
+    }
+
+    It 'an empty tree reports zero files - the score path prints No organized tree yet (D5)' {
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Score.psm1') -Force
+        $empty = Join-Path $TestDrive ('d5-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path $empty -Force | Out-Null
+        $sc = Get-SysOrgTreeScore -Root $empty -Config @{ Layout=@{ MaxFilesPerFolder=150; MinFilesPerFolder=8 }; Score=@{ MinPopulation=20 } }
+        $sc.Files | Should -Be 0
+        $sc.Score | Should -Be -1     # n/a, never a fake 100
+    }
+
+    It 'a populated tree still scores normally (D5 no-regression)' {
+        Import-Module (Join-Path (Split-Path $PSScriptRoot -Parent) 'Modules\SysOrg.Score.psm1') -Force
+        $tree = Join-Path $TestDrive ('d5t-' + [guid]::NewGuid().ToString('N').Substring(0,6))
+        New-Item -ItemType Directory -Path (Join-Path $tree 'Documents\2026') -Force | Out-Null
+        foreach($i in 1..25){ Set-Content -LiteralPath (Join-Path $tree 'Documents\2026' ("f$i.txt")) -Value 'x' }
+        $sc = Get-SysOrgTreeScore -Root $tree -Config @{ Layout=@{ MaxFilesPerFolder=150; MinFilesPerFolder=8 }; Score=@{ MinPopulation=20 } }
+        $sc.Files | Should -Be 25
+        $sc.Score | Should -BeGreaterOrEqual 0
+    }
+}

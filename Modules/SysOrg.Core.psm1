@@ -301,6 +301,8 @@ function Import-SysOrgConfig {
         Move     = @{ AllowCrossVolume = $true }
         MaxPlanActions         = 5000
         InventoryCacheHours    = 24
+        # v3.0.1 D1: identical scans reuse the existing (not executed) plan
+        Plans                  = @{ ReuseIdentical = $true }
         ReportsFolderName      = '_Reports'
         ScheduledTaskName      = 'SysOrg Weekly Scan'
         ScheduledDrives        = @('*')
